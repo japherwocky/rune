@@ -90,7 +90,7 @@ go test ./...           # tests
    ▼                     │   (perception)     idle→observe→wait→act        send_command            │
   network ──▶ Session ───┼──▶ rune.gmcp.on / hooks("output","prompt")      speak(channel)          │
   (Go kernel, 1 goroutine)│                        │                       create_trigger ────────┐│
-   ▲                     │                    llm client ──(async)──▶ Anthropic Messages API       ││
+   ▲                     │                    llm client ──(async)──▶ OpenCode Zen (opencode.ai/zen) ││
    │  rune.send          │   governance: budget / rate-limit / oscillation / quarantine→re-plan   ││
    │                     │   observability: reasoning pane, state bar, turn log                    ││
    └─────────────────────┴────────────────────────────────────────────────────────────────────────┘│
@@ -99,8 +99,9 @@ go test ./...           # tests
 
 - **Perception** — consume GMCP into a live world-model table; keep a rolling text
   transcript from the `output` hook. Uses existing `rune.gmcp`/`hooks`.
-- **Transport** — Phase 1 uses existing `rune.http.post` to the Messages API; Phase 2
-  hardens into a Go `rune._llm` primitive (streaming, key-in-Go, retries, usage).
+- **Transport** — Phase 1 uses existing `rune.http.post` to OpenCode Zen
+  (opencode.ai/zen, see T2/T4); Phase 2 hardens into a Go `rune._llm` primitive
+  (streaming, key-in-Go, retries, usage).
 - **Cognition** — the callback-driven state machine and think-cadence policy.
 - **Action** — tools: `send_command`, `speak`, and the reflex-programming tools
   (`create_trigger` etc.) built on `rune.trigger`.
@@ -149,12 +150,16 @@ The two tasks that unblock everything and do **not** depend on botmud#20 are T1 
 #### T2 `[Go]` — `rune.env` primitive (API-key access)
 - **Why:** the LLM client needs the API key; no env accessor exists today (confirmed).
   Keeps the key out of scripts-in-git.
+- **Provider:** [OpenCode Zen](https://opencode.ai/docs/zen/), not Anthropic directly.
+  Zen is a multi-model gateway behind one API key, including several free/promotional
+  models at time of writing (e.g. "DeepSeek V4 Flash Free") - the point is cheap
+  experimentation across models, not a specific vendor. See T4/T8 for the transport and
+  §6 for what's confirmed vs. still unverified about Zen's wire format.
 - **Create:** `lua/api_env.go` registering `rune._env.get(name) -> string|nil`, and a
-  thin `rune.env(name)` in a core file (or fold into `82_json.lua`'s neighbor). Consider
-  an allowlist (only expose `ANTHROPIC_API_KEY` and a small set) so scripts can't read
-  arbitrary environment.
+  thin `rune.env(name)` in a core file (or fold into `82_json.lua`'s neighbor). Allowlist
+  just `OPENCODE_API_KEY` for now so scripts can't read arbitrary environment.
 - **Tests:** Go unit via the Host/mock; allowlist enforced.
-- **Done when:** `rune.env("ANTHROPIC_API_KEY")` returns the value in a real run and
+- **Done when:** `rune.env("OPENCODE_API_KEY")` returns the value in a real run and
   `nil` for non-allowlisted names.
 
 #### T3 `[Lua]` — world-model module (perception)
@@ -183,21 +188,32 @@ The two tasks that unblock everything and do **not** depend on botmud#20 are T1 
   dir→dest only after a move.
 
 #### T4 `[Lua]` — LLM client (Phase 1 transport via rune.http)
-- **Why:** talk to the Messages API without new Go yet.
+- **Why:** talk to an LLM without new Go yet.
+- **Provider: OpenCode Zen**, not Anthropic directly (see T2). Zen is a multi-model
+  gateway behind one API key. <https://opencode.ai/zen/v1/messages> is documented as the
+  Anthropic-Messages-API-shaped endpoint (it's what the `@ai-sdk/anthropic` provider
+  points at), so request/response bodies should follow the same
+  `content`/`tool_use`/`stop_reason`/`usage` shape as Anthropic's Messages API - just
+  against Zen's host, auth, and model catalog. `GET https://opencode.ai/zen/v1/models`
+  lists available models, including the free/promotional ones that motivated this
+  provider choice (subject to change - check it rather than assuming a model id).
+- **Unverified - confirm against live docs/a real request before hardcoding:** the exact
+  auth header for `/v1/messages` (Zen is documented elsewhere as using
+  `Authorization: Bearer $OPENCODE_API_KEY`, but Anthropic's own API normally expects
+  `x-api-key` - Zen's Anthropic-*compatible* endpoint may want either; a quick request
+  against `/v1/models` with each settles it in seconds) and whether an
+  `anthropic-version` header is required, ignored, or unwanted. Do not carry either
+  assumption into code unverified.
 - **Create:** `lua/core/NN_llm.lua` exposing e.g.
   `rune.llm.chat({ system, messages, tools, max_tokens }, function(reply, err) ... end)`.
 - **Implement:** build the request table, `rune.json.encode` it, `rune.http.post(url,
-  body, { headers = { ["x-api-key"] = rune.env("ANTHROPIC_API_KEY"),
-  ["anthropic-version"] = "...", ["content-type"] = "application/json" } }, cb)`. In
+  body, { headers = { ... } }, cb)` against the Zen endpoint/auth confirmed above. In
   `cb`, `rune.json.decode(resp.body)`, surface `stop_reason`, `content` (text +
   `tool_use` blocks), and `usage`. Own an `id -> callback` map only if you multiplex;
   otherwise rely on single-flight (T5).
-- **Reference:** load the `claude-api` skill for exact endpoint, headers,
-  `anthropic-version`, tool-use request/response shape, model id, and prompt-caching
-  params. **Do not hardcode these from memory.**
-- **Tests:** Lua-against-mock where the mock Host returns a canned Messages API JSON body
-  for an HTTP request; assert `rune.llm.chat` parses text + tool_use + usage. Cover the
-  error path (HTTP err, non-200, malformed JSON).
+- **Tests:** Lua-against-mock where the mock Host returns a canned Zen JSON body for an
+  HTTP request; assert `rune.llm.chat` parses text + tool_use + usage. Cover the error
+  path (HTTP err, non-200, malformed JSON).
 - **Done when:** a canned response parses into a normalized reply table; errors surface
   as `err`.
 
@@ -270,12 +286,12 @@ The two tasks that unblock everything and do **not** depend on botmud#20 are T1 
 - **Create:** `lua/api_llm.go` + `session/lua_llm.go`, **mirroring** `lua/api_http.go` +
   `session/lua_http.go` exactly:
   - `session/lua_llm.go`: `Session.LLMRequest(id, req)` spawns a goroutine, streams from
-    the Messages API; deliver either incremental deltas as multiple `AsyncResult` events
-    (for live streaming) or one final `AsyncResult` (start non-streaming, add streaming
-    behind the same id-based delivery).
+    OpenCode Zen (see T4); deliver either incremental deltas as multiple `AsyncResult`
+    events (for live streaming) or one final `AsyncResult` (start non-streaming, add
+    streaming behind the same id-based delivery).
   - `lua/api_llm.go`: register `rune._llm.request`; `Engine.OnLLMResult(id, ...)` →
     `rune.llm._deliver`.
-  - Key from Go env (`ANTHROPIC_API_KEY`); never passed through Lua.
+  - Key from Go env (`OPENCODE_API_KEY`); never passed through Lua.
 - **Swap:** `rune.llm.chat` (T4) moves from `rune.http` onto `rune._llm`; its public
   signature stays stable so T5/T6 don't change.
 - **Tests:** byte-level/unit for request build + streaming assembly; error/retry paths;
@@ -331,14 +347,23 @@ The two tasks that unblock everything and do **not** depend on botmud#20 are T1 
 
 ## 6. Open decisions
 
-- **API key in Phase 1:** recommended — `rune.env("ANTHROPIC_API_KEY")` (T2) so the key
+- **API key in Phase 1:** recommended — `rune.env("OPENCODE_API_KEY")` (T2) so the key
   stays out of git. Alternative: an `init.lua` constant for a throwaway spike.
 - **`run_lua(code)` codegen tool:** deferred. Ship the structured `create_trigger`
   vocabulary (T6) first; add codegen later as a **gated** power tool (config/confirm,
   restricted env). Rune's watchdog + pcall + quarantine already sandbox runaway/throwing
   code, but arbitrary codegen can still clobber `rune.*`.
-- **Model + Messages API specifics:** resolve via the `claude-api` skill at T4/T8, not
-  from memory.
+- **Provider: OpenCode Zen, not Anthropic directly** (decided after T1 landed - see
+  T2/T4). One key buys access to a rotating catalog of models, including
+  free/promotional ones; the point is cheap experimentation, not a specific vendor.
+  `rune.llm.chat`'s public signature (T4) stays provider-shaped input/output
+  (system/messages/tools/max_tokens in, a normalized reply out) so swapping the model,
+  or the provider again later, doesn't ripple into T5/T6.
+- **Model + wire-format specifics:** confirmed so far - Zen exists, `OPENCODE_API_KEY`,
+  `/v1/messages` is the Anthropic-Messages-API-shaped endpoint, `/v1/models` lists what's
+  available. **Not yet confirmed** - the exact auth header on `/v1/messages`
+  (`Authorization: Bearer` vs. `x-api-key`) and current model ids. Resolve both against
+  <https://opencode.ai/docs/zen/> and a live request at T4 time, not from memory.
 
 ## 7. Suggested commit/PR breakdown
 
