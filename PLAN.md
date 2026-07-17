@@ -233,25 +233,36 @@ The two tasks that unblock everything and do **not** depend on botmud#20 are T1 
   against Zen's host, auth, and model catalog. `GET https://opencode.ai/zen/v1/models`
   lists available models, including the free/promotional ones that motivated this
   provider choice (subject to change - check it rather than assuming a model id).
-- **Unverified - confirm against live docs/a real request before hardcoding:** the exact
-  auth header for `/v1/messages` (Zen is documented elsewhere as using
-  `Authorization: Bearer $OPENCODE_API_KEY`, but Anthropic's own API normally expects
-  `x-api-key` - Zen's Anthropic-*compatible* endpoint may want either; a quick request
-  against `/v1/models` with each settles it in seconds) and whether an
-  `anthropic-version` header is required, ignored, or unwanted. Do not carry either
-  assumption into code unverified.
-- **Create:** `lua/core/NN_llm.lua` exposing e.g.
-  `rune.llm.chat({ system, messages, tools, max_tokens }, function(reply, err) ... end)`.
+- **Verified live (2026-07-17) against `https://opencode.ai/zen/v1/messages`:** the auth
+  header is `x-api-key`, not `Authorization: Bearer` as Zen is documented elsewhere. A
+  request with a bad `x-api-key` gets a distinct `401
+  {"type":"error","error":{"type":"AuthError","message":"Invalid API key."}}` - the
+  gateway recognizes and validates the header. A request with a bad (or no)
+  `Authorization: Bearer` instead gets a generic `400 {"error":{"message":"Error from
+  provider (Console): Upstream request failed",...}}` - i.e. `Authorization` is not
+  inspected at all and the malformed request is passed straight through to the upstream
+  provider. Sending both headers behaves identically to `x-api-key` alone. `GET
+  /v1/models` needs no auth. `anthropic-version` was not settled by this probe (no valid
+  key on hand to observe a 200) - send `2023-06-01` per Anthropic Messages API
+  convention; revisit if Zen ever rejects it.
+- **Create:** `lua/core/86_llm.lua` exposing
+  `rune.llm.chat({ model, system, messages, tools, max_tokens }, function(reply, err) ... end)`.
+  `model` is required, not defaulted - Zen's catalog rotates (including which models are
+  free/promotional; see the `/v1/models` note above), so picking one is a policy decision
+  left to the caller (T5), not baked into the transport.
 - **Implement:** build the request table, `rune.json.encode` it, `rune.http.post(url,
   body, { headers = { ... } }, cb)` against the Zen endpoint/auth confirmed above. In
   `cb`, `rune.json.decode(resp.body)`, surface `stop_reason`, `content` (text +
-  `tool_use` blocks), and `usage`. Own an `id -> callback` map only if you multiplex;
-  otherwise rely on single-flight (T5).
+  `tool_use` blocks, verbatim - a follow-up turn with `tool_result` blocks must echo the
+  assistant's `content` back unchanged), and `usage`; also split `content` into
+  convenience `text`/`tool_uses` fields so T5/T6 don't have to re-walk it. No `id ->
+  callback` map needed: `rune.http` already owns that (80_http.lua); single-flight is
+  T5's job, not the transport's.
 - **Tests:** Lua-against-mock where the mock Host returns a canned Zen JSON body for an
   HTTP request; assert `rune.llm.chat` parses text + tool_use + usage. Cover the error
-  path (HTTP err, non-200, malformed JSON).
+  path (HTTP err, non-200, malformed JSON, missing API key). See `lua/llm_test.go`.
 - **Done when:** a canned response parses into a normalized reply table; errors surface
-  as `err`.
+  as `err`. ✓
 
 #### T5 `[Lua]` — agent core (state machine + cadence)
 - **Depends:** T3, T4.
