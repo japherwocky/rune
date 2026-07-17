@@ -1,5 +1,6 @@
 # Build artifacts (anchored: a bare "rune" would swallow cmd/rune/)
 /rune
+/rune.exe
 layout-test
 *.out
 *.test
