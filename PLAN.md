@@ -264,37 +264,82 @@ The two tasks that unblock everything and do **not** depend on botmud#20 are T1 
 - **Done when:** a canned response parses into a normalized reply table; errors surface
   as `err`. ✓
 
-#### T5 `[Lua]` — agent core (state machine + cadence)
+#### T5 `[Lua]` — agent core (state machine + cadence) ✓
 - **Depends:** T3, T4.
-- **Create:** `lua/core/NN_agent.lua`. A single-flight state machine:
-  `idle → observing → waiting_llm → acting → observing`. **Must call
-  `rune.perception.enable()` at startup** — T3's perception module is inert (no GMCP
-  subscriptions, no hooks registered) until something explicitly enables it; see T3.
-- **Cadence (combine):**
-  - wake flag set by salient events (register triggers/gmcp handlers/hooks for
-    combat-start, low-hp, a tell arriving);
-  - `rune.hooks.on("prompt", ...)` as the natural "my turn" signal;
-  - a debounce `rune.timer` (~1–3s) that fires a think if one is pending and none is in
-    flight;
-  - **single-flight:** never two LLM calls outstanding; events during a think coalesce
-    into "think again on return."
-- **Turn:** gather `rune.perception.snapshot()` + `rune.perception.transcript()` + goal +
-  tool defs → `rune.llm.chat` → on `tool_use`, dispatch to T6 tools, capture results,
-  feed `tool_result` back and continue the turn; on text/end, update goal and idle.
-- **Reload safety:** keep in-flight state and pending callbacks in Lua (like
-  `80_http.lua`) so `/reload` abandons them cleanly. Durable memory lives in
-  `rune.store`.
-- **Tests:** session-synchronous or e2e driving a scripted MUD + a mock LLM (canned
-  tool_use → assert the command is sent; canned end_turn → assert idle). Assert
-  single-flight (a second wake during a think does not launch a second call).
+- **Created:** `lua/core/87_agent.lua`. A single-flight state machine:
+  `idle → observing → waiting_llm → acting → observing`, tracked as `thinking`/
+  `wake_pending` booleans rather than a literal named-state enum (a tool_use round trip
+  loops `acting → waiting_llm` directly, without revisiting `observing` - re-gathering a
+  fresh perception snapshot mid-tool-exchange would break the Anthropic-shaped
+  conversation, since the model needs the *same* messages array it made the tool call
+  against). `rune.agent.status()` exposes `{active, thinking, wake_pending, goal}` for
+  tests and T7. **Calls `rune.perception.enable()` at startup** (`rune.agent.start()`)
+  and `.disable()` on `rune.agent.stop()` — see T3.
+- **Cadence (combine), as spec'd, confirmed by tests in `lua/agent_test.go`:**
+  - salient GMCP deltas only set the wake flag, never think immediately - grounded in
+    botmud#20's *confirmed* package shapes (no separate verification needed, the spec
+    was written this session): `Char.Vitals` hp/maxhp `< 0.3` (low-hp), `Char.Status`
+    `position` transitioning *into* `"fighting"` (edge-triggered - repeated
+    `"fighting"` updates while already fighting do not re-wake, so routine combat
+    rounds don't spam thinks), any `Comm.Channel` message (there is no dedicated tell
+    package - PLAN.md's "a tell arriving" is a channel message in practice, per the
+    spec's actual `Comm.Channel` shape);
+  - `rune.hooks.on("prompt", ...)` wakes **and** attempts a think immediately - the one
+    signal treated as urgent, since it's already rate-limited by the MUD's own round
+    cadence;
+  - `rune.timer.every(2, ...)` (`DEBOUNCE_SECONDS`) is the fallback that catches a
+    salient-event wake with no prompt nearby;
+  - **single-flight** via a `thinking` boolean; **think-again-on-return** via
+    `finish_turn()` rechecking `wake_pending` the instant a turn completes - both
+    literally as spec'd. Deliberately **not** rate-limited beyond that (no cooldown
+    between thinks): spamming is T9's job ("governance: budget, rate-limit,
+    oscillation"), not T5's - see the design-choice note in `87_agent.lua`'s header.
+- **Turn:** each turn starts from **one fresh message** - `## Goal` (from `rune.store`,
+  persists across turns and reloads) + `## Vitals`/`## Status`/`## Room`
+  (`rune.json.encode`d snapshots) + `## Recent output` (transcript) - not a growing chat
+  history (that would blow out context over a long session). `stop_reason == "tool_use"`
+  appends the assistant's `content` verbatim plus a `tool_result` user message and
+  calls `rune.llm.chat` again on the *same* accumulating `messages` array (required by
+  the Anthropic-shaped protocol); anything else sets `goal = reply.text` and idles.
+- **Tool dispatch seam (T6 depends on this):** `rune.agent.register_tool(name,
+  description, input_schema, fn)` / `.unregister_tool(name)` - a flat name → fn map,
+  *not* the `rune.registry.new{kind="tool"}` T6 owns. T5 ships with zero tools
+  registered and has no opinion on what exists; `lua/agent_test.go` registers fakes to
+  exercise the full dispatch/continuation cycle standalone. **T6 should build its
+  registry *on top of* this seam**, not replace it: each real tool's registration
+  wraps a registry-governed function (so it gets quarantine/groups/`/tools` listing)
+  and then calls `rune.agent.register_tool(name, ..., that_wrapped_fn)` so T5's turn
+  loop can dispatch it unchanged. A missing or throwing tool becomes a `tool_result`
+  with `is_error = true` (the model sees the failure and can react), never aborts the
+  turn.
+- **Reload safety:** `thinking`/`wake_pending`/in-flight `messages` are plain Lua
+  locals - die with the VM on `/reload`, same as `80_http.lua`'s pending map. Also
+  covers `rune.agent.stop()`: an LLM call already in flight can't be recalled (Go has
+  no HTTP cancel primitive), so `on_reply` checks `active` first and drops a stale
+  result rather than continuing the turn or updating `goal` on a stopped agent's
+  behalf - see `TestAgentStopUnwindsAndDropsInFlightResult`. `goal` alone persists
+  through `rune.store`.
+- **Tests:** `lua/agent_test.go`, Lua-against-mock (same MockHost HTTP capture/delivery
+  as `lua/llm_test.go`) - 11 tests: start requires a model, start enables perception
+  (and is idempotent), prompt → request shape (default `max_tokens`, `tools` omitted
+  when none registered), single-flight + coalesced re-wake in one flow, full tool_use
+  dispatch + continuation (request shape of the follow-up `messages`, including a
+  registered fake tool's schema in `tools`) through to `goal` update, unknown-tool
+  error surfaced as `is_error`, low-hp/combat-start/channel wake sources (combat-start
+  specifically proven edge-triggered), stop unwinding hooks/timer/perception and
+  dropping an in-flight result.
 - **Done when:** the loop completes a full observe→think→act→observe cycle against a
-  mock LLM without blocking the Session.
+  mock LLM without blocking the Session. ✓
 
 #### T6 `[Lua]` — tool layer (incl. reflex-programming; the centerpiece)
 - **Depends:** T5.
 - **Create:** `lua/core/NN_agent_tools.lua`. Model tools as a
   `rune.registry.new{ kind = "tool" }` so they get names/groups/quarantine/`/tools`
-  listing like every other subsystem.
+  listing like every other subsystem. **T5 already has a dispatch seam**:
+  `rune.agent.register_tool(name, description, input_schema, fn)` is a flat map the
+  turn loop calls into - build the registry *on top of* it (wrap each registry-governed
+  function, then call `rune.agent.register_tool` with the wrapped version) rather than
+  having the turn loop learn about the registry directly. See T5's note.
 - **Ship these tools:**
   - `send_command(cmd)` — generic escape hatch → `rune.send`.
   - `speak(channel, msg)` — `say`/`tell <who>`/`gossip` (for collaboration-via-channels).
