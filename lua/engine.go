@@ -532,6 +532,7 @@ func (e *Engine) registerAPIs() {
 	e.registerGMCPFuncs()
 	e.registerHTTPFuncs()
 	e.registerJSONFuncs()
+	e.registerEnvFuncs()
 }
 
 // getRuneFunc returns rune.<table>.<field> if it is a function.

@@ -55,6 +55,12 @@ type Host interface {
 	Load(path string)
 	RefreshBars() // Force immediate bar refresh
 
+	// Environment: read one process environment variable. ok is false
+	// when unset. Host applies no policy - the allowlist restricting
+	// which names scripts may read lives at the Lua boundary
+	// (api_env.go), not here.
+	Env(name string) (string, bool)
+
 	// History
 	GetHistory() []string
 	GetHistoryEntries() []input.Submission

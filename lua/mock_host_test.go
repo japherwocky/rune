@@ -52,6 +52,10 @@ type MockHost struct {
 	// Durable store capture (see Host.StoreSet); raw JSON values
 	StoreData map[string]string
 
+	// Environment variables visible to Host.Env (see rune.env); tests
+	// set this directly rather than mutating real process environment
+	EnvVars map[string]string
+
 	// GMCP capture (see Host.GMCPSend)
 	GMCPSends []struct{ Package, Data string }
 	GMCPErr   error // when set, GMCPSend fails with this error
@@ -256,6 +260,13 @@ func (m *MockHost) StoreDelete(key string) error {
 	defer m.mu.Unlock()
 	delete(m.StoreData, key)
 	return nil
+}
+
+func (m *MockHost) Env(name string) (string, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	v, ok := m.EnvVars[name]
+	return v, ok
 }
 
 func (m *MockHost) AddToHistory(cmd string) {
