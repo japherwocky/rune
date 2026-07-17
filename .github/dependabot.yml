@@ -16,11 +16,3 @@ updates:
     groups:
       github-actions:
         patterns: ["*"]
-
-  - package-ecosystem: npm
-    directory: "/website"
-    schedule:
-      interval: weekly
-    groups:
-      website-dependencies:
-        patterns: ["*"]

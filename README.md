@@ -115,7 +115,6 @@ Full guides, cookbook recipes, and reference live at
 - [Migrating from another MUD client](https://runemud.com/getting-started/migrating/)
 
 In-repo reference: the [architecture overview](docs/architecture.md).
-The API reference source lives at `website/src/content/docs/reference/api/`.
 
 ## License
 

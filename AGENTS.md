@@ -51,7 +51,7 @@ Data-flow: `"output"`, `"prompt"`, `"echo"` support returning `false` to gag or 
 
 ## Lua API
 
-Full reference: `website/src/content/docs/reference/api/` (one page per namespace; published at runemud.com/reference/api/). It is mechanically complete: a new public `rune.*` function must be added there or `lua/api_docs_coverage_test.go` fails. Go primitives (`rune._*`) are internal. Slash commands are registry-based; `/help` is generated from the registry.
+This fork has no docs site (dropped along with `website/`); the Lua core in `lua/core/` is the source of truth for the public API surface. Go primitives (`rune._*`) are internal. Slash commands are registry-based; `/help` is generated from the registry.
 
 User scripts auto-load from `~/.config/rune/init.lua` at startup.
 
