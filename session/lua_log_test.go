@@ -75,6 +75,7 @@ func TestLogDefaultPathUnderConfigDir(t *testing.T) {
 	if _, err := os.Stat(path); err != nil {
 		t.Errorf("default log file not created: %v", err)
 	}
+	userInput(s, "/log stop")
 }
 
 // TestLogSurvivesReload verifies the Go-owned file handle keeps
