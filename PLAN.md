@@ -86,7 +86,7 @@ go test ./...           # tests
 ```
                          ┌─────────────────────────── Lua user-space ───────────────────────────┐
   MUD (botmud)           │                                                                        │
-   │  GMCP + text        │   worldmodel ──▶ agent core (state machine) ──▶ tool layer ──▶ rune.send│
+   │  GMCP + text        │   rune.perception ──▶ agent core (state machine) ──▶ tool layer ──▶ rune.send│
    ▼                     │   (perception)     idle→observe→wait→act        send_command            │
   network ──▶ Session ───┼──▶ rune.gmcp.on / hooks("output","prompt")      speak(channel)          │
   (Go kernel, 1 goroutine)│                        │                       create_trigger ────────┐│
@@ -97,7 +97,7 @@ go test ./...           # tests
   UI seam (ui.UI): BubbleTeaUI (live)  |  HeadlessUI (headless)  ◀── agent logic is UI-agnostic ────┘
 ```
 
-- **Perception** — consume GMCP into a live world-model table; keep a rolling text
+- **Perception** — consume GMCP into a live world-model table (`rune.perception`); keep a rolling text
   transcript from the `output` hook. Uses existing `rune.gmcp`/`hooks`.
 - **Transport** — Phase 1 uses existing `rune.http.post` to OpenCode Zen
   (opencode.ai/zen, see T2/T4); Phase 2 hardens into a Go `rune._llm` primitive
@@ -162,30 +162,66 @@ The two tasks that unblock everything and do **not** depend on botmud#20 are T1 
 - **Done when:** `rune.env("OPENCODE_API_KEY")` returns the value in a real run and
   `nil` for non-allowlisted names.
 
-#### T3 `[Lua]` — world-model module (perception)
+#### T3 `[Lua]` — world-model module (perception) — **done**, `lua/core/84_perception.lua`
 - **Why:** the agent's sensors. **Buildable/testable now** with GMCP fixtures, before
   botmud#20 ships.
-- **Create:** `lua/core/NN_worldmodel.lua` (or ship as a user script first, then
-  graduate to core). Public surface e.g. `rune.world.snapshot()` returning a compact
-  table `{ vitals, status, room, channels = {recent...} }`.
-- **Wire:**
+- **Namespace:** `rune.perception`, not `rune.world` — `65_worlds.lua` already owns
+  `rune.world` for MUD server bookmarks (`/world add`, `/connect`). A later file loading
+  after it (`8x_*.lua` > `65_worlds.lua`) would silently clobber that table if it also
+  assigned `rune.world = {}`; caught via a broken `TestWorldResolution` while implementing.
+- **Public surface (implemented):** `rune.perception.snapshot()` returns
+  `{ vitals, status, room, channels }`, a fresh defensive copy each call.
+  `rune.perception.transcript()` returns the rolling output ring buffer (T5 needs this
+  alongside `snapshot()` for the LLM turn - it isn't part of `snapshot()` itself).
+  `rune.perception.map()` returns the durable learned map.
+- **Gated behind `enable()` - not in the original plan, required:** this is a **core**
+  file, loaded for every Rune session whether or not an agent is running. Subscribing to
+  GMCP packages and writing to the durable store are observable side effects a plain
+  human user never asked for, so the module registers nothing at load time. **T5's agent
+  core MUST call `rune.perception.enable()` at startup** (and may call `.disable()` to
+  pause perception + GMCP subscriptions; both idempotent, `.is_enabled()` to query).
+  Discovered because unconditional subscription at load time broke two pre-existing GMCP
+  handshake tests that assumed a clean default subscription set
+  (`TestGMCPHandshakeAndSubscriptions`, `TestGMCPEnabledTriggersHandshake`) - a good
+  signal that core scripts must stay opt-in for anything with an observable side effect.
+- **Wire (implemented, inside `enable()`):**
   - `rune.gmcp.subscribe("Char", 1)`, `rune.gmcp.subscribe("Room", 1)`,
     `rune.gmcp.subscribe("Comm", 1)` (triggers `Core.Supports.Set`).
-  - `rune.gmcp.on("Char.Vitals", ...)`, `"Char.Status"`, `"Room.Info"`,
-    `"Comm.Channel"` — update the model. Handler signature is `function(data, package)`
-    where `data` is the decoded value (see `lua/core/70_gmcp.lua`).
-  - `rune.hooks.on("output", ...)` — append cleaned lines to a bounded rolling
-    transcript (ring buffer, cap ~200 lines). Do not gag.
-  - `rune.hooks.on("disconnected", ...)` — reset volatile model.
-- **Durable map:** on `Room.Info`, record the room by `num` in `rune.store` and, when
-  you know the previous room + the direction moved, record `prev.num --dir--> num`
-  (learned by walking; see §4). Keep this out of the hot path if large.
-- **Tests:** e2e scenario JSON that injects `Char.Vitals`/`Room.Info`/`Comm.Channel`
-  GMCP messages and asserts `rune.world.snapshot()` reflects them (model on
-  `test/e2e/scenarios/regressions/30-aardwolf-gmcp-color.json`). Lua-against-mock for
-  the transcript ring buffer.
+  - `rune.gmcp.on("Char.Vitals", ...)`, `"Char.Status"`, `"Room.Info"` **replace** the
+    corresponding local outright (`vitals = data`, not a merge) - the GMCP spec emits a
+    full snapshot of each package on every update and omits fields that no longer apply
+    (e.g. `Char.Status` drops `enemy`/`enemy_condition` once combat ends). Merging would
+    leave a stale "phantom" enemy behind after the fight ends.
+  - `rune.gmcp.on("Comm.Channel", ...)` appends to a bounded ring (cap 20).
+  - `rune.hooks.on("output", ...)` at priority 200 (after triggers, so a gagged line
+    stays out of the transcript too - a human wouldn't see it either) appends
+    `line:clean()` to a bounded rolling transcript (cap 200). Never gags.
+  - `rune.hooks.on("disconnected", ...)` resets all volatile state.
+  - **Not in the original plan, needed for the durable map below:** `rune.hooks.on(
+    "input", ...)` at default priority (50, below the core handler's 100) watches
+    outgoing text against ROM's fixed movement vocabulary (n/north, s/south, ... - see
+    the module) and remembers it as `last_dir`, cleared on every input (movement or not)
+    so a stale direction from an earlier blocked move can't be attributed to a later,
+    unrelated room change (e.g. recall/teleport).
+- **Durable map (implemented):** on `Room.Info`, record the room by `num` in
+  `rune.store` under `rooms[tostring(num)]`, and when the previous room and `last_dir`
+  are both known and the new room differs, record `edges[tostring(prev_num)][last_dir] =
+  num`. Keys are stringified - `rune.store`'s JSON bridge (`api_store.go`) rejects tables
+  with sparse/non-sequential numeric keys, which arbitrary room numbers always are. Only
+  called from the (comparatively rare) `Room.Info` handler, never from chatty
+  `Char.Vitals`, so this stays out of the hot path despite `rune.store.set` being a
+  synchronous file write.
+- **Tests (implemented differently than originally planned):** Lua-against-mock only
+  (`lua/perception_test.go`), not e2e. Per `docs/testing.md`'s "lowest layer that can
+  express the failure": `Engine.OnGMCP`/`OnOutput`/`OnInput` reach this module directly
+  against `MockHost`, no live session/TCP needed, and nothing here is user-visible yet
+  (T7 adds that) for an e2e scenario to assert on. Covers: empty initial snapshot,
+  snapshot reflecting injected GMCP, `Char.Status` fields clearing (not going stale) when
+  a later update omits them, channel/transcript ring-buffer caps, disconnect reset, and
+  the map recording an edge only after a real move (not on a repeated room, not across a
+  non-movement command).
 - **Done when:** snapshot reflects injected GMCP; transcript stays bounded; map records
-  dir→dest only after a move.
+  dir→dest only after a move. ✓
 
 #### T4 `[Lua]` — LLM client (Phase 1 transport via rune.http)
 - **Why:** talk to an LLM without new Go yet.
@@ -220,7 +256,9 @@ The two tasks that unblock everything and do **not** depend on botmud#20 are T1 
 #### T5 `[Lua]` — agent core (state machine + cadence)
 - **Depends:** T3, T4.
 - **Create:** `lua/core/NN_agent.lua`. A single-flight state machine:
-  `idle → observing → waiting_llm → acting → observing`.
+  `idle → observing → waiting_llm → acting → observing`. **Must call
+  `rune.perception.enable()` at startup** — T3's perception module is inert (no GMCP
+  subscriptions, no hooks registered) until something explicitly enables it; see T3.
 - **Cadence (combine):**
   - wake flag set by salient events (register triggers/gmcp handlers/hooks for
     combat-start, low-hp, a tell arriving);
@@ -229,9 +267,9 @@ The two tasks that unblock everything and do **not** depend on botmud#20 are T1 
     flight;
   - **single-flight:** never two LLM calls outstanding; events during a think coalesce
     into "think again on return."
-- **Turn:** gather `rune.world.snapshot()` + recent transcript + goal + tool defs →
-  `rune.llm.chat` → on `tool_use`, dispatch to T6 tools, capture results, feed
-  `tool_result` back and continue the turn; on text/end, update goal and idle.
+- **Turn:** gather `rune.perception.snapshot()` + `rune.perception.transcript()` + goal +
+  tool defs → `rune.llm.chat` → on `tool_use`, dispatch to T6 tools, capture results,
+  feed `tool_result` back and continue the turn; on text/end, update goal and idle.
 - **Reload safety:** keep in-flight state and pending callbacks in Lua (like
   `80_http.lua`) so `/reload` abandons them cleanly. Durable memory lives in
   `rune.store`.
