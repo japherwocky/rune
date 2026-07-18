@@ -154,9 +154,15 @@ on_reply = function(messages, reply, err)
 
     if err then
         rune.echo(rune.style.red("[agent]") .. " " .. err)
+        rune.hooks.call("agent_error", err)
         finish_turn()
         return
     end
+
+    -- Fires for every hop of the turn, including intermediate
+    -- tool_use replies (which often carry reasoning text alongside
+    -- the tool call) - T7's pane/log watch this for live reasoning.
+    rune.hooks.call("agent_reply", reply)
 
     if reply.stop_reason == "tool_use" and #reply.tool_uses > 0 then
         table.insert(messages, { role = "assistant", content = reply.content })
@@ -164,6 +170,7 @@ on_reply = function(messages, reply, err)
         local results = {}
         for _, tu in ipairs(reply.tool_uses) do
             local content, is_error = dispatch_tool(tu.name, tu.input)
+            rune.hooks.call("agent_tool_call", tu.name, tu.input, content, is_error)
             table.insert(results, {
                 type = "tool_result",
                 tool_use_id = tu.id,
@@ -182,12 +189,14 @@ on_reply = function(messages, reply, err)
     if reply.text and reply.text ~= "" then
         set_goal(reply.text)
     end
+    rune.hooks.call("agent_turn_end", reply)
     finish_turn()
 end
 
 start_turn = function()
     thinking = true
     wake_pending = false
+    rune.hooks.call("agent_turn_start")
     local messages = { { role = "user", content = build_observation() } }
     request(messages, function(reply, err)
         on_reply(messages, reply, err)

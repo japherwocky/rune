@@ -391,14 +391,66 @@ The two tasks that unblock everything and do **not** depend on botmud#20 are T1 
   blocking it.
 - **Done when:** the agent can install, fire, list, and clear its own triggers by group. ✓
 
-#### T7 `[Lua]` — observability (live mode)
-- **Create:** `lua/core/NN_agent_ui.lua` (or fold into agent). A reasoning pane
-  (`rune.pane` — note this fork has `rune.pane.show/hide`), a state bar (`rune.bars`,
-  250ms tick) showing state/goal/tokens/$/last-action, and per-turn logging via
-  `rune.log` (prompt, response, tool calls, results).
-- **Tests:** light — bar renderer returns expected content for a given agent state
-  (Lua-against-mock). Pane writes are best-effort.
-- **Done when:** in a live run you can watch reasoning + state; every turn is logged.
+#### T7 `[Lua]` — observability (live mode) ✓
+- **Created:** `lua/core/96_agent_ui.lua` - **not** `NN` picked naively. `rune.pane` is
+  defined in `95_ui.lua`, one of the last core files to load; a first attempt at `89_`
+  loaded before it and every session-boot failed with "attempt to index a non-table
+  object(nil)" on `rune.pane.create`. Numbering a new core file has to check what it
+  actually depends on, not just take the next free slot after the task it logically
+  follows - lesson recorded here so it isn't relearned.
+- **T5 grew five hook points for this (`87_agent.lua`, documented in `20_hooks.lua`'s
+  event list):** `agent_turn_start` (no args), `agent_reply(reply)` (fires per hop,
+  including intermediate tool_use replies - carries reasoning text alongside a tool
+  call), `agent_tool_call(name, input, result, is_error)`, `agent_turn_end(reply)`,
+  `agent_error(err)`. T7 is a **pure observer** of these - it never calls back into
+  `rune.agent`, so a broken renderer can't derail a think (and, being ordinary hook
+  handlers, a failing one is quarantined after 3 errors like anything else rather than
+  spamming). This keeps T5 fully ignorant of panes/bars/logs, same separation as T5/T6.
+- **Reasoning pane:** `rune.pane.create("agent")` at load (idempotent - confirmed
+  against `ui/tui/widget/pane.go`'s `Create`, a safe no-op on an existing name, so this
+  survives `/reload` without resetting content/visibility) + `rune.pane.show("agent")`
+  on every turn start. Writes turn-start/end markers, reasoning text, and
+  `[tool] name(input) -> result` lines - registered unconditionally (like the core
+  status bar) but genuinely inert for a plain human session: nothing ever calls the
+  `agent_*` hooks unless `rune.agent.start()` runs, and the pane is invisible unless
+  something places `{name="agent", height=N}` into `rune.ui.layout` (not done
+  automatically - forcing a new pane into a human's screen would be exactly the
+  unwanted-side-effect mistake T3 already ran into once).
+- **State bar:** `rune.ui.bar("agent", ...)` shows `state | tokens | last-action | goal`,
+  or just `"agent: stopped"` when inactive. `rune.agent_ui.summary()` exposes the same
+  fields as plain data (`{input_tokens, output_tokens, cost, last_action}`) so tests (and
+  `/agent`) don't have to scrape a styled/rendered string.
+- **On "$":** deliberately **not** computed by default. Zen's model catalog rotates
+  (T4/T8) and fabricating a number from guessed per-model pricing would be actively
+  misleading - worse than omitting it. `rune.agent_ui.pricing = {input_per_million,
+  output_per_million}` is an optional config slot a deployer can set for a real
+  estimate; `summary().cost` stays `nil` until they do. Real budget *enforcement* is
+  T9's job ("governance: budget, rate-limit, ..."); this layer only ever displays.
+- **Per-turn logging:** `rune.log.write("[Agent] " .. ...)` from the same hook handlers -
+  reuses the one shared session log (`60_log.lua` explicitly documents this escape
+  hatch) rather than opening a second file handle that would fight over `rune._log`'s
+  single Go-owned handle. No-ops while no log is open, exactly like every other
+  `rune.log.write` caller - confirmed by test, not just inferred from the doc comment.
+- **`/agent` command:** status only (active/thinking/goal/tokens/last-action) -
+  deliberately **not** `/agent start|stop`. T5 made a considered choice to be
+  Lua-API-only with no slash command of its own; adding start/stop control here would
+  silently expand that decision under T7's "observability" banner instead of being a
+  deliberate call. Starting the agent today is one `rune.lua` line or an init.lua
+  snippet.
+- **Collateral fix:** `pane_test.go` (predates T7) asserted an *exact* global pane-call
+  count; booting now also creates the "agent" pane, so it was updated to filter to the
+  `"chat"` pane it actually pins - the same class of fix as T6's `agent_test.go` updates
+  when tool registration stopped being empty-by-default.
+- **Tests:** `lua/agent_ui_test.go`, Lua-against-mock - 8 tests: bar content for
+  stopped/thinking/idle states (including the goal appearing in the idle bar),
+  `summary()` tracking tokens and `last_action` mid-turn (`"tool: send_command"`) and at
+  turn end (`"idle"`), pricing left `nil` by default vs. computing correctly once
+  configured, pane writes occurring at each lifecycle point (turn start / tool call /
+  turn end - "best-effort" per the plan, so occurrence is checked, not exact text),
+  `rune.log.write` firing per-turn when a log is active and silent when it isn't
+  (proving the no-op claim, not just trusting the doc comment), and `/agent`'s output
+  before and after a turn.
+- **Done when:** in a live run you can watch reasoning + state; every turn is logged. ✓
 
 ### Phase 2 — harden + govern
 

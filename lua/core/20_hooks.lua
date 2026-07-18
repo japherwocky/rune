@@ -33,6 +33,12 @@
 --   "gmcp"         -- Every GMCP message: (package, data, raw);
 --                     catch-all alongside rune.gmcp.on (70_gmcp.lua)
 --   "gmcp_enabled" -- GMCP negotiated; the core handler sends Core.Hello
+--   "agent_turn_start" -- A new agent turn begins (87_agent.lua); no args
+--   "agent_reply"       -- Every LLM reply within a turn, including
+--                          intermediate tool_use hops: (reply)
+--   "agent_tool_call"   -- A tool dispatched: (name, input, result, is_error)
+--   "agent_turn_end"    -- The turn reached text/end_turn: (reply)
+--   "agent_error"       -- rune.llm.chat itself failed: (err)
 
 -- Per-event dispatch index, maintained alongside the registry so
 -- rune.hooks.call doesn't scan unrelated events on every line.

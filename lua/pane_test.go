@@ -18,18 +18,28 @@ func TestPaneShowHideReachHostWithVisibility(t *testing.T) {
 		t.Fatalf("script failed: %v", err)
 	}
 
+	// Core boot also creates its own panes (e.g. 96_agent_ui.lua's
+	// "agent" pane) - filter to "chat" so this test only pins the
+	// show/hide/toggle wrapper mapping it actually cares about.
+	var got []struct{ Op, Name, Data string }
+	for _, call := range host.PaneCalls {
+		if call.Name == "chat" {
+			got = append(got, call)
+		}
+	}
+
 	want := []struct{ Op, Name, Data string }{
 		{"create", "chat", ""},
 		{"set_visible", "chat", "true"},
 		{"set_visible", "chat", "false"},
 		{"toggle", "chat", ""},
 	}
-	if len(host.PaneCalls) != len(want) {
-		t.Fatalf("got %d pane calls, want %d: %v", len(host.PaneCalls), len(want), host.PaneCalls)
+	if len(got) != len(want) {
+		t.Fatalf("got %d \"chat\" pane calls, want %d: %v", len(got), len(want), got)
 	}
 	for i, w := range want {
-		if host.PaneCalls[i] != w {
-			t.Errorf("call %d: got %v, want %v", i, host.PaneCalls[i], w)
+		if got[i] != w {
+			t.Errorf("call %d: got %v, want %v", i, got[i], w)
 		}
 	}
 }
