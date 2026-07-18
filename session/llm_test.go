@@ -17,14 +17,17 @@ import (
 	"time"
 )
 
-// withLLMTestServer points llmURL at srv for the calling test and
-// restores the real Zen endpoint on cleanup. llmURL is package state,
-// so callers must not run this under t.Parallel().
+// withLLMTestServer points the "zen" provider at srv for the calling
+// test via RUNE_LLM_URL - the same override a real deployment would
+// use, just aimed at a local httptest.Server instead of the real
+// gateway. Also pins RUNE_LLM_PROVIDER=zen explicitly so a real
+// RUNE_LLM_PROVIDER set in the developer's own shell (increasingly
+// plausible now that T8b exists) can't leak into a test expecting the
+// zen-default path - t.Setenv restores both on cleanup.
 func withLLMTestServer(t *testing.T, srv *httptest.Server) {
 	t.Helper()
-	orig := llmURL
-	llmURL = srv.URL
-	t.Cleanup(func() { llmURL = orig })
+	t.Setenv(llmProviderEnv, "zen")
+	t.Setenv(llmURLEnv, srv.URL)
 }
 
 // withNoLLMBackoff zeroes the retry delay so retry tests run at full
@@ -215,5 +218,140 @@ func TestLLMRetriesExhaustedDeliversLastResponse(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&hits); got != llmMaxAttempts {
 		t.Errorf("server saw %d requests, want %d (every attempt exhausted)", got, llmMaxAttempts)
+	}
+}
+
+// TestLLMOpenAIProviderOmitsAuthWhenNoKey proves the common local
+// case - llama.cpp's llama-server needs no key by default - sends a
+// clean request with no Authorization header at all, not an empty
+// "Bearer ".
+func TestLLMOpenAIProviderOmitsAuthWhenNoKey(t *testing.T) {
+	s, _, _ := newTestSession(t)
+	t.Setenv("RUNE_LLM_API_KEY", "")
+
+	var authHeaderPresent bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, authHeaderPresent = r.Header["Authorization"]
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"hi there"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}`))
+	}))
+	defer srv.Close()
+	t.Setenv("RUNE_LLM_PROVIDER", "openai")
+	t.Setenv(llmURLEnv, srv.URL)
+
+	err := s.engine.DoString("test", `
+		rune.llm.chat({
+			model = "local",
+			messages = { { role = "user", content = "look" } },
+			max_tokens = 512,
+		}, function(reply, err)
+			rune.session.set("text", tostring(reply and reply.text))
+			rune.session.set("err", tostring(err))
+		end)
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	awaitAsyncResult(t, s)
+
+	if v, _ := s.SessionGet("text"); v != "hi there" {
+		t.Errorf("text = %q, want %q", v, "hi there")
+	}
+	if authHeaderPresent {
+		t.Errorf("Authorization header present, want none (no key configured)")
+	}
+}
+
+// TestLLMOpenAIProviderSendsBearerWhenKeySet proves a configured
+// RUNE_LLM_API_KEY (e.g. a remote OpenAI-compatible host that does
+// require one) is attached as a standard Bearer token.
+func TestLLMOpenAIProviderSendsBearerWhenKeySet(t *testing.T) {
+	s, _, _ := newTestSession(t)
+
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"hi there"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}`))
+	}))
+	defer srv.Close()
+	t.Setenv("RUNE_LLM_PROVIDER", "openai")
+	t.Setenv(llmURLEnv, srv.URL)
+	t.Setenv("RUNE_LLM_API_KEY", "local-key-456")
+
+	err := s.engine.DoString("test", `
+		rune.llm.chat({
+			model = "local",
+			messages = { { role = "user", content = "look" } },
+			max_tokens = 512,
+		}, function(reply, err) end)
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	awaitAsyncResult(t, s)
+
+	if gotAuth != "Bearer local-key-456" {
+		t.Errorf("Authorization = %q, want %q", gotAuth, "Bearer local-key-456")
+	}
+}
+
+// TestLLMOpenAIProviderMissingURLDeliversError proves a local server's
+// address is never guessed - RUNE_LLM_PROVIDER=openai without
+// RUNE_LLM_URL fails fast with a clear error instead of silently
+// falling back to Zen's endpoint or some hardcoded localhost:port
+// that might be wrong.
+func TestLLMOpenAIProviderMissingURLDeliversError(t *testing.T) {
+	s, _, _ := newTestSession(t)
+	t.Setenv("RUNE_LLM_PROVIDER", "openai")
+	t.Setenv(llmURLEnv, "")
+
+	err := s.engine.DoString("test", `
+		rune.llm.chat({
+			model = "local",
+			messages = { { role = "user", content = "look" } },
+			max_tokens = 512,
+		}, function(reply, err)
+			rune.session.set("err", tostring(err))
+		end)
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	awaitAsyncResult(t, s)
+
+	if v, _ := s.SessionGet("err"); !strings.Contains(v, "RUNE_LLM_URL") {
+		t.Errorf("err = %q, want it to mention RUNE_LLM_URL", v)
+	}
+}
+
+// TestLLMUnknownProviderDeliversError proves a typo'd
+// RUNE_LLM_PROVIDER fails with a clear message rather than silently
+// behaving like "zen" (which would produce a confusing "OPENCODE_API_KEY
+// is not set" for someone who never meant to talk to Zen at all).
+func TestLLMUnknownProviderDeliversError(t *testing.T) {
+	s, _, _ := newTestSession(t)
+	t.Setenv("RUNE_LLM_PROVIDER", "openia")
+
+	err := s.engine.DoString("test", `
+		rune.llm.chat({
+			model = "local",
+			messages = { { role = "user", content = "look" } },
+			max_tokens = 512,
+		}, function(reply, err)
+			rune.session.set("err", tostring(err))
+		end)
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	awaitAsyncResult(t, s)
+
+	if v, _ := s.SessionGet("err"); !strings.Contains(v, "openia") {
+		t.Errorf("err = %q, want it to mention the bad provider name", v)
 	}
 }

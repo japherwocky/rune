@@ -6,8 +6,17 @@ import glua "github.com/yuin/gopher-lua"
 // scripts may read via rune.env. Everything else returns nil, exactly
 // like an unset variable, so scripts get no signal to distinguish "not
 // allowed" from "not set" - the allowlist can't be probed from Lua.
+//
+// RUNE_LLM_PROVIDER is not a secret (unlike the API keys below, which
+// stay Go-only per LLMRequest's doc comment in host.go) - 86_llm.lua
+// needs to read it to decide which wire-format JSON to build/parse
+// (Anthropic-shaped vs. OpenAI-shaped), so it's safe and necessary to
+// allowlist. RUNE_LLM_URL and RUNE_LLM_API_KEY never need to reach
+// Lua - session/lua_llm.go reads those directly, same as
+// OPENCODE_API_KEY.
 var envAllowlist = map[string]bool{
-	"OPENCODE_API_KEY": true,
+	"OPENCODE_API_KEY":  true,
+	"RUNE_LLM_PROVIDER": true,
 }
 
 // registerEnvFuncs registers rune._env.* primitives.

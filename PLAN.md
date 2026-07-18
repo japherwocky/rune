@@ -652,6 +652,91 @@ The two tasks that unblock everything and do **not** depend on botmud#20 are T1 
   tested end-to-end through the real `create_trigger` → quarantine → wake path, not a
   synthetic shortcut) ✓.
 
+#### T9b `[Go+Lua]` — OpenAI-compatible provider (llama.cpp, local/self-hosted) ✓
+- **Why:** run the agent against a local `llama.cpp` (`llama-server`) instance - or any
+  other server speaking the same OpenAI chat/completions wire format (Ollama, vLLM, LM
+  Studio, ...) - instead of OpenCode Zen. Motivated by wanting to develop/test without a
+  hosted key or network dependency, not a vendor preference.
+- **Design constraint that shaped this:** `rune.llm.chat`'s public req/reply shape (T4) is
+  Anthropic-Messages-flavored, and everything above `86_llm.lua` - `87_agent.lua`,
+  `88_agent_tools.lua`, `91_agent_policy.lua` - only ever touches that canonical shape,
+  never raw JSON. `llama-server` speaks OpenAI's `/v1/chat/completions` shape, not
+  Anthropic's, so the work is entirely a translation layer at the existing provider
+  boundary (`86_llm.lua` for JSON shape, `session/lua_llm.go` for URL/auth) - **zero
+  changes** to the agent core, tools, or governance layer.
+- **Provider selection: `RUNE_LLM_PROVIDER`**, read independently on both sides of the
+  boundary rather than one side telling the other - the same pattern as
+  `OPENCODE_API_KEY` already being Go-only and invisible to Lua:
+  - `session/lua_llm.go` reads it to pick the URL/auth-header/key-requirement (`zen`,
+    default, vs. `openai`).
+  - `lua/core/86_llm.lua` reads it (via `rune.env` - added to `api_env.go`'s allowlist,
+    since unlike an API key this name isn't a secret) to pick which JSON shape to
+    build/parse.
+  - An unrecognized value is a configuration error delivered through the normal
+    `_deliver(id, nil, err)` path (not a raise) rather than silently behaving like `zen` -
+    a typo'd provider name would otherwise produce a confusing "OPENCODE_API_KEY is not
+    set" for someone who never meant to talk to Zen at all.
+- **`RUNE_LLM_URL`** overrides the endpoint for either provider; **required** (fails fast
+  with a clear error, gateway never contacted) when `RUNE_LLM_PROVIDER=openai` - a local
+  server's address/port is deployment-specific, and guessing a default (e.g.
+  `localhost:8080`) would silently point at the wrong thing more often than the right one,
+  the same reasoning T4/T7 already used to decline defaulting `req.model` or a per-model $
+  price. `RUNE_LLM_API_KEY` is optional for `openai` - `llama-server` needs no key by
+  default, so it's only attached as `Authorization: Bearer <key>` when configured (a bare
+  `Authorization: Bearer ` on every request would be worse than omitting the header
+  entirely). Neither var is Lua-visible; both are read directly in `session/lua_llm.go`,
+  same as `OPENCODE_API_KEY`.
+- **Wire-format translation (`86_llm.lua`), both directions:**
+  - Request: `system` becomes a leading `{role="system"}` message (OpenAI has no top-level
+    `system` field); `{name, description, input_schema}` tools become `{type="function",
+    function={name, description, parameters}}`; a canonical assistant message's content
+    array becomes OpenAI's separate `content`/`tool_calls` fields; a canonical user
+    message carrying `tool_result` blocks expands into **one OpenAI `role="tool"` message
+    per block** (OpenAI has no multi-block content the way Anthropic does, so one incoming
+    message can become several outgoing ones).
+  - **`is_error` fidelity gap, closed rather than left silent:** Anthropic's `tool_result`
+    block has an `is_error` flag; OpenAI's `role="tool"` message has no equivalent field.
+    Dropping it would leave a local model blind to its own tool failures, so a
+    true `is_error` is folded into the text itself as an `"Error: "` prefix instead of
+    being discarded.
+  - Response: `choices[1].message` is synthesized back into the same Anthropic-shaped
+    `content` array (`text`/`tool_use` blocks) the Zen path produces natively, so
+    `split_content` and the tool-result round trip (`87_agent.lua` echoes `reply.content`
+    back verbatim on the next hop, which the request-side translation above then
+    re-translates) behave identically regardless of which wire was actually spoken.
+    `function.arguments` arrives as a JSON **string** in OpenAI's shape (unlike
+    Anthropic's already-decoded `tool_use.input`) - decoded here so `tool_uses[].input` is
+    always a table either way. `usage.prompt_tokens`/`completion_tokens` map onto the
+    existing `input_tokens`/`output_tokens` fields T7's tracking already reads.
+  - `finish_reason` → `stop_reason`: only `"tool_calls"` → `"tool_use"` is translated (the
+    one value `87_agent.lua`'s `on_reply` actually branches on) plus `"length"` →
+    `"max_tokens"` (a direct, unambiguous correspondence); anything else (e.g. plain
+    `"stop"`) passes through unchanged rather than being forced into an Anthropic term the
+    backend never actually said - still visible in T7's turn-end log either way.
+- **`req.model` against a local server:** typically ignored server-side (`llama-server`
+  serves whatever's loaded) - any non-empty placeholder satisfies the existing "model
+  required" validation; no code change needed.
+- **Tests:** `session/llm_test.go` gained coverage for the Go-side URL/auth split - a
+  configured `RUNE_LLM_API_KEY` is sent as a standard Bearer token, no key configured
+  sends no `Authorization` header at all (not an empty `"Bearer "`), a missing
+  `RUNE_LLM_URL` under `openai` delivers an error without ever contacting a server, and an
+  unrecognized provider name delivers an error naming it. The test seam changed from
+  mutating a package var (`llmURL`) to `t.Setenv(RUNE_LLM_URL, ...)` - the same override a
+  real deployment uses, just aimed at an `httptest.Server`; `withLLMTestServer` also now
+  pins `RUNE_LLM_PROVIDER=zen` explicitly so a real value of that var in a developer's own
+  shell (increasingly plausible now that this exists) can't leak into a test expecting the
+  zen-default path. `lua/llm_test.go` gained the JSON-shape coverage: request body shape
+  (system-as-message, tools-as-function-defs), a text-only response, a tool_calls response
+  (proving `arguments` is decoded from a JSON string into a table), and a tool-result
+  continuation built the same way `87_agent.lua` would build one - proving the
+  assistant-content round trip and the `is_error` → `"Error: "` prefix both survive the
+  translation.
+- **Done when:** `RUNE_LLM_PROVIDER=openai` + `RUNE_LLM_URL` pointed at a local
+  `llama-server` runs the full agent loop - tool calls included - with zero changes to
+  `87_agent.lua`/`88_agent_tools.lua`/`91_agent_policy.lua` ✓ (proven by construction: none
+  of those files were touched); a missing/bad config fails fast with a clear error instead
+  of a confusing downstream failure or a silent wrong-endpoint guess ✓.
+
 ### Phase 3 — headless
 
 #### T10 `[Go+cmd]` — HeadlessUI + `--headless`
@@ -691,7 +776,10 @@ The two tasks that unblock everything and do **not** depend on botmud#20 are T1 
   free/promotional ones; the point is cheap experimentation, not a specific vendor.
   `rune.llm.chat`'s public signature (T4) stays provider-shaped input/output
   (system/messages/tools/max_tokens in, a normalized reply out) so swapping the model,
-  or the provider again later, doesn't ripple into T5/T6.
+  or the provider again later, doesn't ripple into T5/T6. **Bore out as intended:** T9b
+  added a second, OpenAI-chat-completions-shaped provider (`llama.cpp` et al.) behind
+  `RUNE_LLM_PROVIDER`, entirely inside `86_llm.lua`/`session/lua_llm.go` - T5/T6/T9
+  needed zero changes, confirming this boundary was drawn in the right place.
 - **Model + wire-format specifics:** confirmed so far - Zen exists, `OPENCODE_API_KEY`,
   `/v1/messages` is the Anthropic-Messages-API-shaped endpoint, `/v1/models` lists what's
   available. **Not yet confirmed** - the exact auth header on `/v1/messages`
