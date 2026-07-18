@@ -3,7 +3,7 @@ package lua
 // T6 tool tests (88_agent_tools.lua): send_command, speak,
 // create_trigger, create_alias, remove_group, list_automation. These
 // drive the *real* agent turn cycle (start -> wake -> canned tool_use
-// -> continuation), the same MockHost HTTP mechanism as agent_test.go
+// -> continuation), the same MockHost LLM mechanism as agent_test.go
 // and llm_test.go, rather than reaching into T5's private tool map -
 // there is no other entry point, by design (see 87_agent.lua).
 //
@@ -22,18 +22,18 @@ import (
 )
 
 // startAgentAndWake starts the agent and fires a prompt, returning the
-// id of the resulting HTTP call.
+// id of the resulting LLM call.
 func startAgentAndWake(t *testing.T, engine *Engine, host *MockHost) int {
 	t.Helper()
 	if err := engine.DoString("start", `rune.agent.start({ model = "deepseek-v4-flash-free" })`); err != nil {
 		t.Fatal(err)
 	}
-	before := len(host.HTTPCalls)
+	before := len(host.LLMCalls)
 	engine.OnPrompt(text.NewLine("prompt"))
-	if len(host.HTTPCalls) != before+1 {
-		t.Fatalf("expected a new HTTP call after prompt, had %d now have %d", before, len(host.HTTPCalls))
+	if len(host.LLMCalls) != before+1 {
+		t.Fatalf("expected a new LLM call after prompt, had %d now have %d", before, len(host.LLMCalls))
 	}
-	return host.HTTPCalls[len(host.HTTPCalls)-1].ID
+	return host.LLMCalls[len(host.LLMCalls)-1].ID
 }
 
 // deliverToolUse delivers a canned single-tool_use response and
@@ -44,18 +44,18 @@ func deliverToolUse(t *testing.T, engine *Engine, host *MockHost, id int, toolUs
 	if err != nil {
 		t.Fatal(err)
 	}
-	before := len(host.HTTPCalls)
+	before := len(host.LLMCalls)
 	body := fmt.Sprintf(`{"content":[{"type":"tool_use","id":%q,"name":%q,"input":%s}],"stop_reason":"tool_use","usage":{"input_tokens":1,"output_tokens":1}}`,
 		toolUseID, toolName, inputJSON)
-	engine.OnHTTPResult(id, &HTTPResponse{Status: 200, Body: body}, "")
-	if len(host.HTTPCalls) != before+1 {
-		t.Fatalf("expected the turn to continue with a new call, had %d now have %d", before, len(host.HTTPCalls))
+	engine.OnLLMResult(id, &HTTPResponse{Status: 200, Body: body}, "")
+	if len(host.LLMCalls) != before+1 {
+		t.Fatalf("expected the turn to continue with a new call, had %d now have %d", before, len(host.LLMCalls))
 	}
-	return host.HTTPCalls[len(host.HTTPCalls)-1].ID
+	return host.LLMCalls[len(host.LLMCalls)-1].ID
 }
 
 func deliverEndTurn(engine *Engine, host *MockHost, id int, text string) {
-	engine.OnHTTPResult(id, &HTTPResponse{
+	engine.OnLLMResult(id, &HTTPResponse{
 		Status: 200,
 		Body: fmt.Sprintf(`{"content":[{"type":"text","text":%q}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`,
 			text),
@@ -67,7 +67,7 @@ func deliverEndTurn(engine *Engine, host *MockHost, id int, text string) {
 // tool_result block's content/is_error.
 func lastToolResult(t *testing.T, host *MockHost) (content string, isError bool) {
 	t.Helper()
-	call := host.HTTPCalls[len(host.HTTPCalls)-1]
+	call := host.LLMCalls[len(host.LLMCalls)-1]
 	var body map[string]interface{}
 	if err := json.Unmarshal([]byte(call.Req.Body), &body); err != nil {
 		t.Fatal(err)
@@ -167,8 +167,8 @@ func TestAgentToolsCreateTriggerFiresReflex(t *testing.T) {
 	if len(sent) != 1 || sent[0] != "kill kobold" {
 		t.Fatalf("expected the trigger to fire [\"kill kobold\"], got %v", sent)
 	}
-	if len(host.HTTPCalls) != 2 {
-		t.Fatalf("the reflex must not involve the LLM: expected 2 total HTTP calls, got %d", len(host.HTTPCalls))
+	if len(host.LLMCalls) != 2 {
+		t.Fatalf("the reflex must not involve the LLM: expected 2 total LLM calls, got %d", len(host.LLMCalls))
 	}
 }
 
@@ -246,7 +246,7 @@ func TestAgentToolsRemoveGroupClearsTriggersAndAliases(t *testing.T) {
 
 	// One response, two tool_use blocks: a trigger and an alias in the
 	// same group.
-	before := len(host.HTTPCalls)
+	before := len(host.LLMCalls)
 	body := `{
 		"content": [
 			{"type": "tool_use", "id": "toolu_1", "name": "create_trigger", "input": {"pattern": "x", "command": "y", "group": "combat"}},
@@ -255,11 +255,11 @@ func TestAgentToolsRemoveGroupClearsTriggersAndAliases(t *testing.T) {
 		"stop_reason": "tool_use",
 		"usage": {"input_tokens": 1, "output_tokens": 1}
 	}`
-	engine.OnHTTPResult(id, &HTTPResponse{Status: 200, Body: body}, "")
-	if len(host.HTTPCalls) != before+1 {
-		t.Fatalf("expected the turn to continue, got %d calls", len(host.HTTPCalls))
+	engine.OnLLMResult(id, &HTTPResponse{Status: 200, Body: body}, "")
+	if len(host.LLMCalls) != before+1 {
+		t.Fatalf("expected the turn to continue, got %d calls", len(host.LLMCalls))
 	}
-	id = host.HTTPCalls[len(host.HTTPCalls)-1].ID
+	id = host.LLMCalls[len(host.LLMCalls)-1].ID
 
 	if err := engine.DoString("check-created", `
 		assert(rune.trigger.count() == 1)

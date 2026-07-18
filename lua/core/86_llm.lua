@@ -1,16 +1,14 @@
 -- LLM
--- Phase 1 transport: rune.http.post against OpenCode Zen's
--- Anthropic-Messages-API-shaped endpoint (see PLAN.md T4 and T2 for the
--- provider choice). T8 swaps the body of rune.llm.chat onto a Go
--- rune._llm primitive for streaming; this module's public signature is
--- designed to survive that swap unchanged.
---
--- Auth: verified live against https://opencode.ai/zen/v1/messages
--- (2026-07-17, see PLAN.md T4) - a bad "x-api-key" gets a distinct 401
--- AuthError, while a bad "Authorization: Bearer" is silently ignored
--- and the request falls through to the upstream provider. So:
--- x-api-key, not Authorization: Bearer, contrary to Zen's docs
--- elsewhere.
+-- Go-backed transport (rune._llm, see PLAN.md T8): Go owns the
+-- destination, auth header, and retry/backoff policy for OpenCode Zen
+-- (session/lua_llm.go) - the API key never passes through Lua. This
+-- module only builds/parses the Anthropic-Messages-API-shaped JSON
+-- body and owns the id -> callback map, the same split of
+-- responsibilities as rune.http/80_http.lua: pending callbacks die
+-- with the VM on /reload, and a late result for a stale id is
+-- dropped. rune.llm.chat's public signature and reply shape are
+-- unchanged from the Phase 1 (T4) rune.http.post transport this
+-- replaced.
 --
 -- This module only builds/parses the request - it does not choose a
 -- model on the caller's behalf. Zen's catalog rotates (including which
@@ -19,8 +17,8 @@
 
 rune.llm = {}
 
-local ZEN_URL = "https://opencode.ai/zen/v1/messages"
-local ANTHROPIC_VERSION = "2023-06-01"
+local pending = {}
+local next_id = 0
 
 -- Pulls the human-readable message out of a Zen/Anthropic-shaped error
 -- body ({"error":{"message":...}}, optionally wrapped in an outer
@@ -81,12 +79,6 @@ function rune.llm.chat(req, callback)
         error("rune.llm.chat: callback must be a function", 2)
     end
 
-    local key = rune.env("OPENCODE_API_KEY")
-    if not key then
-        callback(nil, "rune.llm: OPENCODE_API_KEY is not set")
-        return
-    end
-
     local body, encode_err = rune.json.encode({
         model = req.model,
         system = req.system,
@@ -99,35 +91,44 @@ function rune.llm.chat(req, callback)
         return
     end
 
-    rune.http.post(ZEN_URL, body, {
-        headers = {
-            ["Content-Type"] = "application/json",
-            ["x-api-key"] = key,
-            ["anthropic-version"] = ANTHROPIC_VERSION,
-        },
-    }, function(resp, err)
-        if err then
-            callback(nil, "rune.llm: " .. err)
-            return
-        end
-        if resp.status ~= 200 then
-            callback(nil, error_message(resp.status, resp.body))
-            return
-        end
+    next_id = next_id + 1
+    pending[next_id] = callback
+    rune._llm.request(next_id, { body = body })
+end
 
-        local data, decode_err = rune.json.decode(resp.body)
-        if not data then
-            callback(nil, "rune.llm: malformed response JSON: " .. tostring(decode_err))
-            return
-        end
+-- INTERNAL: called by Go when a request completes. Exactly one of
+-- response/err is set. Unknown ids - callback-less requests (there
+-- are none today), or requests started before a /reload - are
+-- dropped. A throwing callback propagates to the engine's error
+-- report.
+function rune.llm._deliver(id, resp, err)
+    local cb = pending[id]
+    if not cb then
+        return
+    end
+    pending[id] = nil
 
-        local text, tool_uses = split_content(data.content)
-        callback({
-            content = data.content,
-            text = text,
-            tool_uses = tool_uses,
-            stop_reason = data.stop_reason,
-            usage = data.usage,
-        }, nil)
-    end)
+    if err then
+        cb(nil, "rune.llm: " .. err)
+        return
+    end
+    if resp.status ~= 200 then
+        cb(nil, error_message(resp.status, resp.body))
+        return
+    end
+
+    local data, decode_err = rune.json.decode(resp.body)
+    if not data then
+        cb(nil, "rune.llm: malformed response JSON: " .. tostring(decode_err))
+        return
+    end
+
+    local text, tool_uses = split_content(data.content)
+    cb({
+        content = data.content,
+        text = text,
+        tool_uses = tool_uses,
+        stop_reason = data.stop_reason,
+        usage = data.usage,
+    }, nil)
 end

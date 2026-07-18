@@ -63,6 +63,12 @@ type MockHost struct {
 	// HTTP capture (see Host.HTTPRequest)
 	HTTPCalls []MockHTTPCall
 
+	// LLM capture (see Host.LLMRequest). A dumb recorder like
+	// HTTPCalls above - the missing-key/retry/backoff policy lives in
+	// session.Session's real implementation, not here, so it isn't
+	// exercised at this layer (see session/llm_test.go).
+	LLMCalls []MockLLMCall
+
 	// Input line state (see Host.GetInput/SetInput); mirrors the real
 	// UI, where SetInput moves the cursor to the end of the text
 	InputText   string
@@ -78,6 +84,12 @@ type MockHost struct {
 type MockHTTPCall struct {
 	ID  int
 	Req HTTPRequest
+}
+
+// MockLLMCall records one Host.LLMRequest invocation.
+type MockLLMCall struct {
+	ID  int
+	Req LLMRequest
 }
 
 func NewMockHost() *MockHost {
@@ -314,6 +326,12 @@ func (m *MockHost) HTTPRequest(id int, req HTTPRequest) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.HTTPCalls = append(m.HTTPCalls, MockHTTPCall{ID: id, Req: req})
+}
+
+func (m *MockHost) LLMRequest(id int, req LLMRequest) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.LLMCalls = append(m.LLMCalls, MockLLMCall{ID: id, Req: req})
 }
 
 func (m *MockHost) GetInput() string {

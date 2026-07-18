@@ -454,24 +454,75 @@ The two tasks that unblock everything and do **not** depend on botmud#20 are T1 
 
 ### Phase 2 — harden + govern
 
-#### T8 `[Go]` — `rune._llm` transport
-- **Why:** streaming (live reasoning), key held in Go (out of Lua), retries/backoff on
-  429/529, usage/token reporting.
-- **Create:** `lua/api_llm.go` + `session/lua_llm.go`, **mirroring** `lua/api_http.go` +
-  `session/lua_http.go` exactly:
-  - `session/lua_llm.go`: `Session.LLMRequest(id, req)` spawns a goroutine, streams from
-    OpenCode Zen (see T4); deliver either incremental deltas as multiple `AsyncResult`
-    events (for live streaming) or one final `AsyncResult` (start non-streaming, add
-    streaming behind the same id-based delivery).
-  - `lua/api_llm.go`: register `rune._llm.request`; `Engine.OnLLMResult(id, ...)` →
-    `rune.llm._deliver`.
-  - Key from Go env (`OPENCODE_API_KEY`); never passed through Lua.
-- **Swap:** `rune.llm.chat` (T4) moves from `rune.http` onto `rune._llm`; its public
-  signature stays stable so T5/T6 don't change.
-- **Tests:** byte-level/unit for request build + streaming assembly; error/retry paths;
-  the Lua `_deliver` id map drops stale ids on reload (mirror `80_http.lua` tests).
-- **Done when:** streaming reasoning renders live; key never appears in Lua; usage is
-  reported to governance.
+#### T8 `[Go]` — `rune._llm` transport ✓
+- **Created:** `lua/api_llm.go` + `session/lua_llm.go`, mirroring `lua/api_http.go` +
+  `session/lua_http.go` as planned - same async goroutine → `event.AsyncResult` →
+  `Engine.OnLLMResult` → `rune.llm._deliver` shape as HTTP, one final result per call
+  (see "Streaming" below for why, not incremental deltas).
+- **`LLMRequest` is narrower than `HTTPRequest` by design:** `lua/host.go`'s new
+  `LLMRequest{Body string}` carries *only* the pre-encoded JSON body - no method, url, or
+  headers fields, unlike `HTTPRequest`. The destination (`llmURL`), `x-api-key`, and
+  `anthropic-version` are now attached entirely inside `session/lua_llm.go`'s
+  `doLLMRequest`, from the real process environment (`s.Env("OPENCODE_API_KEY")`) - so
+  the key doesn't just avoid being logged, it never exists as a Lua value at any point.
+  `Engine.OnLLMResult` reuses `HTTPResponse` (status/body/headers) as the delivery shape
+  rather than adding a near-identical duplicate type.
+- **Consequence: the missing-key check moved from Lua to Go.** T4's `86_llm.lua` used to
+  call `rune.env("OPENCODE_API_KEY")` itself and fail fast, before ever making a call -
+  but that would mean touching the key from Lua just to check it exists, undermining the
+  point above. Now `rune.llm.chat` always calls `rune._llm.request` and always gets an id;
+  a missing key is detected in `doLLMRequestWithRetry` and delivered through the *same*
+  `_deliver(id, nil, err)` path as a transport failure - `86_llm.lua` doesn't special-case
+  it, it's just another error string prefixed and handed to the caller's callback.
+  `TestLLMChatMissingAPIKey` (Lua/MockHost-level) was removed for this reason - MockHost's
+  `LLMRequest` is a dumb recorder like `HTTPRequest`'s, so the check isn't reachable at
+  that layer anymore - and replaced by `TestLLMMissingAPIKeyDeliversError` in the new
+  `session/llm_test.go`, which is the lowest layer that can actually express this failure
+  now (per `docs/testing.md`).
+- **Retries/backoff on 429/529:** `doLLMRequestWithRetry` retries up to `llmMaxAttempts`
+  (4 = 1 initial + 3 retries) with exponential backoff (`llmRetryBackoff`, 250ms·2ⁿ).
+  Exhausting retries delivers the *last* response as a normal result (still whatever
+  non-2xx it was), not a synthesized transport error - so it flows through `86_llm.lua`'s
+  existing non-200 handling (`error_message`, unchanged since T4) with no new Lua logic
+  needed. Only 429/529 trigger a retry; a real transport error (DNS, timeout, connection
+  refused) is returned on the first attempt, matching `HTTPRequest`'s existing behavior.
+- **Test seams:** `llmURL` and `llmRetryBackoff` are package `var`s, not `const`s,
+  specifically so `session/llm_test.go` can redirect the destination at an
+  `httptest.Server` and skip real sleeps during retries - a small, contained seam rather
+  than a new interface/DI layer, sized to what the tests actually needed.
+- **Swap:** `rune.llm.chat` (T4) moved from `rune.http.post` onto `rune._llm.request`;
+  its public signature and reply shape (`content`/`text`/`tool_uses`/`stop_reason`/`usage`)
+  are unchanged, so T5/T6/T7 needed zero code changes.
+- **Ripple this swap caused (expected, not a bug):** T5/T6/T7's entire test suites
+  (`lua/agent_test.go`, `lua/agent_tools_test.go`, and `lua/agent_ui_test.go` via the
+  shared helpers the latter two files define/consume) simulate LLM turns by injecting
+  canned responses directly against `MockHost`'s HTTP capture - swapping the transport
+  primitive touched every one of them. Purely mechanical, no behavioral change:
+  `host.HTTPCalls` → `host.LLMCalls`, `engine.OnHTTPResult` → `engine.OnLLMResult`
+  (`HTTPResponse` itself is unchanged, since it's reused for delivery - see above).
+  `agent_ui_test.go` needed no edits at all, since it only goes through
+  `agent_tools_test.go`'s shared helpers (`startAgentAndWake`, `deliverToolUse`,
+  `deliverEndTurn`) rather than touching `HTTPCalls`/`OnHTTPResult` directly - exactly the
+  payoff of centralizing those helpers during T6.
+- **Streaming: deliberately deferred, per the plan's own "start non-streaming" option.**
+  T5's turn loop (`on_reply`) and T7's pane/bar both already consume one whole reply per
+  hop, not partial deltas - wiring real token-level streaming through would mean reworking
+  both, not just the transport. `rune._llm.request`'s id-based delivery is already the
+  right shape to grow incremental `AsyncResult`s behind later without another transport
+  swap, same as the plan noted; this task ships the one-final-result half only.
+- **Tests:** `lua/llm_test.go` (MockHost, same coverage as T4 minus the request
+  URL/header/method assertions - those aren't Lua's concern anymore, see below) + new
+  `session/llm_test.go` (real `Session` against `httptest.Server`, mirroring
+  `session/http_test.go`'s pattern): round trip proving method/`x-api-key`/
+  `anthropic-version`/`Content-Type`/body actually reach the wire and the reply flows back
+  through `rune.llm.chat`'s callback; missing-key delivers an error with the server never
+  contacted; a 429-then-200 sequence succeeds after retrying (asserts the server saw
+  exactly the expected hit count); a persistent 429 exhausts every attempt and delivers
+  the final 429 body verbatim rather than a transport error.
+- **Done when:** key never appears in Lua ✓; usage still flows through to T7's tracking
+  unchanged ✓ (reply shape untouched); 429/529 retried with backoff, verified by test, not
+  just reviewed ✓. Live-streaming reasoning is the one open half - see "Streaming" above;
+  the id-based delivery it needs is already in place.
 
 #### T9 `[Lua + small Go]` — governance
 - **Create:** `lua/core/NN_agent_policy.lua`.

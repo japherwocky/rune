@@ -1,9 +1,18 @@
 package lua
 
-// LLM client tests (86_llm.lua): Phase 1 transport over rune.http
-// against OpenCode Zen's Anthropic-Messages-API-shaped endpoint (see
-// PLAN.md T4). Driven against MockHost's HTTP capture/delivery, same
+// LLM client tests (86_llm.lua): the Go-backed transport (rune._llm,
+// see PLAN.md T8) against OpenCode Zen's Anthropic-Messages-API-shaped
+// endpoint. Driven against MockHost's LLM capture/delivery, same
 // approach as api_http_test.go - no real network call, no real key.
+//
+// The destination URL, auth headers, and 429/529 retry policy are now
+// Go's responsibility (session/lua_llm.go), not Lua's, so they are not
+// re-asserted here - see session/llm_test.go for those. This file
+// covers only what 86_llm.lua itself still owns: building the request
+// body, the id -> callback map, and parsing/normalizing the response
+// (or surfacing whatever error Go delivers, including a missing API
+// key - session/llm_test.go proves that specific error string; here
+// it's just another delivered error like a transport failure).
 
 import (
 	"encoding/json"
@@ -11,13 +20,18 @@ import (
 	"testing"
 )
 
-// withAPIKey sets the one allowlisted env var (see api_env.go) so
-// rune.llm.chat gets past its own key check.
+// withAPIKey sets the one allowlisted env var (see api_env.go).
+// Kept for the agent/tool test helpers that share this package and
+// still document "assume a key is configured" at the call site, but
+// as of T8 it has no effect on rune.llm.chat itself: MockHost.LLMRequest
+// is a dumb recorder, and the real key check now happens Go-side
+// (session.Session.LLMRequest), not via rune.env - see
+// TestLLMMissingAPIKeyDeliversError in session/llm_test.go.
 func withAPIKey(host *MockHost) {
 	host.EnvVars = map[string]string{"OPENCODE_API_KEY": "test-key-123"}
 }
 
-func TestLLMChatRequestShape(t *testing.T) {
+func TestLLMChatRequestBodyShape(t *testing.T) {
 	engine, host, cleanup := setupTest(t)
 	defer cleanup()
 	withAPIKey(host)
@@ -36,22 +50,10 @@ func TestLLMChatRequestShape(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if len(host.HTTPCalls) != 1 {
-		t.Fatalf("expected 1 HTTP call, got %d", len(host.HTTPCalls))
+	if len(host.LLMCalls) != 1 {
+		t.Fatalf("expected 1 LLM call, got %d", len(host.LLMCalls))
 	}
-	call := host.HTTPCalls[0]
-	if call.Req.Method != "POST" || call.Req.URL != "https://opencode.ai/zen/v1/messages" {
-		t.Errorf("unexpected request: %+v", call.Req)
-	}
-	if call.Req.Headers["x-api-key"] != "test-key-123" {
-		t.Errorf("x-api-key not sent: %+v", call.Req.Headers)
-	}
-	if call.Req.Headers["anthropic-version"] != "2023-06-01" {
-		t.Errorf("anthropic-version not sent: %+v", call.Req.Headers)
-	}
-	if call.Req.Headers["Authorization"] != "" {
-		t.Errorf("Authorization should not be sent (Zen ignores it, see T4): %+v", call.Req.Headers)
-	}
+	call := host.LLMCalls[0]
 
 	var body map[string]interface{}
 	if err := json.Unmarshal([]byte(call.Req.Body), &body); err != nil {
@@ -94,8 +96,8 @@ func TestLLMChatSuccessTextOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	id := host.HTTPCalls[0].ID
-	engine.OnHTTPResult(id, &HTTPResponse{
+	id := host.LLMCalls[0].ID
+	engine.OnLLMResult(id, &HTTPResponse{
 		Status: 200,
 		Body: `{
 			"id": "msg_01",
@@ -140,8 +142,8 @@ func TestLLMChatSuccessToolUse(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	id := host.HTTPCalls[0].ID
-	engine.OnHTTPResult(id, &HTTPResponse{
+	id := host.LLMCalls[0].ID
+	engine.OnLLMResult(id, &HTTPResponse{
 		Status: 200,
 		Body: `{
 			"id": "msg_02",
@@ -173,39 +175,7 @@ func TestLLMChatSuccessToolUse(t *testing.T) {
 	}
 }
 
-func TestLLMChatMissingAPIKey(t *testing.T) {
-	engine, host, cleanup := setupTest(t)
-	defer cleanup()
-	// host.EnvVars deliberately left unset - no OPENCODE_API_KEY.
-
-	err := engine.DoString("test", `
-		rune.llm.chat({
-			model = "deepseek-v4-flash-free",
-			messages = { { role = "user", content = "look" } },
-			max_tokens = 512,
-		}, function(reply, err)
-			got_reply = reply
-			got_err = err
-		end)
-	`)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if len(host.HTTPCalls) != 0 {
-		t.Fatalf("expected no HTTP call without an API key, got %d", len(host.HTTPCalls))
-	}
-
-	err = engine.DoString("assert", `
-		assert(got_reply == nil, "reply should be nil")
-		assert(got_err ~= nil and got_err:find("OPENCODE_API_KEY"), "err: " .. tostring(got_err))
-	`)
-	if err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestLLMChatHTTPTransportError(t *testing.T) {
+func TestLLMChatTransportError(t *testing.T) {
 	engine, host, cleanup := setupTest(t)
 	defer cleanup()
 	withAPIKey(host)
@@ -224,7 +194,11 @@ func TestLLMChatHTTPTransportError(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	engine.OnHTTPResult(host.HTTPCalls[0].ID, nil, "dial tcp: timeout")
+	// Stands in for any Go-side delivery failure, including the
+	// missing-API-key case now enforced in session.Session.LLMRequest
+	// (see session/llm_test.go) - 86_llm.lua treats every such error
+	// identically, just prefixing it for the caller.
+	engine.OnLLMResult(host.LLMCalls[0].ID, nil, "dial tcp: timeout")
 
 	err = engine.DoString("assert", `
 		assert(got_reply == nil, "reply should be nil")
@@ -256,7 +230,7 @@ func TestLLMChatNon200ExtractsErrorMessage(t *testing.T) {
 
 	// The exact shape observed from a live bad-key request against Zen
 	// (see PLAN.md T4): a 401 with a nested error.message.
-	engine.OnHTTPResult(host.HTTPCalls[0].ID, &HTTPResponse{
+	engine.OnLLMResult(host.LLMCalls[0].ID, &HTTPResponse{
 		Status: 401,
 		Body:   `{"type":"error","error":{"type":"AuthError","message":"Invalid API key."}}`,
 	}, "")
@@ -289,7 +263,7 @@ func TestLLMChatNon200FallsBackToRawBody(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	engine.OnHTTPResult(host.HTTPCalls[0].ID, &HTTPResponse{
+	engine.OnLLMResult(host.LLMCalls[0].ID, &HTTPResponse{
 		Status: 502,
 		Body:   "bad gateway",
 	}, "")
@@ -322,7 +296,7 @@ func TestLLMChatMalformedResponseJSON(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	engine.OnHTTPResult(host.HTTPCalls[0].ID, &HTTPResponse{
+	engine.OnLLMResult(host.LLMCalls[0].ID, &HTTPResponse{
 		Status: 200,
 		Body:   "not json at all",
 	}, "")
@@ -342,13 +316,13 @@ func TestLLMChatBadArgumentsRaise(t *testing.T) {
 	withAPIKey(host)
 
 	for _, code := range []string{
-		`rune.llm.chat("not a table", function() end)`,                                       // not a table
-		`rune.llm.chat({ messages = {}, max_tokens = 512 }, function() end)`,                  // missing model
-		`rune.llm.chat({ model = "", messages = {}, max_tokens = 512 }, function() end)`,       // empty model
-		`rune.llm.chat({ model = "m", max_tokens = 512 }, function() end)`,                     // missing messages
-		`rune.llm.chat({ model = "m", messages = {} }, function() end)`,                        // missing max_tokens
-		`rune.llm.chat({ model = "m", messages = {}, max_tokens = "many" }, function() end)`,    // wrong type
-		`rune.llm.chat({ model = "m", messages = {}, max_tokens = 512 })`,                       // missing callback
+		`rune.llm.chat("not a table", function() end)`,                                    // not a table
+		`rune.llm.chat({ messages = {}, max_tokens = 512 }, function() end)`,               // missing model
+		`rune.llm.chat({ model = "", messages = {}, max_tokens = 512 }, function() end)`,    // empty model
+		`rune.llm.chat({ model = "m", max_tokens = 512 }, function() end)`,                  // missing messages
+		`rune.llm.chat({ model = "m", messages = {} }, function() end)`,                     // missing max_tokens
+		`rune.llm.chat({ model = "m", messages = {}, max_tokens = "many" }, function() end)`, // wrong type
+		`rune.llm.chat({ model = "m", messages = {}, max_tokens = 512 })`,                   // missing callback
 	} {
 		if err := engine.DoString("test", code); err == nil {
 			t.Errorf("expected error for %q", code)
@@ -374,7 +348,7 @@ func TestLLMChatCallbackErrorReported(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	engine.OnHTTPResult(host.HTTPCalls[0].ID, &HTTPResponse{
+	engine.OnLLMResult(host.LLMCalls[0].ID, &HTTPResponse{
 		Status: 200,
 		Body:   `{"content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`,
 	}, "")

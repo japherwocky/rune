@@ -97,6 +97,15 @@ type Host interface {
 	// for a stale id is dropped there.
 	HTTPRequest(id int, req HTTPRequest)
 
+	// LLM: perform an LLM chat request off the session goroutine and
+	// deliver the outcome back on it via Engine.OnLLMResult with the
+	// same id - the same async shape as HTTPRequest above. Unlike
+	// HTTPRequest, the destination, auth header, and retry policy are
+	// fixed by the implementation (see session/lua_llm.go), not
+	// caller-supplied: req carries only the pre-encoded JSON body, so
+	// the API key never has to pass through Lua to be attached.
+	LLMRequest(id int, req LLMRequest)
+
 	// State
 	OnConfigChange()
 }
@@ -112,9 +121,21 @@ type HTTPRequest struct {
 }
 
 // HTTPResponse is a completed request's result, delivered back to Lua
-// through Engine.OnHTTPResult.
+// through Engine.OnHTTPResult. Also reused as-is for Engine.OnLLMResult
+// (see LLMRequest) - an LLM response is a status/body/headers triple
+// like any other HTTP result, so a second identical type would only
+// duplicate this one.
 type HTTPResponse struct {
 	Status  int
 	Body    string
 	Headers map[string]string
+}
+
+// LLMRequest is one rune.llm.chat call's already-JSON-encoded body
+// (built in Lua via rune.json.encode - see lua/core/86_llm.lua).
+// Everything needed to actually reach the gateway - URL, auth header,
+// API version, retry policy - is the implementation's responsibility,
+// not the caller's; see session/lua_llm.go.
+type LLMRequest struct {
+	Body string
 }

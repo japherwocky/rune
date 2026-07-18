@@ -2,10 +2,10 @@ package lua
 
 // Agent core tests (87_agent.lua): the state machine, cadence, and
 // tool dispatch seam (see PLAN.md T5). Driven the same way as the
-// LLM client tests - MockHost captures the outbound rune.http.post
-// calls that rune.llm.chat makes, and engine.OnHTTPResult delivers
-// canned Zen-shaped responses synchronously. withAPIKey is shared
-// with llm_test.go (same package).
+// LLM client tests - MockHost captures the outbound rune._llm.request
+// calls that rune.llm.chat makes (see PLAN.md T8), and
+// engine.OnLLMResult delivers canned Zen-shaped responses
+// synchronously. withAPIKey is shared with llm_test.go (same package).
 
 import (
 	"encoding/json"
@@ -78,12 +78,12 @@ func TestAgentPromptWakesAndSendsRequest(t *testing.T) {
 
 	engine.OnPrompt(text.NewLine("<100hp 100mv> "))
 
-	if len(host.HTTPCalls) != 1 {
-		t.Fatalf("expected 1 HTTP call after a prompt, got %d", len(host.HTTPCalls))
+	if len(host.LLMCalls) != 1 {
+		t.Fatalf("expected 1 LLM call after a prompt, got %d", len(host.LLMCalls))
 	}
 
 	var body map[string]interface{}
-	if err := json.Unmarshal([]byte(host.HTTPCalls[0].Req.Body), &body); err != nil {
+	if err := json.Unmarshal([]byte(host.LLMCalls[0].Req.Body), &body); err != nil {
 		t.Fatalf("request body not valid JSON: %v", err)
 	}
 	if body["model"] != "deepseek-v4-flash-free" {
@@ -128,27 +128,27 @@ func TestAgentSingleFlightThenCoalescedRewake(t *testing.T) {
 	}
 
 	engine.OnPrompt(text.NewLine("prompt 1"))
-	if len(host.HTTPCalls) != 1 {
-		t.Fatalf("expected 1 HTTP call, got %d", len(host.HTTPCalls))
+	if len(host.LLMCalls) != 1 {
+		t.Fatalf("expected 1 LLM call, got %d", len(host.LLMCalls))
 	}
 
 	// A second wake while the first think is in flight must not launch
 	// a second call (single-flight).
 	engine.OnPrompt(text.NewLine("prompt 2"))
-	if len(host.HTTPCalls) != 1 {
-		t.Fatalf("single-flight violated: expected still 1 HTTP call, got %d", len(host.HTTPCalls))
+	if len(host.LLMCalls) != 1 {
+		t.Fatalf("single-flight violated: expected still 1 LLM call, got %d", len(host.LLMCalls))
 	}
 
 	// Resolving the first think with no further tool use must
 	// immediately fire a second call, since a wake (prompt 2) arrived
 	// during the think ("think again on return").
-	engine.OnHTTPResult(host.HTTPCalls[0].ID, &HTTPResponse{
+	engine.OnLLMResult(host.LLMCalls[0].ID, &HTTPResponse{
 		Status: 200,
 		Body:   `{"content":[{"type":"text","text":"resting"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`,
 	}, "")
 
-	if len(host.HTTPCalls) != 2 {
-		t.Fatalf("expected a coalesced re-think to fire a 2nd call, got %d calls", len(host.HTTPCalls))
+	if len(host.LLMCalls) != 2 {
+		t.Fatalf("expected a coalesced re-think to fire a 2nd call, got %d calls", len(host.LLMCalls))
 	}
 }
 
@@ -172,13 +172,13 @@ func TestAgentToolUseDispatchAndContinuesTurn(t *testing.T) {
 	}
 
 	engine.OnPrompt(text.NewLine("prompt"))
-	if len(host.HTTPCalls) != 1 {
-		t.Fatalf("expected 1 HTTP call, got %d", len(host.HTTPCalls))
+	if len(host.LLMCalls) != 1 {
+		t.Fatalf("expected 1 LLM call, got %d", len(host.LLMCalls))
 	}
 
 	// The first request should advertise the registered tool.
 	var firstBody map[string]interface{}
-	if err := json.Unmarshal([]byte(host.HTTPCalls[0].Req.Body), &firstBody); err != nil {
+	if err := json.Unmarshal([]byte(host.LLMCalls[0].Req.Body), &firstBody); err != nil {
 		t.Fatal(err)
 	}
 	toolDefs, _ := firstBody["tools"].([]interface{})
@@ -192,7 +192,7 @@ func TestAgentToolUseDispatchAndContinuesTurn(t *testing.T) {
 		t.Fatalf("expected fake_tool among tools (alongside T6's built-ins), got %v", firstBody["tools"])
 	}
 
-	engine.OnHTTPResult(host.HTTPCalls[0].ID, &HTTPResponse{
+	engine.OnLLMResult(host.LLMCalls[0].ID, &HTTPResponse{
 		Status: 200,
 		Body: `{
 			"content": [
@@ -211,12 +211,12 @@ func TestAgentToolUseDispatchAndContinuesTurn(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if len(host.HTTPCalls) != 2 {
-		t.Fatalf("expected the turn to continue with a 2nd call, got %d", len(host.HTTPCalls))
+	if len(host.LLMCalls) != 2 {
+		t.Fatalf("expected the turn to continue with a 2nd call, got %d", len(host.LLMCalls))
 	}
 
 	var secondBody map[string]interface{}
-	if err := json.Unmarshal([]byte(host.HTTPCalls[1].Req.Body), &secondBody); err != nil {
+	if err := json.Unmarshal([]byte(host.LLMCalls[1].Req.Body), &secondBody); err != nil {
 		t.Fatal(err)
 	}
 	msgs := secondBody["messages"].([]interface{})
@@ -240,7 +240,7 @@ func TestAgentToolUseDispatchAndContinuesTurn(t *testing.T) {
 	}
 
 	// Complete the turn.
-	engine.OnHTTPResult(host.HTTPCalls[1].ID, &HTTPResponse{
+	engine.OnLLMResult(host.LLMCalls[1].ID, &HTTPResponse{
 		Status: 200,
 		Body:   `{"content":[{"type":"text","text":"All clear, resting now."}],"stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":4}}`,
 	}, "")
@@ -264,7 +264,7 @@ func TestAgentUnknownToolReportsErrorInToolResult(t *testing.T) {
 	}
 	engine.OnPrompt(text.NewLine("prompt"))
 
-	engine.OnHTTPResult(host.HTTPCalls[0].ID, &HTTPResponse{
+	engine.OnLLMResult(host.LLMCalls[0].ID, &HTTPResponse{
 		Status: 200,
 		Body: `{
 			"content": [{"type": "tool_use", "id": "toolu_1", "name": "no_such_tool", "input": {}}],
@@ -273,11 +273,11 @@ func TestAgentUnknownToolReportsErrorInToolResult(t *testing.T) {
 		}`,
 	}, "")
 
-	if len(host.HTTPCalls) != 2 {
-		t.Fatalf("expected the turn to continue even for an unknown tool, got %d calls", len(host.HTTPCalls))
+	if len(host.LLMCalls) != 2 {
+		t.Fatalf("expected the turn to continue even for an unknown tool, got %d calls", len(host.LLMCalls))
 	}
 	var body map[string]interface{}
-	if err := json.Unmarshal([]byte(host.HTTPCalls[1].Req.Body), &body); err != nil {
+	if err := json.Unmarshal([]byte(host.LLMCalls[1].Req.Body), &body); err != nil {
 		t.Fatal(err)
 	}
 	msgs := body["messages"].([]interface{})
@@ -301,8 +301,8 @@ func TestAgentLowHPWakesButDoesNotThinkImmediately(t *testing.T) {
 
 	engine.OnGMCP("Char.Vitals", `{"hp":20,"maxhp":100,"mana":50,"maxmana":50,"move":50,"maxmove":50}`)
 
-	if len(host.HTTPCalls) != 0 {
-		t.Fatalf("a salient GMCP event alone should not immediately think, got %d calls", len(host.HTTPCalls))
+	if len(host.LLMCalls) != 0 {
+		t.Fatalf("a salient GMCP event alone should not immediately think, got %d calls", len(host.LLMCalls))
 	}
 	if err := engine.DoString("check", `assert(rune.agent.status().wake_pending == true)`); err != nil {
 		t.Fatal(err)
@@ -322,8 +322,8 @@ func TestAgentLowHPWakesButDoesNotThinkImmediately(t *testing.T) {
 	}
 	engine.OnTimer(debounceID)
 
-	if len(host.HTTPCalls) != 1 {
-		t.Fatalf("expected the debounce tick to fire the pending wake, got %d calls", len(host.HTTPCalls))
+	if len(host.LLMCalls) != 1 {
+		t.Fatalf("expected the debounce tick to fire the pending wake, got %d calls", len(host.LLMCalls))
 	}
 }
 
@@ -383,8 +383,8 @@ func TestAgentChannelMessageWakes(t *testing.T) {
 
 	engine.OnGMCP("Comm.Channel", `{"chan":"tell","msg":"Bubba tells you 'hey'","player":"Bubba"}`)
 
-	if len(host.HTTPCalls) != 0 {
-		t.Fatalf("a channel message alone should not immediately think, got %d calls", len(host.HTTPCalls))
+	if len(host.LLMCalls) != 0 {
+		t.Fatalf("a channel message alone should not immediately think, got %d calls", len(host.LLMCalls))
 	}
 	if err := engine.DoString("check", `assert(rune.agent.status().wake_pending == true)`); err != nil {
 		t.Fatal(err)
@@ -400,8 +400,8 @@ func TestAgentStopUnwindsAndDropsInFlightResult(t *testing.T) {
 		t.Fatal(err)
 	}
 	engine.OnPrompt(text.NewLine("prompt"))
-	if len(host.HTTPCalls) != 1 {
-		t.Fatalf("expected 1 HTTP call in flight, got %d", len(host.HTTPCalls))
+	if len(host.LLMCalls) != 1 {
+		t.Fatalf("expected 1 LLM call in flight, got %d", len(host.LLMCalls))
 	}
 
 	if err := engine.DoString("stop", `rune.agent.stop()`); err != nil {
@@ -416,7 +416,7 @@ func TestAgentStopUnwindsAndDropsInFlightResult(t *testing.T) {
 
 	// The in-flight call's result lands after stop() - it must be
 	// dropped, not acted on.
-	engine.OnHTTPResult(host.HTTPCalls[0].ID, &HTTPResponse{
+	engine.OnLLMResult(host.LLMCalls[0].ID, &HTTPResponse{
 		Status: 200,
 		Body:   `{"content":[{"type":"text","text":"should be ignored"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`,
 	}, "")
@@ -428,8 +428,8 @@ func TestAgentStopUnwindsAndDropsInFlightResult(t *testing.T) {
 	`); err != nil {
 		t.Fatal(err)
 	}
-	if len(host.HTTPCalls) != 1 {
-		t.Fatalf("a dropped result must not launch a new call, got %d calls", len(host.HTTPCalls))
+	if len(host.LLMCalls) != 1 {
+		t.Fatalf("a dropped result must not launch a new call, got %d calls", len(host.LLMCalls))
 	}
 
 	// The prompt hook itself must be gone, not just internally
