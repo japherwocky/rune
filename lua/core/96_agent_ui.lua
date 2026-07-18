@@ -1,10 +1,13 @@
--- Agent Observability (live mode)
+-- Agent Observability (live mode) + start/stop control
 -- Watches the agent core (87_agent.lua) through its agent_* hooks and
 -- renders what it sees: a reasoning pane, a status-bar segment, and
--- per-turn rune.log entries (PLAN.md T7). Pure observer - never calls
--- back into rune.agent, never affects the turn loop, so a broken
--- render here can't derail a think (and per-hook quarantine means a
--- failing renderer just stops updating instead of spamming errors).
+-- per-turn rune.log entries (PLAN.md T7). The hook handlers below are
+-- pure observers - never call back into rune.agent, never affect the
+-- turn loop, so a broken render here can't derail a think (and
+-- per-hook quarantine means a failing renderer just stops updating
+-- instead of spamming errors). The "/agent start|stop" command is the
+-- one deliberate exception - a direct, user-initiated call into
+-- rune.agent, not a hook reacting to agent activity.
 --
 -- Registered unconditionally, like the core status bar in 95_ui.lua:
 -- the "agent" pane/bar exist but are invisible to a plain human
@@ -118,18 +121,67 @@ rune.ui.bar("agent", function(width)
     return "agent: " .. state .. " | " .. tokens .. " | " .. summary.last_action .. goal
 end)
 
--- /agent - read-only status (start/stop is a Lua API call, see T5;
--- this module only ever watches)
+-- /agent [start [model] | stop] - status by default; start/stop
+-- control added by explicit user request (T7 originally kept this
+-- read-only "as a deliberate call" - see PLAN.md T7 - this is that
+-- deliberate call, made later). Model resolution for "start":
+-- explicit arg > RUNE_LLM_MODEL (.env, see 83_env.lua) > usage error.
+local USAGE_AGENT = "[Usage] /agent [start [model] | stop]"
+
+-- model/provider tag shared by the three places below that report
+-- what's running: "started", "already running", and plain status.
+-- Provider comes from rune.llm.provider() (86_llm.lua) - the same
+-- RUNE_LLM_PROVIDER-or-"zen" resolution rune.llm.chat itself uses, not
+-- re-derived here, so this can never drift out of sync with what a
+-- turn actually talks to.
+local function model_provider_tag(model)
+    return "  (model: " .. tostring(model) .. ", provider: " .. rune.llm.provider() .. ")"
+end
+
 rune.command.add("agent", function(args)
+    local sub, rest = args:match("^(%S*)%s*(.-)%s*$")
+
+    if sub == "start" then
+        if rune.agent.is_active() then
+            rune.echo(rune.style.yellow("[Agent]") .. " already running" ..
+                model_provider_tag(rune.agent.status().model))
+            return
+        end
+        local model = rest ~= "" and rest or rune.env("RUNE_LLM_MODEL")
+        if not model then
+            rune.echo("[Usage] /agent start <model>  (or set RUNE_LLM_MODEL in .env)")
+            return
+        end
+        rune.agent.start({ model = model })
+        rune.echo(rune.style.green("[Agent]") .. " started" .. model_provider_tag(model))
+        return
+    end
+
+    if sub == "stop" then
+        if not rune.agent.is_active() then
+            rune.echo(rune.style.gray("[Agent]") .. " already stopped")
+            return
+        end
+        rune.agent.stop()
+        rune.echo(rune.style.yellow("[Agent]") .. " stopped")
+        return
+    end
+
+    if sub ~= "" then
+        rune.echo(USAGE_AGENT)
+        return
+    end
+
     local s = rune.agent.status()
     local summary = rune.agent_ui.summary()
     if not s.active then
         rune.echo(rune.style.gray("[Agent]") .. " stopped")
         return
     end
-    rune.echo(rune.style.green("[Agent]") .. " " .. (s.thinking and "thinking" or "idle"))
+    rune.echo(rune.style.green("[Agent]") .. " " .. (s.thinking and "thinking" or "idle") ..
+        model_provider_tag(s.model))
     rune.echo("  goal: " .. (s.goal or rune.style.gray("(none yet)")))
     rune.echo("  tokens: " .. summary.input_tokens .. " in / " .. summary.output_tokens .. " out" ..
         (summary.cost and string.format("  (~$%.4f)", summary.cost) or ""))
     rune.echo("  last action: " .. summary.last_action)
-end, "Show agent status (reasoning pane: add {name='agent'} to your layout)")
+end, "Show/control the agent: /agent [start [model] | stop] (reasoning pane: add {name='agent'} to your layout)")

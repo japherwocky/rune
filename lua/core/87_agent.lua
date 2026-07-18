@@ -317,5 +317,6 @@ function rune.agent.status()
         thinking = thinking,
         wake_pending = wake_pending,
         goal = goal(),
+        model = model,
     }
 end

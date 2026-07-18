@@ -45,6 +45,29 @@ func withOpenAIProvider(host *MockHost) {
 	host.EnvVars = map[string]string{"RUNE_LLM_PROVIDER": "openai"}
 }
 
+// rune.llm.provider() is a getter over the same RUNE_LLM_PROVIDER-or-
+// "zen" resolution rune.llm.chat uses internally, exposed so other
+// modules (96_agent_ui.lua's /agent status) can display it without a
+// second copy of the default.
+func TestLLMProviderDefaultsToZen(t *testing.T) {
+	engine, _, cleanup := setupTest(t)
+	defer cleanup()
+
+	if err := engine.DoString("check", `assert(rune.llm.provider() == "zen", rune.llm.provider())`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLLMProviderReadsEnvOverride(t *testing.T) {
+	engine, host, cleanup := setupTest(t)
+	defer cleanup()
+	withOpenAIProvider(host)
+
+	if err := engine.DoString("check", `assert(rune.llm.provider() == "openai", rune.llm.provider())`); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestLLMChatRequestBodyShape(t *testing.T) {
 	engine, host, cleanup := setupTest(t)
 	defer cleanup()

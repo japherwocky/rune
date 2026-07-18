@@ -190,3 +190,148 @@ func TestAgentCommandShowsStatus(t *testing.T) {
 		t.Fatalf("expected /agent to report idle + goal after a turn, got:\n%s", joined)
 	}
 }
+
+// T7-addendum tests (PLAN.md): "/agent start|stop" control, added after
+// the fact by explicit user request - see 96_agent_ui.lua's updated
+// header comment for why this reverses T7's original status-only call.
+
+func TestAgentCommandStartWithExplicitModel(t *testing.T) {
+	engine, host, cleanup := setupTest(t)
+	defer cleanup()
+	withAPIKey(host)
+
+	engine.OnInput("/agent start big-pickle")
+
+	if err := engine.DoString("check", `
+		local s = rune.agent.status()
+		assert(s.active, "expected agent active after /agent start")
+		assert(s.model == "big-pickle", "model: " .. tostring(s.model))
+	`); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(host.PrintCalls, "\n")
+	if !strings.Contains(joined, "started") || !strings.Contains(joined, "big-pickle") {
+		t.Fatalf("expected start confirmation with model name, got:\n%s", joined)
+	}
+	if !strings.Contains(joined, "provider: zen") {
+		t.Fatalf("expected the default provider (zen) alongside the model, got:\n%s", joined)
+	}
+}
+
+func TestAgentCommandShowsProviderOverrideInStatus(t *testing.T) {
+	engine, host, cleanup := setupTest(t)
+	defer cleanup()
+	host.EnvVars = map[string]string{
+		"OPENCODE_API_KEY":  "test-key-123",
+		"RUNE_LLM_PROVIDER": "openai",
+	}
+
+	engine.OnInput("/agent start big-pickle")
+	host.PrintCalls = nil
+	engine.OnInput("/agent")
+
+	joined := strings.Join(host.PrintCalls, "\n")
+	if !strings.Contains(joined, "provider: openai") {
+		t.Fatalf("expected /agent status to reflect RUNE_LLM_PROVIDER=openai, got:\n%s", joined)
+	}
+}
+
+func TestAgentCommandStartUsesEnvModelDefault(t *testing.T) {
+	engine, host, cleanup := setupTest(t)
+	defer cleanup()
+	host.EnvVars = map[string]string{
+		"OPENCODE_API_KEY": "test-key-123",
+		"RUNE_LLM_MODEL":   "claude-haiku-4-5",
+	}
+
+	engine.OnInput("/agent start")
+
+	if err := engine.DoString("check", `
+		local s = rune.agent.status()
+		assert(s.active, "expected agent active after /agent start with env default")
+		assert(s.model == "claude-haiku-4-5", "model: " .. tostring(s.model))
+	`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAgentCommandStartWithoutModelOrEnvShowsUsage(t *testing.T) {
+	engine, host, cleanup := setupTest(t)
+	defer cleanup()
+	withAPIKey(host) // no RUNE_LLM_MODEL set
+
+	engine.OnInput("/agent start")
+
+	if err := engine.DoString("check", `assert(not rune.agent.status().active, "agent must not start with no model available")`); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(host.PrintCalls, "\n")
+	if !strings.Contains(joined, "Usage") {
+		t.Fatalf("expected a usage message, got:\n%s", joined)
+	}
+}
+
+func TestAgentCommandStartWhenAlreadyActiveIsNoop(t *testing.T) {
+	engine, host, cleanup := setupTest(t)
+	defer cleanup()
+	withAPIKey(host)
+
+	engine.OnInput("/agent start big-pickle")
+	host.PrintCalls = nil
+	engine.OnInput("/agent start some-other-model")
+
+	if err := engine.DoString("check", `
+		local s = rune.agent.status()
+		assert(s.model == "big-pickle", "second /agent start must not replace the running model, got " .. tostring(s.model))
+	`); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(host.PrintCalls, "\n")
+	if !strings.Contains(joined, "already running") {
+		t.Fatalf("expected an already-running notice, got:\n%s", joined)
+	}
+}
+
+func TestAgentCommandStop(t *testing.T) {
+	engine, host, cleanup := setupTest(t)
+	defer cleanup()
+	withAPIKey(host)
+
+	engine.OnInput("/agent start big-pickle")
+	host.PrintCalls = nil
+	engine.OnInput("/agent stop")
+
+	if err := engine.DoString("check", `assert(not rune.agent.status().active, "expected agent stopped")`); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(host.PrintCalls, "\n")
+	if !strings.Contains(joined, "stopped") {
+		t.Fatalf("expected a stopped confirmation, got:\n%s", joined)
+	}
+}
+
+func TestAgentCommandStopWhenAlreadyStoppedIsNoop(t *testing.T) {
+	engine, host, cleanup := setupTest(t)
+	defer cleanup()
+	withAPIKey(host)
+
+	engine.OnInput("/agent stop")
+
+	joined := strings.Join(host.PrintCalls, "\n")
+	if !strings.Contains(joined, "already stopped") {
+		t.Fatalf("expected an already-stopped notice, got:\n%s", joined)
+	}
+}
+
+func TestAgentCommandUnknownSubcommandShowsUsage(t *testing.T) {
+	engine, host, cleanup := setupTest(t)
+	defer cleanup()
+	withAPIKey(host)
+
+	engine.OnInput("/agent bogus")
+
+	joined := strings.Join(host.PrintCalls, "\n")
+	if !strings.Contains(joined, "Usage") {
+		t.Fatalf("expected a usage message for an unknown subcommand, got:\n%s", joined)
+	}
+}

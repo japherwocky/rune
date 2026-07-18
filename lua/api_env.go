@@ -14,9 +14,14 @@ import glua "github.com/yuin/gopher-lua"
 // allowlist. RUNE_LLM_URL and RUNE_LLM_API_KEY never need to reach
 // Lua - session/lua_llm.go reads those directly, same as
 // OPENCODE_API_KEY.
+//
+// RUNE_LLM_MODEL is also not a secret - it's a fallback model id read
+// by 96_agent_ui.lua's "/agent start" (no arg) so routine start/stop
+// doesn't require a model name at the keyboard every time.
 var envAllowlist = map[string]bool{
 	"OPENCODE_API_KEY":  true,
 	"RUNE_LLM_PROVIDER": true,
+	"RUNE_LLM_MODEL":    true,
 }
 
 // registerEnvFuncs registers rune._env.* primitives.

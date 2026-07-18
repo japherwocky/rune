@@ -493,12 +493,27 @@ The two tasks that unblock everything and do **not** depend on botmud#20 are T1 
   hatch) rather than opening a second file handle that would fight over `rune._log`'s
   single Go-owned handle. No-ops while no log is open, exactly like every other
   `rune.log.write` caller - confirmed by test, not just inferred from the doc comment.
-- **`/agent` command:** status only (active/thinking/goal/tokens/last-action) -
-  deliberately **not** `/agent start|stop`. T5 made a considered choice to be
-  Lua-API-only with no slash command of its own; adding start/stop control here would
-  silently expand that decision under T7's "observability" banner instead of being a
-  deliberate call. Starting the agent today is one `rune.lua` line or an init.lua
-  snippet.
+- **`/agent` command:** status by default (active/thinking/goal/tokens/last-action),
+  plus `/agent start [model]` and `/agent stop`. Originally shipped status-only,
+  deliberately **not** `/agent start|stop` - the concern at the time was adding
+  start/stop control would silently expand T5's "Lua-API-only" decision under T7's
+  "observability" banner instead of being its own deliberate call. **Reversed
+  2026-07-18** by explicit user request, once end-to-end use made `/lua
+  rune.agent.start{model="..."}` too awkward for routine start/stop - i.e. this *is*
+  that deliberate call, just made later. `start` resolves the model as `<arg> >
+  RUNE_LLM_MODEL (.env, allowlisted in api_env.go) > usage error`; `rune.agent.start`
+  itself is unchanged and still requires an explicit non-empty `model` in its opts
+  (T5's contract, unchanged for scripted/programmatic callers). `rune.agent.status()`
+  (`87_agent.lua`) gained a `model` field so both `/agent` and `/agent start` (when
+  already running) can report which model is active. Provider is shown alongside it
+  (`(model: ..., provider: ...)`) via a new `rune.llm.provider()` getter in
+  `86_llm.lua` - the exact `RUNE_LLM_PROVIDER`-or-`"zen"` default `rune.llm.chat`
+  already resolved internally, now exposed as a function instead of re-derived a
+  second time in `96_agent_ui.lua`. Provider deliberately did **not** go on
+  `rune.agent.status()` itself - unlike `model` (an explicit per-call argument to
+  `rune.agent.start`), provider is global transport config with no per-agent
+  identity, and 87_agent.lua staying ignorant of providers is exactly the boundary
+  T9b's "Bore out as intended" note above already validated.
 - **Collateral fix:** `pane_test.go` (predates T7) asserted an *exact* global pane-call
   count; booting now also creates the "agent" pane, so it was updated to filter to the
   `"chat"` pane it actually pins - the same class of fix as T6's `agent_test.go` updates
@@ -511,7 +526,13 @@ The two tasks that unblock everything and do **not** depend on botmud#20 are T1 
   turn end - "best-effort" per the plan, so occurrence is checked, not exact text),
   `rune.log.write` firing per-turn when a log is active and silent when it isn't
   (proving the no-op claim, not just trusting the doc comment), and `/agent`'s output
-  before and after a turn.
+  before and after a turn. **Start/stop addendum (2026-07-18):** 9 more tests covering
+  `/agent start <model>`, `/agent start` resolving `RUNE_LLM_MODEL` from `.env`,
+  the usage error when neither is available, already-running/already-stopped as
+  no-ops that print a notice rather than erroring, `/agent stop`, an unknown
+  subcommand falling through to usage, and the displayed provider following
+  `RUNE_LLM_PROVIDER` (plus 2 tests on `rune.llm.provider()` itself in
+  `lua/llm_test.go` - default `"zen"` and the env override).
 - **Done when:** in a live run you can watch reasoning + state; every turn is logged. ✓
 
 ### Phase 2 — harden + govern

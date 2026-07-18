@@ -42,6 +42,15 @@ rune.llm = {}
 local pending = {}
 local next_id = 0
 
+-- rune.llm.provider() -> "zen" (default) or "openai", whichever
+-- RUNE_LLM_PROVIDER (.env) resolves to. Exposed as a getter, not just
+-- an internal local, so callers outside this file (96_agent_ui.lua's
+-- "/agent" status) can display the active provider without
+-- re-deriving the same default in a second place.
+function rune.llm.provider()
+    return rune.env("RUNE_LLM_PROVIDER") or "zen"
+end
+
 -- zen_model_uses_messages_api(model) -> true for Zen's Claude family
 -- (needs /v1/messages, Anthropic shape), false for everything else in
 -- the catalog (needs /v1/chat/completions, OpenAI shape). Mirrors
@@ -238,7 +247,7 @@ function rune.llm.chat(req, callback)
         error("rune.llm.chat: callback must be a function", 2)
     end
 
-    local provider = rune.env("RUNE_LLM_PROVIDER") or "zen"
+    local provider = rune.llm.provider()
     local use_openai_shape = provider == "openai"
         or (provider == "zen" and not zen_model_uses_messages_api(req.model))
 
