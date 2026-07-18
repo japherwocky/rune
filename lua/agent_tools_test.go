@@ -99,6 +99,31 @@ func TestAgentToolsSendCommand(t *testing.T) {
 	}
 }
 
+// TestAgentToolsSendCommandRespectsDenylist proves send_command is
+// actually wired onto rune.agent_policy.send (91_agent_policy.lua, T9),
+// not just calling rune.send directly - see agent_policy_test.go for
+// rune.agent_policy.send's own dedicated coverage.
+func TestAgentToolsSendCommandRespectsDenylist(t *testing.T) {
+	engine, host, cleanup := setupTest(t)
+	defer cleanup()
+	withAPIKey(host)
+
+	id := startAgentAndWake(t, engine, host)
+	host.DrainNetworkCalls()
+	deliverToolUse(t, engine, host, id, "toolu_1", "send_command", map[string]string{"cmd": "quit"})
+
+	if sent := host.DrainNetworkCalls(); len(sent) != 0 {
+		t.Fatalf("a denylisted send_command must never reach the wire, got %v", sent)
+	}
+	content, isError := lastToolResult(t, host)
+	if !isError {
+		t.Fatalf("expected send_command(\"quit\") to error, got %q", content)
+	}
+	if !strings.Contains(content, "quit") {
+		t.Errorf("expected the tool_result to mention the blocked command, got %q", content)
+	}
+}
+
 func TestAgentToolsSpeak(t *testing.T) {
 	cases := []struct {
 		name    string

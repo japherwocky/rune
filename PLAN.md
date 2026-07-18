@@ -524,25 +524,133 @@ The two tasks that unblock everything and do **not** depend on botmud#20 are T1 
   just reviewed ✓. Live-streaming reasoning is the one open half - see "Streaming" above;
   the id-based delivery it needs is already in place.
 
-#### T9 `[Lua + small Go]` — governance
-- **Create:** `lua/core/NN_agent_policy.lua`.
-  - **Budget:** accumulate `usage` (tokens → $); pause + notify when a per-session cap is
-    hit.
-  - **Rate limit:** cap outgoing commands/sec (be a good MUD citizen and stop runaways);
-    covers channel output too (two bots gossiping forever is the failure mode).
-  - **Oscillation:** detect same command / same tool cycle repeated N times with no state
-    change → break and wake the LLM.
-  - **Irreversible-command gate:** denylist/confirm for `quit`, dropping gear, spending
-    currency, etc. before they hit the wire.
-  - **Quarantine → re-plan (the payoff loop):** when an `agent-*` trigger is quarantined
-    (3 failures), wake the LLM to re-plan. This likely needs a **small hook**: have the
-    registry/`guarded_call` emit an event/callback on quarantine (today it just disables +
-    reports). Add a minimal signal in `lua/core/15_registry.lua` (or wherever quarantine
-    lives) and consume it here.
-- **Tests:** budget cap pauses at threshold; rate limiter throttles; oscillation detector
-  fires on a repeat loop; a quarantined agent trigger triggers a re-plan wake.
-- **Done when:** a runaway/looping agent is contained and a failing reflex re-engages
-  cognition.
+#### T9 `[Lua + small Go]` — governance ✓
+- **Created:** `lua/core/91_agent_policy.lua`. Touched `lua/core/00_init.lua` (new
+  `"quarantined"` hook), `lua/core/20_hooks.lua` (documented the 2 new events), and
+  `lua/core/88_agent_tools.lua` (`send_command`/`speak`/`create_trigger` rewired onto the
+  new governance choke point).
+- **Turned out to need zero new Go, despite the task's own `[Lua + small Go]` label:**
+  `os.time()` (an ordinary gopher-lua stdlib global, already used by `60_log.lua`'s
+  `os.date`) covers the rate limiter's clock, and the quarantine signal is just a new hook
+  fired from `rune.guarded_call` - itself already pure Lua in `00_init.lua`, not the
+  `lua/core/15_registry.lua` the plan guessed (quarantine tracking/disabling lives in
+  `guarded_call`, not the registry factory). Recorded here the same way T3/T8 recorded
+  their own deviations from the original plan.
+- **Why not wrap `rune.send`/`rune.send_raw` directly:** those are shared with ordinary
+  human input - a human typing "quit" at the prompt must never be blocked by the agent's
+  own denylist, and a human's typing speed must never be capped by the agent's rate limit.
+  Governance can only live at the *agent-attribution boundary*: the specific call sites
+  that originate from the agent's own tools/reflexes. `rune.agent_policy.send(cmd)` is that
+  boundary - `send_command`, `speak`, and the function `create_trigger` now installs (see
+  below) call it instead of `rune.send` directly; nothing else does, and a plain human
+  session using `rune.send` itself is completely unaffected.
+- **Rate limit:** `rune.agent_policy.send` enforces `max_commands_per_second` (default 3)
+  via a **fixed 1-second window** keyed off `os.time()` - not a true sliding window (a
+  burst can straddle a boundary), but good-citizen throttling doesn't need leaky-bucket
+  precision, and it made the tests trivial (monkeypatch the Lua global `os.time` for the
+  duration of one test, restored implicitly since each test gets a fresh VM - no new Go
+  seam needed, unlike T8's `llmURL`/`llmRetryBackoff`). On by default, unlike budget - a
+  safety net, not an opt-in. "Covers channel output too" (the plan's own phrasing) falls
+  out for free: `speak` funnels through the exact same `send()` as `send_command`, no
+  separate accounting. The echo+`agent_policy` hook notification is deduped to once per
+  window even under a sustained flood (`rate_limit_notified_this_window`) - the same
+  "report once" instinct as `10_regex.lua`'s `entry.reported` - while `send()`'s own return
+  value still reports every individual denial to its immediate caller.
+  - **Known caveat, documented rather than closed:** `rune.send` still expands `;`-chains
+    and `#N` repeats *after* this choke point, so one governed call can still put more than
+    one line on the wire. This was already true of `create_trigger`'s `command` field before
+    T9 (its schema always allowed `;`-separated commands) - not a regression, just not fully
+    closed by the limiter. It counts governed calls, not wire lines.
+- **Irreversible-command gate:** a denylist of Go-regexp patterns (`rune.regex`, same
+  engine/cache triggers and aliases already use) checked against the full outgoing command
+  text; defaults to a bare `^quit$`. `rune.agent_policy.deny(pattern)` extends it (raises on
+  an invalid pattern, same convention as `rune.trigger.regex`). **Deny-only, not
+  deny-or-confirm:** an interactive confirm needs a UI affordance neither run mode has yet
+  (live mode has no such prompt; headless mode doesn't exist until T10/T11) - denying is the
+  strictly safer half of "denylist/confirm" and fully satisfies "contained". Checked only at
+  send time, never at `create_trigger`/`create_alias` creation time - a single robust
+  enforcement point beats statically analyzing trigger definitions whose `%N` capture
+  substitution could produce a denylisted command dynamically in a way creation-time
+  checking could never catch anyway.
+- **Oscillation:** the last `oscillation_window` (default 4) commands
+  `rune.agent_policy.send` actually sent, if they are all the *same command* sent while
+  `rune.perception.snapshot()` stayed byte-identical (compared via `rune.json.encode`, the
+  same encode-and-compare technique `87_agent.lua`'s `build_observation` already uses) every
+  time, means nothing is changing in response to repeating it - notifies, wakes the LLM
+  (`rune.agent.wake("oscillation")`), and clears the tracking ring so it takes a fresh
+  `oscillation_window` repeats to fire again (otherwise every subsequent repeat of a still-stuck
+  command would re-notify/re-wake). **Detects same-command (period-1) repetition
+  specifically, not arbitrary-period cycles** ("A, B, A, B, ...") - the dominant real failure
+  mode (one stuck reflex, or the model repeating one tool call) and far simpler to detect and
+  test than general cycle detection; recorded as a deliberate scope call, not an oversight.
+- **Budget:** accumulates `reply.usage` (via the existing `agent_reply` hook, same event
+  `96_agent_ui.lua` already watches) into a running `$` total and calls `rune.agent.stop()`
+  once `config.budget_usd` is hit. Off by default (`nil`), exactly like `96_agent_ui.lua`'s
+  own `pricing` slot, and for the same reason already documented there: there is no safe
+  universal default for "how much may this bot spend," and fabricating one from guessed
+  per-model pricing would be worse than not enforcing at all. **Tracks its own
+  tokens/pricing independently of `96_agent_ui.lua`'s display accumulator** - a deliberate,
+  considered duplication (not an oversight): governance must keep working even if
+  observability were ever stripped out, and vice versa. A deployer wanting both the bar's
+  display *and* a real cap sets `rune.agent_ui.pricing` and
+  `rune.agent_policy.configure{pricing=...}` separately; they are intentionally not linked,
+  at the cost of needing to be set twice.
+  - **Known imprecision, documented rather than fixed:** the check runs on every
+    `agent_reply` hop (including intermediate `tool_use` hops), but `on_reply`
+    (`87_agent.lua`) does not re-check `active` between firing that hook and continuing a
+    `tool_use` turn - so calling `rune.agent.stop()` from inside the hook can still let one
+    more in-flight hop go out before the *next* `on_reply` invocation's existing `not active`
+    guard drops it. A firm backstop, not a laser-precise cutoff; fixing it would mean
+    touching `87_agent.lua`'s already-shipped turn loop for a one-hop overshoot, which isn't
+    worth it.
+- **Quarantine → re-plan (the payoff loop):** `rune.guarded_call` (`00_init.lua`) now fires
+  a new `"quarantined"` hook `(label, data)` the instant it disables an entry after 3
+  consecutive failures (guarded by `if rune.hooks then`, since this file loads before
+  `20_hooks.lua` defines `rune.hooks` - dead code in practice, since `guarded_call` is only
+  ever invoked during real dispatch, long after every core file has loaded, but consistent
+  with the codebase's existing defensive style, e.g. `15_registry.lua`'s
+  `not rune.group or ...`). `91_agent_policy.lua` listens and wakes the LLM **only when the
+  quarantined entry's `group` starts with `"agent-"`** - the exact convention
+  `create_trigger`/`create_alias` already enforce structurally (T6) - so a human's own
+  quarantined trigger can never wake somebody else's bot.
+  - **Tool quarantine deliberately does NOT wake the LLM** (scope is triggers/aliases only,
+    via the group-prefix check): a tool's failure already reaches the model for free,
+    synchronously, as an `is_error` `tool_result` within the very turn that caused it. Only a
+    *reflex* - which runs entirely outside any turn, with no LLM anywhere nearby - has no
+    other way to be noticed at all, which is exactly why the plan called this out as needing
+    a new signal in the first place.
+  - **This forced `create_trigger`'s installed action to change from a string to a
+    function** (`88_agent_tools.lua`): `50_triggers.lua`'s dispatcher only ever routes
+    *function* actions through `rune.guarded_call` - a string action is sent directly,
+    unprotected, and can never fail or quarantine. `create_trigger` now installs
+    `function(matches) ... rune.agent_policy.send(...) ... end` (substituting captures via
+    the same `rune.substitute_captures` the trigger engine itself would have used, so `%1`/`%2`
+    behavior is byte-for-byte unchanged) instead of the raw command string. Its failure
+    contract is deliberately asymmetric: a `"denied"` result from `send()` is re-raised
+    (counts toward *this trigger's* quarantine, feeding the re-plan wake above), but a
+    `"rate_limited"` result is swallowed silently - throttling a fast-but-otherwise-fine
+    reflex during a legitimate burst must degrade to "dropped this one" rather than escalate
+    into "quarantined and disabled," which would be a much harsher outcome than rate
+    limiting is meant to cause. `send_command`/`speak` raise on either reason, since reaching
+    3 consecutive rate-limited *tool* calls would require the model itself to blindly retry
+    3 times despite being told each time - a scenario closer to oscillation than bad luck.
+- **Tests:** `lua/agent_policy_test.go` (14 tests) - denylist blocks the default `quit` and
+  a custom `deny()` pattern (and rejects an invalid one), rate limiting throttles a burst and
+  resumes after the window rolls over (`os.time` monkeypatched, no real sleeps) and honors
+  `configure()`, oscillation wakes an idle agent after 4 identical sends with unchanged
+  perception and resets afterward (proven by 2 more repeats *not* re-waking), the budget cap
+  stops the agent once crossed and stays inert without pricing configured, a quarantined
+  `agent-*` trigger wakes the agent while a quarantined human trigger does not, and
+  `status()`/`/policy` reflect live config. `lua/agent_tools_test.go` gained
+  `TestAgentToolsSendCommandRespectsDenylist`, proving the tool-level integration (not just
+  `rune.agent_policy.send` in isolation) actually routes through the new layer. All
+  pre-existing T5/T6/T7 tests pass unchanged - the rewiring preserves every previously-tested
+  happy path exactly (nothing in those suites sends fast enough or sends anything
+  denylisted).
+- **Done when:** a runaway/looping agent is contained (rate limit + denylist + oscillation,
+  all independently tested) ✓ and a failing reflex re-engages cognition (quarantine → re-plan,
+  tested end-to-end through the real `create_trigger` → quarantine → wake path, not a
+  synthetic shortcut) ✓.
 
 ### Phase 3 — headless
 

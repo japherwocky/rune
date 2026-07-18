@@ -69,7 +69,10 @@ register("send_command", "Send a raw command to the MUD, exactly as a player wou
     if type(input) ~= "table" or type(input.cmd) ~= "string" or input.cmd == "" then
         error("send_command: input.cmd must be a non-empty string")
     end
-    rune.send(input.cmd)
+    local ok, err = rune.agent_policy.send(input.cmd)
+    if not ok then
+        error(err)
+    end
     return "sent"
 end)
 
@@ -85,17 +88,22 @@ register("speak", "Talk to other players over say (room), tell (private), or gos
     if type(input) ~= "table" or type(input.message) ~= "string" or input.message == "" then
         error("speak: input.message must be a non-empty string")
     end
+    local cmd
     if input.channel == "say" then
-        rune.send("say " .. input.message)
+        cmd = "say " .. input.message
     elseif input.channel == "gossip" then
-        rune.send("gossip " .. input.message)
+        cmd = "gossip " .. input.message
     elseif input.channel == "tell" then
         if type(input.target) ~= "string" or input.target == "" then
             error("speak: input.target is required when channel is 'tell'")
         end
-        rune.send("tell " .. input.target .. " " .. input.message)
+        cmd = "tell " .. input.target .. " " .. input.message
     else
         error("speak: input.channel must be 'say', 'tell', or 'gossip', got " .. tostring(input.channel))
+    end
+    local ok, err = rune.agent_policy.send(cmd)
+    if not ok then
+        error(err)
     end
     return "sent"
 end)
@@ -126,7 +134,29 @@ register("create_trigger",
         error("create_trigger: input.command must be a non-empty string")
     end
     local group = agent_group(input.group)
-    rune.trigger.regex(input.pattern, input.command, {
+    local command = input.command
+    -- A function action, not the plain string rune.trigger.regex would
+    -- otherwise send directly - PLAN.md T9's governance (rate limit,
+    -- denylist, oscillation) lives at rune.agent_policy.send, and a
+    -- reflex is the one send path with no LLM round-trip anywhere near
+    -- it to slow it down, so it needs that gate more than any other
+    -- caller. rune.substitute_captures is the exact same substitution
+    -- rune.trigger.process would have done for a string action, so
+    -- %1/%2 behavior is unchanged - only where the substituted command
+    -- goes is different. A "denied" (not "rate_limited") failure is
+    -- re-raised so a reflex that keeps trying something denylisted
+    -- quarantines like any other malfunctioning trigger, feeding T9's
+    -- quarantine -> re-plan wake (91_agent_policy.lua); a rate-limited
+    -- firing is dropped silently instead, since throttling a fast (but
+    -- otherwise fine) reflex during a burst must not itself escalate
+    -- into disabling it.
+    rune.trigger.regex(input.pattern, function(matches)
+        local cmd = rune.substitute_captures(command, matches)
+        local ok, err, reason = rune.agent_policy.send(cmd)
+        if not ok and reason == "denied" then
+            error(err)
+        end
+    end, {
         group = group,
         once = input.once or false,
         gag = input.gag or false,

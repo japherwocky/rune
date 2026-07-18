@@ -43,6 +43,16 @@ function rune.guarded_call(label, data, fn, ...)
         data.enabled = false
         rune.echo(rune.style.yellow("[" .. label .. "]") .. " disabled after " ..
             data.failures .. " consecutive errors")
+        -- Let anything (91_agent_policy.lua's quarantine -> re-plan, in
+        -- particular) react to a quarantine as it happens. rune.hooks
+        -- doesn't exist yet at the point this file first loads (it's
+        -- 20_hooks.lua, loaded much later) - but guarded_call itself is
+        -- only ever invoked during real dispatch, after every core file
+        -- has loaded, so this nil check is defensive, not expected to
+        -- ever actually skip the call.
+        if rune.hooks then
+            rune.hooks.call("quarantined", label, data)
+        end
     end
     return false, nil, tostring(result)
 end

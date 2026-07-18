@@ -39,6 +39,14 @@
 --   "agent_tool_call"   -- A tool dispatched: (name, input, result, is_error)
 --   "agent_turn_end"    -- The turn reached text/end_turn: (reply)
 --   "agent_error"       -- rune.llm.chat itself failed: (err)
+--   "quarantined"       -- rune.guarded_call (00_init.lua) disabled an
+--                          entry after 3 consecutive failures:
+--                          (label, data) - data is the registry entry
+--                          (trigger/alias/hook/timer/bar/command/tool)
+--   "agent_policy"       -- A governance intervention (91_agent_policy.lua):
+--                          (kind, message) - kind is one of
+--                          "denied_command", "rate_limited", "oscillation",
+--                          "budget_paused", "quarantine_replan"
 
 -- Per-event dispatch index, maintained alongside the registry so
 -- rune.hooks.call doesn't scan unrelated events on every line.
