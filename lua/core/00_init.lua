@@ -25,7 +25,11 @@ local MAX_CONSECUTIVE_FAILURES = 3
 -- (any registry entry with an `enabled` field). Errors are echoed under
 -- `label`; when the failure limit is reached the entry is disabled and
 -- the user notified (re-enable with the registry's enable function).
--- Returns ok, result from the callback.
+-- Returns ok, result from the callback; on failure also returns the
+-- error message as a 3rd value (most callers only need pass/fail and
+-- ignore it, but a caller that must forward the specific failure
+-- somewhere other than the echo - e.g. a tool_result an LLM can react
+-- to - can capture it instead of re-deriving or discarding it).
 function rune.guarded_call(label, data, fn, ...)
     local ok, result = pcall(fn, ...)
     if ok then
@@ -40,7 +44,7 @@ function rune.guarded_call(label, data, fn, ...)
         rune.echo(rune.style.yellow("[" .. label .. "]") .. " disabled after " ..
             data.failures .. " consecutive errors")
     end
-    return false, nil
+    return false, nil, tostring(result)
 end
 
 -- Source attribution

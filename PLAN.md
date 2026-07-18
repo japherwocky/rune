@@ -331,37 +331,65 @@ The two tasks that unblock everything and do **not** depend on botmud#20 are T1 
 - **Done when:** the loop completes a full observe→think→act→observe cycle against a
   mock LLM without blocking the Session. ✓
 
-#### T6 `[Lua]` — tool layer (incl. reflex-programming; the centerpiece)
+#### T6 `[Lua]` — tool layer (incl. reflex-programming; the centerpiece) ✓
 - **Depends:** T5.
-- **Create:** `lua/core/NN_agent_tools.lua`. Model tools as a
-  `rune.registry.new{ kind = "tool" }` so they get names/groups/quarantine/`/tools`
-  listing like every other subsystem. **T5 already has a dispatch seam**:
-  `rune.agent.register_tool(name, description, input_schema, fn)` is a flat map the
-  turn loop calls into - build the registry *on top of* it (wrap each registry-governed
-  function, then call `rune.agent.register_tool` with the wrapped version) rather than
-  having the turn loop learn about the registry directly. See T5's note.
-- **Ship these tools:**
-  - `send_command(cmd)` — generic escape hatch → `rune.send`.
-  - `speak(channel, msg)` — `say`/`tell <who>`/`gossip` (for collaboration-via-channels).
-  - `create_trigger(pattern, command, opts)` — the key one. Builds
-    `rune.trigger.regex(pattern, command, { group = "agent-combat"|"agent-nav"|..., ... })`.
-    **Use the string-action form** (`"kill %1"` with `%1` capture substitution — see
-    `lua/core/50_triggers.lua`): it is data, not code, so no `loadstring`, fully
-    auditable and quarantine-able.
-  - `create_alias`, `remove_group(group)`, `list_automation()` (from
-    `rune.trigger.list()`), so the agent can inspect/prune its own reflexes.
-- **Group discipline:** every agent-authored entry goes in an `agent-*` group so a
-  zone/goal switch is one `rune.trigger.remove_group("agent-combat")`, and the human can
-  see agent reflexes in live mode.
+- **Created:** `lua/core/88_agent_tools.lua`. `rune.registry.new{kind="tool"}` as
+  planned, built *on top of* T5's `rune.agent.register_tool` seam exactly as sketched:
+  a local `register(name, description, input_schema, fn)` helper adds a registry entry
+  for source/quarantine bookkeeping, then registers a wrapper (not `fn` directly) that
+  checks `registry:active(data)` and runs `fn` through `rune.guarded_call`.
+- **Shipped these tools** (all string/data-only actions, no `loadstring` anywhere):
+  - `send_command(cmd)` → `rune.send`.
+  - `speak(channel, message, target?)` → `say "<msg>"` / `gossip "<msg>"` /
+    `tell <target> <msg>` (`target` required and validated when `channel == "tell"`).
+  - `create_trigger(pattern, command, group, once?, gag?)` → `rune.trigger.regex(pattern,
+    command, {group = "agent-" .. group, once, gag})`. String-action form throughout, so
+    `%1`/`%2` capture substitution "just works" and every reflex stays auditable/`/tools`
+    +`/triggers`-listable, per the original plan.
+  - `create_alias(word, expansion, group)` → `rune.alias.exact` (word-match, not regex -
+    the common alias case, and matches create_trigger's data-only minimalism).
+  - `remove_group(group)` → `rune.trigger.remove_group("agent-"..group) +
+    rune.alias.remove_group("agent-"..group)` (both kinds, one call - a zone switch
+    shouldn't need the model to remember it made both a trigger and an alias).
+  - `list_automation()` → merges `rune.trigger.list()` + `rune.alias.list()`, filtered to
+    `group:match("^agent%-")` so the agent only ever sees its *own* automation, never a
+    human's.
+- **Group discipline, made structural rather than conventional:** every tool's
+  `input_schema` asks the model for a short **label** ("combat", "nav"), never a full
+  group string - the `"agent-"` prefix is prepended by the tool's own Lua, not something
+  the model can spell (or forget to spell, or collide with a human's own trigger groups
+  by omitting). `remove_group`/`list_automation` apply the identical prefix rule, so the
+  three tools can't drift out of sync with each other. The label is validated against
+  `^[%w_-]+$` (letters/digits/`-`/`_`) so a malformed label (a space, punctuation) fails
+  fast with a specific message instead of producing a group nothing else can address.
+- **`rune.guarded_call` gained a 3rd return value (`00_init.lua`):** on failure it
+  already echoed the specific error message locally but returned only `false, nil` to
+  the caller - fine for hooks/timers/triggers/etc., which never needed the message back,
+  but wrong for a tool: the model only sees what comes back in the `tool_result`, never
+  the local echo, so swallowing the message left it with a useless generic
+  "see the echoed error above" and no way to correct its next call. Added `, tostring
+  (result)` as a 3rd return on the failure path - purely additive, every existing caller
+  destructures at most `ok, result` and silently ignores extra returns, confirmed against
+  all 10 call sites. `88_agent_tools.lua`'s wrapper re-raises that message so
+  `dispatch_tool` (T5) surfaces it as `tool_result.content`, `is_error = true`.
 - **Do NOT (yet):** ship a `run_lua(code)` codegen tool. Deferred, gated (see §6).
-- **Combat walkthrough to validate against:** new mob type → LLM writes triggers for the
-  repetitive rounds (chase on flee, quaff-heal below threshold) into `agent-combat` →
-  disengages → triggers autopilot at machine speed, zero LLM cost → LLM re-wakes on
-  exception (see T9).
-- **Tests:** e2e where a canned tool_use `create_trigger` installs a trigger, then a
-  matching server line fires the command with captures substituted; `remove_group` clears
-  it. Confirm agent triggers are quarantined after 3 failures (shared machinery).
-- **Done when:** the agent can install, fire, list, and clear its own triggers by group.
+- **Combat walkthrough, validated by `TestAgentToolsCreateTriggerFiresReflex`:** a canned
+  `tool_use` for `create_trigger` installs a regex trigger; a subsequent
+  `engine.OnOutput` matching it sends the substituted command with **zero** additional
+  HTTP calls (asserted directly - total call count stays at 2, the original think plus
+  the tool-result continuation) - the reflex genuinely runs at machine speed, off the
+  LLM path entirely, exactly as T9's eventual quarantine→re-plan story assumes.
+- **Tests:** `lua/agent_tools_test.go`, driven through the real turn cycle (start → wake
+  → canned `tool_use` → continuation), not a backdoor into T5's private tool map - 11
+  tests: `send_command`/`speak` (incl. `tell` validation and an unknown-channel error),
+  `create_trigger` firing a reflex with capture substitution, the `agent-` prefix
+  applied structurally (and rejecting a malformed label), `remove_group` clearing both a
+  trigger *and* an alias in one call, `list_automation` excluding a human-authored
+  (ungrouped) trigger, and quarantine: 3 consecutive invalid `create_trigger` calls
+  disable the tool, and a 4th call **with valid input** still fails with a "disabled"
+  `tool_result` - proving quarantine, not the earlier validation error, is what's now
+  blocking it.
+- **Done when:** the agent can install, fire, list, and clear its own triggers by group. ✓
 
 #### T7 `[Lua]` — observability (live mode)
 - **Create:** `lua/core/NN_agent_ui.lua` (or fold into agent). A reasoning pane

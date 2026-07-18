@@ -92,8 +92,17 @@ func TestAgentPromptWakesAndSendsRequest(t *testing.T) {
 	if body["max_tokens"].(float64) != 1024 {
 		t.Errorf("expected default max_tokens 1024, got %v", body["max_tokens"])
 	}
-	if _, hasTools := body["tools"]; hasTools {
-		t.Errorf("tools should be omitted when none registered, got %v", body["tools"])
+	// T6's tools (88_agent_tools.lua) register unconditionally at core
+	// load, same as every other module - so they're present in every
+	// session's request, not just one that opted in.
+	toolNames := map[string]bool{}
+	for _, def := range body["tools"].([]interface{}) {
+		toolNames[def.(map[string]interface{})["name"].(string)] = true
+	}
+	for _, want := range []string{"send_command", "speak", "create_trigger", "create_alias", "remove_group", "list_automation"} {
+		if !toolNames[want] {
+			t.Errorf("expected built-in tool %q in request tools, got %v", want, toolNames)
+		}
 	}
 	msgs := body["messages"].([]interface{})
 	if len(msgs) != 1 {
@@ -173,8 +182,14 @@ func TestAgentToolUseDispatchAndContinuesTurn(t *testing.T) {
 		t.Fatal(err)
 	}
 	toolDefs, _ := firstBody["tools"].([]interface{})
-	if len(toolDefs) != 1 || toolDefs[0].(map[string]interface{})["name"] != "fake_tool" {
-		t.Fatalf("expected fake_tool in tools, got %v", firstBody["tools"])
+	found := false
+	for _, def := range toolDefs {
+		if def.(map[string]interface{})["name"] == "fake_tool" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected fake_tool among tools (alongside T6's built-ins), got %v", firstBody["tools"])
 	}
 
 	engine.OnHTTPResult(host.HTTPCalls[0].ID, &HTTPResponse{
