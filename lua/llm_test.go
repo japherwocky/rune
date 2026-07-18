@@ -32,12 +32,15 @@ func withAPIKey(host *MockHost) {
 }
 
 // withOpenAIProvider sets RUNE_LLM_PROVIDER=openai on the MockHost so
-// rune.llm.chat builds/parses the OpenAI chat/completions shape
-// (llama.cpp and other local/self-hosted runners, PLAN.md T8b)
-// instead of the default Anthropic-Messages shape. These tests never
-// reach session.Session.LLMRequest (MockHost.LLMRequest is a dumb
-// recorder), so no key needs to be configured here - see
-// session/llm_test.go for the Go-side URL/auth coverage.
+// rune.llm.chat unconditionally builds/parses the OpenAI
+// chat/completions shape (llama.cpp and other local/self-hosted
+// runners, PLAN.md T8b) - as opposed to the default "zen" provider,
+// where the shape instead depends on req.model (Claude vs everything
+// else - see TestLLMChatZenDefaultsToOpenAIShapeForNonClaudeModels
+// below and PLAN.md T4b). These tests never reach
+// session.Session.LLMRequest (MockHost.LLMRequest is a dumb recorder),
+// so no key needs to be configured here - see session/llm_test.go for
+// the Go-side URL/auth coverage.
 func withOpenAIProvider(host *MockHost) {
 	host.EnvVars = map[string]string{"RUNE_LLM_PROVIDER": "openai"}
 }
@@ -49,7 +52,7 @@ func TestLLMChatRequestBodyShape(t *testing.T) {
 
 	err := engine.DoString("test", `
 		rune.llm.chat({
-			model = "deepseek-v4-flash-free",
+			model = "claude-haiku-4-5",
 			system = "You are a MUD agent.",
 			messages = {
 				{ role = "user", content = "look" },
@@ -70,7 +73,7 @@ func TestLLMChatRequestBodyShape(t *testing.T) {
 	if err := json.Unmarshal([]byte(call.Req.Body), &body); err != nil {
 		t.Fatalf("request body not valid JSON: %v\nbody: %s", err, call.Req.Body)
 	}
-	if body["model"] != "deepseek-v4-flash-free" {
+	if body["model"] != "claude-haiku-4-5" {
 		t.Errorf("model: %v", body["model"])
 	}
 	if body["system"] != "You are a MUD agent." {
@@ -95,7 +98,7 @@ func TestLLMChatSuccessTextOnly(t *testing.T) {
 
 	err := engine.DoString("test", `
 		rune.llm.chat({
-			model = "deepseek-v4-flash-free",
+			model = "claude-haiku-4-5",
 			messages = { { role = "user", content = "look" } },
 			max_tokens = 512,
 		}, function(reply, err)
@@ -141,7 +144,7 @@ func TestLLMChatSuccessToolUse(t *testing.T) {
 
 	err := engine.DoString("test", `
 		rune.llm.chat({
-			model = "deepseek-v4-flash-free",
+			model = "claude-haiku-4-5",
 			messages = { { role = "user", content = "kill kobold" } },
 			max_tokens = 512,
 		}, function(reply, err)
@@ -372,6 +375,131 @@ func TestLLMChatCallbackErrorReported(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("callback error not reported; prints: %v", host.PrintCalls)
+	}
+}
+
+// ---- "zen" default provider routes by model, not just provider name
+// (PLAN.md T4b) ----
+
+// TestLLMChatZenNonClaudeModelUsesOpenAIShape proves the *default*
+// provider (no RUNE_LLM_PROVIDER at all, mirroring an unconfigured
+// real deployment) builds the OpenAI chat/completions shape for a
+// non-Claude model - the actual free/promotional models Zen exists
+// for (deepseek, glm, hy3, mimo, ...) - rather than the Anthropic
+// shape every test above unconditionally assumed pre-T4b. This is the
+// routing gap that made every non-Claude model fail live against the
+// real gateway until it was root-caused there (PLAN.md T4b): Zen
+// fronts two differently-shaped endpoints, and req.model - not
+// RUNE_LLM_PROVIDER - decides which one a request needs.
+func TestLLMChatZenNonClaudeModelUsesOpenAIShape(t *testing.T) {
+	engine, host, cleanup := setupTest(t)
+	defer cleanup()
+	withAPIKey(host)
+
+	err := engine.DoString("test", `
+		rune.llm.chat({
+			model = "deepseek-v4-flash-free",
+			system = "You are a MUD agent.",
+			messages = { { role = "user", content = "look" } },
+			max_tokens = 512,
+		}, function(reply, err)
+			got_reply = reply
+			got_err = err
+		end)
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	call := host.LLMCalls[0]
+	if call.Req.Model != "deepseek-v4-flash-free" {
+		t.Errorf("LLMRequest.Model = %q, want it passed through so Go can route the URL by model too", call.Req.Model)
+	}
+	var body map[string]interface{}
+	if err := json.Unmarshal([]byte(call.Req.Body), &body); err != nil {
+		t.Fatalf("request body not valid JSON: %v\nbody: %s", err, call.Req.Body)
+	}
+	if _, hasSystem := body["system"]; hasSystem {
+		t.Errorf("top-level system should be absent for the openai shape, got %v", body["system"])
+	}
+	msgs, ok := body["messages"].([]interface{})
+	if !ok || len(msgs) != 2 {
+		t.Fatalf("messages: %v, want [system, user] (openai shape)", body["messages"])
+	}
+
+	// Feed back an OpenAI-shaped response - if 86_llm.lua guessed
+	// wrong and parsed this via the Anthropic path instead, text would
+	// silently come back empty rather than erroring, which is exactly
+	// why the round trip is worth exercising here, not just the
+	// request shape.
+	engine.OnLLMResult(host.LLMCalls[0].ID, &HTTPResponse{
+		Status: 200,
+		Body: `{
+			"choices": [{"index": 0, "message": {"role": "assistant", "content": "There is nothing here."}, "finish_reason": "stop"}],
+			"usage": {"prompt_tokens": 12, "completion_tokens": 5}
+		}`,
+	}, "")
+
+	err = engine.DoString("assert", `
+		assert(got_err == nil, "err should be nil, got " .. tostring(got_err))
+		assert(got_reply.text == "There is nothing here.", "text: " .. tostring(got_reply.text))
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestLLMChatZenClaudeModelUsesAnthropicShape proves the flip side:
+// the default provider still builds the Anthropic shape for an actual
+// Claude model, unchanged from every pre-T4b test in this file.
+func TestLLMChatZenClaudeModelUsesAnthropicShape(t *testing.T) {
+	engine, host, cleanup := setupTest(t)
+	defer cleanup()
+	withAPIKey(host)
+
+	err := engine.DoString("test", `
+		rune.llm.chat({
+			model = "claude-haiku-4-5",
+			system = "You are a MUD agent.",
+			messages = { { role = "user", content = "look" } },
+			max_tokens = 512,
+		}, function(reply, err)
+			got_reply = reply
+			got_err = err
+		end)
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	call := host.LLMCalls[0]
+	var body map[string]interface{}
+	if err := json.Unmarshal([]byte(call.Req.Body), &body); err != nil {
+		t.Fatalf("request body not valid JSON: %v\nbody: %s", err, call.Req.Body)
+	}
+	if body["system"] != "You are a MUD agent." {
+		t.Errorf("top-level system should be present for the anthropic shape, got %v", body["system"])
+	}
+	msgs, ok := body["messages"].([]interface{})
+	if !ok || len(msgs) != 1 {
+		t.Fatalf("messages: %v, want the single original message unchanged (anthropic shape)", body["messages"])
+	}
+
+	engine.OnLLMResult(host.LLMCalls[0].ID, &HTTPResponse{
+		Status: 200,
+		Body: `{
+			"content": [{"type": "text", "text": "There is nothing here."}],
+			"stop_reason": "end_turn",
+			"usage": {"input_tokens": 12, "output_tokens": 5}
+		}`,
+	}, "")
+
+	err = engine.DoString("assert", `
+		assert(got_err == nil, "err should be nil, got " .. tostring(got_err))
+		assert(got_reply.text == "There is nothing here.", "text: " .. tostring(got_reply.text))
+	`)
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -43,10 +43,41 @@ const (
 	llmMaxAttempts = 4
 )
 
-// llmZenURL is the OpenCode Zen endpoint (see PLAN.md T2/T4) - the
+// Zen fronts two differently-shaped endpoints, not one (see PLAN.md
+// T4b): Claude models live behind the Anthropic-Messages-API-shaped
+// /v1/messages, everything else (the free/promotional models this
+// provider exists for - deepseek, glm, hy3, mimo, ...) behind the
+// OpenAI-chat-completions-shaped /v1/chat/completions. Sending a
+// non-Claude model to /v1/messages doesn't 404 - it reaches a real
+// backend that then fails opaquely ("Input required: specify
+// \"prompt\" or \"messages\"" or "Upstream request failed"), which is
+// what made this take a live-fire investigation to find rather than
+// showing up as an obvious error. zenModelUsesMessagesAPI below is the
 // default target for the "zen" provider when RUNE_LLM_URL doesn't
 // override it.
-const llmZenURL = "https://opencode.ai/zen/v1/messages"
+const (
+	llmZenMessagesURL        = "https://opencode.ai/zen/v1/messages"
+	llmZenChatCompletionsURL = "https://opencode.ai/zen/v1/chat/completions"
+)
+
+// zenModelUsesMessagesAPI reports whether model belongs to Zen's
+// Claude family (and so must go to /v1/messages in the Anthropic
+// shape) as opposed to every other model in the catalog (which goes
+// to /v1/chat/completions in the OpenAI shape). Read independently by
+// this file (URL selection) and by lua/core/86_llm.lua (wire-format
+// selection) from the same req.model - the two sides agree by
+// applying the same rule to the same value rather than one telling
+// the other, matching how RUNE_LLM_PROVIDER already works. Verified
+// live 2026-07-18: a Claude model 200s at /v1/messages and 401s at
+// /v1/chat/completions; a non-Claude model 200s at
+// /v1/chat/completions and 400s at /v1/messages - every Zen Claude id
+// in the live catalog is "claude-*" (claude-sonnet-5, claude-opus-4-8,
+// claude-haiku-4-5, ...) and no non-Claude id is, so the prefix is a
+// reliable, low-maintenance split rather than a hardcoded model list
+// that would need updating every time Zen's rotating catalog changes.
+func zenModelUsesMessagesAPI(model string) bool {
+	return strings.HasPrefix(model, "claude")
+}
 
 // llmRetryBackoff computes the delay before retry attempt n (n >= 1).
 // A var so tests can zero it out rather than actually sleeping.
@@ -69,12 +100,14 @@ type llmProvider struct {
 }
 
 // resolveLLMProvider reads llmProviderEnv/llmURLEnv from the real
-// process environment and returns the resolved backend. An
+// process environment and returns the resolved backend. model (from
+// the same LLMRequest the caller is about to send) picks which of
+// Zen's two endpoints to default to - see zenModelUsesMessagesAPI. An
 // unrecognized provider name or a missing required URL is a
 // recoverable configuration error, delivered through the same
 // _deliver(id, nil, err) path as any other LLM failure - not a raise,
 // per the Go-primitive error convention (PLAN.md §2).
-func resolveLLMProvider(s *Session) (llmProvider, error) {
+func resolveLLMProvider(s *Session, model string) (llmProvider, error) {
 	name, ok := s.Env(llmProviderEnv)
 	if !ok || name == "" {
 		name = "zen"
@@ -84,7 +117,11 @@ func resolveLLMProvider(s *Session) (llmProvider, error) {
 	switch name {
 	case "zen":
 		if url == "" {
-			url = llmZenURL
+			if zenModelUsesMessagesAPI(model) {
+				url = llmZenMessagesURL
+			} else {
+				url = llmZenChatCompletionsURL
+			}
 		}
 		return llmProvider{
 			url:         url,
@@ -149,7 +186,7 @@ func (s *Session) LLMRequest(id int, req lua.LLMRequest) {
 }
 
 func doLLMRequestWithRetry(s *Session, req lua.LLMRequest) (*lua.HTTPResponse, error) {
-	provider, err := resolveLLMProvider(s)
+	provider, err := resolveLLMProvider(s, req.Model)
 	if err != nil {
 		return nil, err
 	}

@@ -8,18 +8,25 @@
 -- dropped. rune.llm.chat's public signature and reply shape are
 -- unchanged since Phase 1 (T4).
 --
--- Two wire formats, one public shape (PLAN.md T8b): Go picks the
--- backend from RUNE_LLM_PROVIDER (session/lua_llm.go) - "zen"
--- (default), OpenCode Zen's Anthropic-Messages-API-shaped endpoint, or
--- "openai", the OpenAI chat/completions shape spoken by llama.cpp's
--- llama-server and other local/self-hosted runners. This module reads
--- the *same* env var (allowlisted in api_env.go, unlike the API keys)
--- to decide which JSON shape to build/parse - the two sides agree
--- independently rather than one telling the other. Everything above
--- this file (87_agent.lua, 88_agent_tools.lua, 91_agent_policy.lua)
--- only ever sees the one canonical reply shape below
--- (content/text/tool_uses/stop_reason/usage, Anthropic-flavored) -
--- picking "openai" translates on the way out and normalizes on the
+-- Two wire formats, one public shape (PLAN.md T8b/T4b): RUNE_LLM_PROVIDER
+-- (session/lua_llm.go) picks between "zen" (default), OpenCode Zen, or
+-- "openai", an explicit local/self-hosted runner (llama.cpp's
+-- llama-server and friends) - this module reads the *same* env var
+-- (allowlisted in api_env.go, unlike the API keys) so the two sides
+-- agree independently rather than one telling the other. Within "zen"
+-- there is a second split Go and this module also agree on
+-- independently, this time from req.model: Zen itself fronts two
+-- differently-shaped endpoints, not one - Claude models need the
+-- Anthropic-Messages-API shape at /v1/messages, every other model in
+-- Zen's catalog (deepseek, glm, hy3, mimo, ... - the free/promotional
+-- models this provider exists for) needs the OpenAI chat/completions
+-- shape at /v1/chat/completions. See zen_model_uses_messages_api and
+-- session/lua_llm.go's zenModelUsesMessagesAPI for the shared rule and
+-- how this was confirmed live. Everything above this file
+-- (87_agent.lua, 88_agent_tools.lua, 91_agent_policy.lua) only ever
+-- sees the one canonical reply shape below
+-- (content/text/tool_uses/stop_reason/usage, Anthropic-flavored) - the
+-- openai-shaped path translates on the way out and normalizes on the
 -- way back in, entirely inside this file.
 --
 -- This module only builds/parses the request - it does not choose a
@@ -34,6 +41,16 @@ rune.llm = {}
 
 local pending = {}
 local next_id = 0
+
+-- zen_model_uses_messages_api(model) -> true for Zen's Claude family
+-- (needs /v1/messages, Anthropic shape), false for everything else in
+-- the catalog (needs /v1/chat/completions, OpenAI shape). Mirrors
+-- session/lua_llm.go's zenModelUsesMessagesAPI exactly - see that
+-- function's comment for how this was confirmed live and why a prefix
+-- check is the right long-term rule against Zen's rotating catalog.
+local function zen_model_uses_messages_api(model)
+    return model:match("^claude") ~= nil
+end
 
 -- Pulls the human-readable message out of an error body shaped
 -- {"error":{"message":...}}, optionally wrapped in an outer
@@ -222,9 +239,11 @@ function rune.llm.chat(req, callback)
     end
 
     local provider = rune.env("RUNE_LLM_PROVIDER") or "zen"
+    local use_openai_shape = provider == "openai"
+        or (provider == "zen" and not zen_model_uses_messages_api(req.model))
 
     local body_table
-    if provider == "openai" then
+    if use_openai_shape then
         body_table = {
             model = req.model,
             messages = to_openai_messages(req.system, req.messages),
@@ -248,8 +267,8 @@ function rune.llm.chat(req, callback)
     end
 
     next_id = next_id + 1
-    pending[next_id] = { callback = callback, provider = provider }
-    rune._llm.request(next_id, { body = body })
+    pending[next_id] = { callback = callback, wire_format = use_openai_shape and "openai" or "anthropic" }
+    rune._llm.request(next_id, { body = body, model = req.model })
 end
 
 -- INTERNAL: called by Go when a request completes. Exactly one of
@@ -281,7 +300,7 @@ function rune.llm._deliver(id, resp, err)
     end
 
     local content, stop_reason, usage
-    if entry.provider == "openai" then
+    if entry.wire_format == "openai" then
         content, stop_reason, usage = from_openai_response(data)
     else
         content, stop_reason, usage = data.content, data.stop_reason, data.usage

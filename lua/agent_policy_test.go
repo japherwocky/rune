@@ -136,7 +136,7 @@ func TestAgentPolicyOscillationWakesIdleAgent(t *testing.T) {
 	defer cleanup()
 	withAPIKey(host)
 
-	if err := engine.DoString("start", `rune.agent.start({ model = "deepseek-v4-flash-free" })`); err != nil {
+	if err := engine.DoString("start", `rune.agent.start({ model = "claude-haiku-4-5" })`); err != nil {
 		t.Fatal(err)
 	}
 	if len(host.LLMCalls) != 0 {
@@ -163,7 +163,7 @@ func TestAgentPolicyOscillationResetsAfterFiring(t *testing.T) {
 	withAPIKey(host)
 
 	if err := engine.DoString("start", `
-		rune.agent.start({ model = "deepseek-v4-flash-free" })
+		rune.agent.start({ model = "claude-haiku-4-5" })
 		rune.agent_policy.configure({ max_commands_per_second = 100 })
 		for i = 1, 4 do
 			assert(rune.agent_policy.send("flee") == true)
@@ -293,7 +293,7 @@ func TestAgentPolicyIgnoresNonAgentQuarantine(t *testing.T) {
 	withAPIKey(host)
 
 	if err := engine.DoString("setup", `
-		rune.agent.start({ model = "deepseek-v4-flash-free" })
+		rune.agent.start({ model = "claude-haiku-4-5" })
 		rune.trigger.regex("^boom$", function() error("nope") end, {})
 	`); err != nil {
 		t.Fatal(err)

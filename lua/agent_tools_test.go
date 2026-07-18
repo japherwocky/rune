@@ -25,7 +25,7 @@ import (
 // id of the resulting LLM call.
 func startAgentAndWake(t *testing.T, engine *Engine, host *MockHost) int {
 	t.Helper()
-	if err := engine.DoString("start", `rune.agent.start({ model = "deepseek-v4-flash-free" })`); err != nil {
+	if err := engine.DoString("start", `rune.agent.start({ model = "claude-haiku-4-5" })`); err != nil {
 		t.Fatal(err)
 	}
 	before := len(host.LLMCalls)

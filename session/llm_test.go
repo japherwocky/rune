@@ -60,7 +60,7 @@ func TestLLMRoundTrip(t *testing.T) {
 
 	err := s.engine.DoString("test", `
 		rune.llm.chat({
-			model = "deepseek-v4-flash-free",
+			model = "claude-haiku-4-5",
 			messages = { { role = "user", content = "look" } },
 			max_tokens = 512,
 		}, function(reply, err)
@@ -93,8 +93,60 @@ func TestLLMRoundTrip(t *testing.T) {
 	if gotContentType != "application/json" {
 		t.Errorf("Content-Type = %q, want application/json", gotContentType)
 	}
-	if !strings.Contains(gotBody, `"deepseek-v4-flash-free"`) {
+	if !strings.Contains(gotBody, `"claude-haiku-4-5"`) {
 		t.Errorf("request body missing model: %s", gotBody)
+	}
+}
+
+// TestZenResolvesEndpointByModelFamily proves the "zen" provider's
+// default URL depends on req.model, not just the provider name (see
+// zenModelUsesMessagesAPI). PLAN.md T4's original live probe never
+// had a valid key to observe a single 200, so this split went
+// unnoticed until every non-Claude model - the actual free/promotional
+// models this provider exists for - failed live with a confusing
+// "Input required: specify \"prompt\" or \"messages\"" (PLAN.md T4b).
+func TestZenResolvesEndpointByModelFamily(t *testing.T) {
+	s, _, _ := newTestSession(t)
+	t.Setenv(llmProviderEnv, "zen")
+	t.Setenv(llmURLEnv, "") // no override - exercise the real default
+
+	for _, tc := range []struct {
+		model   string
+		wantURL string
+	}{
+		{"claude-haiku-4-5", llmZenMessagesURL},
+		{"claude-opus-4-8", llmZenMessagesURL},
+		{"deepseek-v4-flash-free", llmZenChatCompletionsURL},
+		{"hy3-free", llmZenChatCompletionsURL},
+		{"big-pickle", llmZenChatCompletionsURL},
+		{"", llmZenChatCompletionsURL}, // no model given: default to the more common family rather than guessing Claude
+	} {
+		provider, err := resolveLLMProvider(s, tc.model)
+		if err != nil {
+			t.Fatalf("model %q: unexpected error: %v", tc.model, err)
+		}
+		if provider.url != tc.wantURL {
+			t.Errorf("model %q: url = %q, want %q", tc.model, provider.url, tc.wantURL)
+		}
+	}
+}
+
+// TestZenURLOverrideBypassesModelRouting proves RUNE_LLM_URL, when
+// set, wins outright regardless of model - the escape hatch stays a
+// full override, not a second default to route around.
+func TestZenURLOverrideBypassesModelRouting(t *testing.T) {
+	s, _, _ := newTestSession(t)
+	t.Setenv(llmProviderEnv, "zen")
+	t.Setenv(llmURLEnv, "https://example.invalid/custom")
+
+	for _, model := range []string{"claude-haiku-4-5", "deepseek-v4-flash-free"} {
+		provider, err := resolveLLMProvider(s, model)
+		if err != nil {
+			t.Fatalf("model %q: unexpected error: %v", model, err)
+		}
+		if provider.url != "https://example.invalid/custom" {
+			t.Errorf("model %q: url = %q, want the override to win", model, provider.url)
+		}
 	}
 }
 
@@ -156,7 +208,7 @@ func TestLLMRetriesOnRateLimitThenSucceeds(t *testing.T) {
 
 	err := s.engine.DoString("test", `
 		rune.llm.chat({
-			model = "deepseek-v4-flash-free",
+			model = "claude-haiku-4-5",
 			messages = { { role = "user", content = "look" } },
 			max_tokens = 512,
 		}, function(reply, err)

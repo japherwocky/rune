@@ -34,7 +34,7 @@ func TestAgentStartEnablesPerception(t *testing.T) {
 	engine, _, cleanup := setupTest(t)
 	defer cleanup()
 
-	if err := engine.DoString("start", `rune.agent.start({ model = "deepseek-v4-flash-free" })`); err != nil {
+	if err := engine.DoString("start", `rune.agent.start({ model = "claude-haiku-4-5" })`); err != nil {
 		t.Fatal(err)
 	}
 	if err := engine.DoString("check", `
@@ -50,7 +50,7 @@ func TestAgentStartIsIdempotent(t *testing.T) {
 	defer cleanup()
 
 	if err := engine.DoString("start", `
-		rune.agent.start({ model = "deepseek-v4-flash-free" })
+		rune.agent.start({ model = "claude-haiku-4-5" })
 		rune.agent.start({ model = "some-other-model" }) -- must not double-register
 	`); err != nil {
 		t.Fatal(err)
@@ -72,7 +72,7 @@ func TestAgentPromptWakesAndSendsRequest(t *testing.T) {
 	defer cleanup()
 	withAPIKey(host)
 
-	if err := engine.DoString("start", `rune.agent.start({ model = "deepseek-v4-flash-free" })`); err != nil {
+	if err := engine.DoString("start", `rune.agent.start({ model = "claude-haiku-4-5" })`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -86,7 +86,7 @@ func TestAgentPromptWakesAndSendsRequest(t *testing.T) {
 	if err := json.Unmarshal([]byte(host.LLMCalls[0].Req.Body), &body); err != nil {
 		t.Fatalf("request body not valid JSON: %v", err)
 	}
-	if body["model"] != "deepseek-v4-flash-free" {
+	if body["model"] != "claude-haiku-4-5" {
 		t.Errorf("model: %v", body["model"])
 	}
 	if body["max_tokens"].(float64) != 1024 {
@@ -123,7 +123,7 @@ func TestAgentSingleFlightThenCoalescedRewake(t *testing.T) {
 	defer cleanup()
 	withAPIKey(host)
 
-	if err := engine.DoString("start", `rune.agent.start({ model = "deepseek-v4-flash-free" })`); err != nil {
+	if err := engine.DoString("start", `rune.agent.start({ model = "claude-haiku-4-5" })`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -165,7 +165,7 @@ func TestAgentToolUseDispatchAndContinuesTurn(t *testing.T) {
 				fake_tool_input = input
 				return "did the thing"
 			end)
-		rune.agent.start({ model = "deepseek-v4-flash-free" })
+		rune.agent.start({ model = "claude-haiku-4-5" })
 	`)
 	if err != nil {
 		t.Fatal(err)
@@ -259,7 +259,7 @@ func TestAgentUnknownToolReportsErrorInToolResult(t *testing.T) {
 	defer cleanup()
 	withAPIKey(host)
 
-	if err := engine.DoString("start", `rune.agent.start({ model = "deepseek-v4-flash-free" })`); err != nil {
+	if err := engine.DoString("start", `rune.agent.start({ model = "claude-haiku-4-5" })`); err != nil {
 		t.Fatal(err)
 	}
 	engine.OnPrompt(text.NewLine("prompt"))
@@ -295,7 +295,7 @@ func TestAgentLowHPWakesButDoesNotThinkImmediately(t *testing.T) {
 	defer cleanup()
 	withAPIKey(host)
 
-	if err := engine.DoString("start", `rune.agent.start({ model = "deepseek-v4-flash-free" })`); err != nil {
+	if err := engine.DoString("start", `rune.agent.start({ model = "claude-haiku-4-5" })`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -332,7 +332,7 @@ func TestAgentCombatStartIsEdgeTriggered(t *testing.T) {
 	defer cleanup()
 	withAPIKey(host)
 
-	if err := engine.DoString("start", `rune.agent.start({ model = "deepseek-v4-flash-free" })`); err != nil {
+	if err := engine.DoString("start", `rune.agent.start({ model = "claude-haiku-4-5" })`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -377,7 +377,7 @@ func TestAgentChannelMessageWakes(t *testing.T) {
 	defer cleanup()
 	withAPIKey(host)
 
-	if err := engine.DoString("start", `rune.agent.start({ model = "deepseek-v4-flash-free" })`); err != nil {
+	if err := engine.DoString("start", `rune.agent.start({ model = "claude-haiku-4-5" })`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -396,7 +396,7 @@ func TestAgentStopUnwindsAndDropsInFlightResult(t *testing.T) {
 	defer cleanup()
 	withAPIKey(host)
 
-	if err := engine.DoString("start", `rune.agent.start({ model = "deepseek-v4-flash-free" })`); err != nil {
+	if err := engine.DoString("start", `rune.agent.start({ model = "claude-haiku-4-5" })`); err != nil {
 		t.Fatal(err)
 	}
 	engine.OnPrompt(text.NewLine("prompt"))

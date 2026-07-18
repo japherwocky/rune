@@ -135,7 +135,14 @@ type HTTPResponse struct {
 // (built in Lua via rune.json.encode - see lua/core/86_llm.lua).
 // Everything needed to actually reach the gateway - URL, auth header,
 // API version, retry policy - is the implementation's responsibility,
-// not the caller's; see session/lua_llm.go.
+// not the caller's; see session/lua_llm.go. Model is carried alongside
+// Body (rather than requiring the implementation to parse it back out
+// of the opaque JSON) purely so the "zen" provider can pick which of
+// Zen's two endpoints to hit - Lua and Go each read it and apply the
+// same model-family rule independently, the same "two sides agree
+// without one telling the other" pattern RUNE_LLM_PROVIDER already
+// uses (see 86_llm.lua's header comment).
 type LLMRequest struct {
-	Body string
+	Body  string
+	Model string
 }

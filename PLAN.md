@@ -264,6 +264,68 @@ The two tasks that unblock everything and do **not** depend on botmud#20 are T1 
 - **Done when:** a canned response parses into a normalized reply table; errors surface
   as `err`. ✓
 
+#### T4b `[Go+Lua]` — fix: Zen fronts two endpoints, not one ✓
+- **Why:** every real agent run against the "zen" provider failed live, for every model
+  tried (`big-pickle`, `deepseek-v4-flash-free`, `hy3-free`) with an opaque 400 -
+  `Input required: specify "prompt" or "messages"` or `Error from provider (Console):
+  Upstream request failed` - despite `rune.llm.chat` sending a well-formed request and
+  the API key checking out (a garbage key gets a distinct `401 AuthError`, proving the
+  real key authenticates fine). Root cause, found by replaying the exact bytes the real
+  agent sends straight at Zen with curl, bypassing rune entirely to separate "our
+  request is wrong" from "their endpoint is wrong": **Zen's docs
+  (<https://opencode.ai/docs/zen/>) list two separate endpoints** -
+  `https://opencode.ai/zen/v1/messages` (Anthropic-Messages-API shape) for Claude models
+  only, and `https://opencode.ai/zen/v1/chat/completions` (OpenAI chat/completions
+  shape) for everything else - deepseek, glm (`big-pickle`), hy3, mimo, the actual
+  free/promotional models this provider exists for. `session/lua_llm.go` hardcoded
+  `/v1/messages` for every model. Sending a non-Claude model there doesn't 404 - it
+  reaches a real backend that then fails opaquely, which is why this took a live-fire
+  investigation rather than showing up as an obvious error. Confirmed live
+  (2026-07-18): a Claude model 200s at `/v1/messages` and 401s at `/v1/chat/completions`;
+  a non-Claude model 200s at `/v1/chat/completions` and 400s at `/v1/messages` - the
+  split is real, not an artifact of one bad request.
+- **Also worth naming:** T4's original "confirmed" auth-header finding was live-verified
+  only against a *bad* key (distinguishing `x-api-key` from `Authorization: Bearer` via
+  401-vs-400) - nobody had a valid key on hand at T4 time to observe an actual 200
+  (T4's own note: "`anthropic-version` was not settled by this probe... revisit if Zen
+  ever rejects it"). The full success path, including which endpoint a given model
+  actually needs, was never confirmed until this task. Worth remembering next time
+  something here is marked "confirmed" - confirm the happy path, not just the failure
+  shape of a deliberately-bad request.
+- **Fix:** `session/lua_llm.go` gains `zenModelUsesMessagesAPI(model)` (a `"claude"`
+  prefix check - every Claude id in Zen's live catalog is `claude-*`, no non-Claude id
+  is, so this is a low-maintenance split against a rotating catalog rather than a
+  hardcoded model list) and two URL constants (`llmZenMessagesURL`,
+  `llmZenChatCompletionsURL`); `resolveLLMProvider` now takes `model` and picks between
+  them when `RUNE_LLM_URL` doesn't override. `lua/core/86_llm.lua` gains the identical
+  `zen_model_uses_messages_api` check and now picks the wire format (Anthropic vs. the
+  OpenAI shape already built for T8b) the same way - reusing T8b's translation code
+  entirely rather than adding a third shape. The two sides agree independently from the
+  same `req.model`, the same "agree without one telling the other" pattern
+  `RUNE_LLM_PROVIDER` already used - `lua.LLMRequest` gained a `Model` field
+  (`lua/host.go`, `lua/api_llm.go`) purely so Go can see it too. `RUNE_LLM_URL`, when
+  set, still wins outright regardless of model (full override, not just a changed
+  default).
+- **Tests:** `session/llm_test.go` gained `TestZenResolvesEndpointByModelFamily` and
+  `TestZenURLOverrideBypassesModelRouting` (direct `resolveLLMProvider` coverage, no
+  network). `lua/llm_test.go` gained `TestLLMChatZenNonClaudeModelUsesOpenAIShape` /
+  `TestLLMChatZenClaudeModelUsesAnthropicShape` (full request-shape + response-round-trip
+  coverage for both families under the *default* provider). Every pre-existing test that
+  used a placeholder non-Claude model name (`deepseek-v4-flash-free`) while asserting
+  Anthropic-shaped request/response behavior under the default provider - scattered
+  across `session/llm_test.go`, `lua/llm_test.go`, `lua/agent_test.go`,
+  `lua/agent_policy_test.go`, `lua/agent_tools_test.go` - switched to a real Claude id
+  (`claude-haiku-4-5`) so the placeholder keeps meaning what it meant before this task;
+  error-path tests that never reach the shape-specific branch were left alone.
+  Verified against the live endpoint (not just tests) via a throwaway harness exercising
+  the real `session.Session`/`rune.llm.chat` path end to end, key never printed: both
+  `hy3-free` and `claude-haiku-4-5` round-tripped a real completion with no
+  `RUNE_LLM_PROVIDER`/`RUNE_LLM_URL` override, i.e. exactly the unconfigured default a
+  real deployment hits.
+- **Done when:** a non-Claude Zen model (e.g. `hy3-free`) and a Claude Zen model both
+  complete a live `rune.agent.start` turn successfully with no env override beyond
+  `OPENCODE_API_KEY`. ✓
+
 #### T5 `[Lua]` — agent core (state machine + cadence) ✓
 - **Depends:** T3, T4.
 - **Created:** `lua/core/87_agent.lua`. A single-flight state machine:
@@ -780,11 +842,16 @@ The two tasks that unblock everything and do **not** depend on botmud#20 are T1 
   added a second, OpenAI-chat-completions-shaped provider (`llama.cpp` et al.) behind
   `RUNE_LLM_PROVIDER`, entirely inside `86_llm.lua`/`session/lua_llm.go` - T5/T6/T9
   needed zero changes, confirming this boundary was drawn in the right place.
-- **Model + wire-format specifics:** confirmed so far - Zen exists, `OPENCODE_API_KEY`,
-  `/v1/messages` is the Anthropic-Messages-API-shaped endpoint, `/v1/models` lists what's
-  available. **Not yet confirmed** - the exact auth header on `/v1/messages`
-  (`Authorization: Bearer` vs. `x-api-key`) and current model ids. Resolve both against
-  <https://opencode.ai/docs/zen/> and a live request at T4 time, not from memory.
+- **Model + wire-format specifics:** fully confirmed as of T4b, against real 200s, not
+  just a bad-key probe. `x-api-key` (not `Authorization: Bearer`) is the auth header,
+  `2023-06-01` is an accepted `anthropic-version`, `/v1/models` lists what's available -
+  and, the part T4's original probe couldn't reach (no valid key on hand, so it never
+  saw a real success): **Zen fronts two differently-shaped endpoints, not one.**
+  `/v1/messages` (Anthropic-Messages-API shape) is Claude-only; every other model in the
+  catalog - deepseek, glm, hy3, mimo, the actual free/promotional models this provider
+  exists for - needs `/v1/chat/completions` (OpenAI chat/completions shape) instead.
+  Sending the wrong model to `/v1/messages` doesn't 404, it fails opaquely, which is why
+  this shipped and ran for a while before it was caught. See T4b for the fix.
 
 ## 7. Suggested commit/PR breakdown
 

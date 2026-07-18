@@ -16,13 +16,14 @@ func (e *Engine) registerLLMFuncs() {
 	llmTable := e.L.NewTable()
 	e.L.SetField(e.runeTable, "_llm", llmTable)
 
-	// rune._llm.request(id, {body})
+	// rune._llm.request(id, {body, model})
 	e.L.SetField(llmTable, "request", e.L.NewFunction(func(L *glua.LState) int {
 		id := int(L.CheckNumber(1))
 		opts := L.CheckTable(2)
 
 		req := LLMRequest{
-			Body: glua.LVAsString(opts.RawGetString("body")),
+			Body:  glua.LVAsString(opts.RawGetString("body")),
+			Model: glua.LVAsString(opts.RawGetString("model")),
 		}
 		if req.Body == "" {
 			L.RaiseError("rune._llm.request: body is required")
