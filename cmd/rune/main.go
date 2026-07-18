@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 
+	"github.com/joho/godotenv"
 	"github.com/mmcdole/rune/config"
 	"github.com/mmcdole/rune/lua"
 	"github.com/mmcdole/rune/network"
@@ -70,6 +72,11 @@ Options:
 		fmt.Println("rune " + version.Number)
 		return
 	}
+
+	// Load .env from project root first (dev convenience), then config
+	// directory (deployed use). Failures are silent - files are optional.
+	godotenv.Load(".env")
+	godotenv.Load(filepath.Join(config.Dir(), ".env"))
 
 	scripts, target, err := classifyArgs(flag.Args())
 	if err != nil {
