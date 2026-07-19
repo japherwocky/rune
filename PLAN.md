@@ -478,10 +478,22 @@ The two tasks that unblock everything and do **not** depend on botmud#20 are T1 
   something places `{name="agent", height=N}` into `rune.ui.layout` (not done
   automatically - forcing a new pane into a human's screen would be exactly the
   unwanted-side-effect mistake T3 already ran into once).
-- **State bar:** `rune.ui.bar("agent", ...)` shows `state | tokens | last-action | goal`,
+- **State bar:** `rune.ui.bar("agent_status", ...)` shows `state | tokens | last-action | goal`,
   or just `"agent: stopped"` when inactive. `rune.agent_ui.summary()` exposes the same
   fields as plain data (`{input_tokens, output_tokens, cost, last_action}`) so tests (and
   `/agent`) don't have to scrape a styled/rendered string.
+- **2026-07-18 bug fix - bar/pane name collision:** the bar was originally registered as
+  `rune.ui.bar("agent", ...)`, the same name as the pane (`rune.pane.create("agent")`).
+  `ui/tui/layout.go`'s `getWidget` checks `m.widgets` (bars) before panes for a given
+  name, so any layout entry `{name="agent", ...}` always resolved to the 1-line bar -
+  the reasoning pane could never actually be placed, in any layout, by any user. Worse,
+  `widget.Bar.SetSize` ignores its height argument (bars are always 1 line), so a layout
+  entry with an explicit height (e.g. `{name="agent", height=12}`) still reserved 12 rows
+  in the viewport-height calculation while only ever rendering 1 - the other ~11 rows
+  went completely unused, showing as a dead gap at the bottom of the terminal. Fixed by
+  renaming the bar to `"agent_status"`, leaving the pane as `"agent"`. A user's layout
+  now wants `{name="agent", height=N}` for the reasoning pane and, optionally,
+  `"agent_status"` alongside `"status"` for the compact bar.
 - **On "$":** deliberately **not** computed by default. Zen's model catalog rotates
   (T4/T8) and fabricating a number from guessed per-model pricing would be actively
   misleading - worse than omitting it. `rune.agent_ui.pricing = {input_per_million,

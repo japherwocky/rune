@@ -1,6 +1,6 @@
 package lua
 
-// T7 tests (96_agent_ui.lua): the reasoning pane, the "agent" bar
+// T7 tests (96_agent_ui.lua): the reasoning pane, the "agent_status" bar
 // segment, per-turn rune.log entries, and the read-only /agent
 // command. Per PLAN.md T7 these are meant to be light - bar/summary
 // content for a given agent state, and "best-effort" confirmation
@@ -17,8 +17,8 @@ func TestAgentUIBarStoppedWhenInactive(t *testing.T) {
 	defer cleanup()
 
 	if err := engine.DoString("check", `
-		local bar = rune.bars._render_all(80).agent
-		assert(bar ~= nil, "expected an agent bar entry")
+		local bar = rune.bars._render_all(80).agent_status
+		assert(bar ~= nil, "expected an agent_status bar entry")
 		assert(bar:find("stopped"), bar)
 	`); err != nil {
 		t.Fatal(err)
@@ -32,7 +32,7 @@ func TestAgentUIBarReflectsThinkingThenIdle(t *testing.T) {
 
 	id := startAgentAndWake(t, engine, host)
 	if err := engine.DoString("check-thinking", `
-		local bar = rune.bars._render_all(80).agent
+		local bar = rune.bars._render_all(80).agent_status
 		assert(bar:find("thinking"), bar)
 	`); err != nil {
 		t.Fatal(err)
@@ -40,7 +40,7 @@ func TestAgentUIBarReflectsThinkingThenIdle(t *testing.T) {
 
 	deliverEndTurn(engine, host, id, "all clear")
 	if err := engine.DoString("check-idle", `
-		local bar = rune.bars._render_all(80).agent
+		local bar = rune.bars._render_all(80).agent_status
 		assert(bar:find("idle"), bar)
 		assert(bar:find("all clear"), "expected the goal in the bar: " .. bar)
 	`); err != nil {

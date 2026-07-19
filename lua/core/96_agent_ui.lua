@@ -104,7 +104,11 @@ function rune.agent_ui.summary()
     }
 end
 
-rune.ui.bar("agent", function(width)
+-- Named "agent_status", not "agent": the layout resolver checks bars
+-- before panes for a given name (ui/tui/layout.go's getWidget), so a
+-- bar sharing the pane's name would permanently shadow it - no layout
+-- could ever place the reasoning pane, only this one-line summary.
+rune.ui.bar("agent_status", function(width)
     local s = rune.agent.status()
     if not s.active then
         return rune.style.gray("agent: stopped")
