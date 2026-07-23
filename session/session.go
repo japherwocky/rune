@@ -45,6 +45,7 @@ type Config struct {
 	ConfigDir     string   // Path to ~/.config/rune
 	UserScripts   []string // CLI script arguments
 	ConnectTarget string   // CLI connect target (world, host port, or address)
+	Headless      bool     // Running without a terminal UI (see ui/headless)
 }
 
 // Session is the central actor/orchestrator that owns the Lua state and
@@ -323,6 +324,7 @@ func (s *Session) initLua() error {
 		return err
 	}
 	s.engine.SetConfigDir(s.config.ConfigDir)
+	s.engine.SetHeadless(s.config.Headless)
 	return nil
 }
 

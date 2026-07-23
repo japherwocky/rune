@@ -201,6 +201,16 @@ func (e *Engine) SetConfigDir(dir string) {
 	e.L.SetField(e.runeTable, "config_dir", glua.LString(dir))
 }
 
+// SetHeadless exposes the run mode to scripts as rune.headless. Static
+// boot config, set once before core scripts load - deliberately not
+// part of ClientState, which is mutable state Go re-pushes as the
+// connection/terminal changes. Core scripts read it to pick behavior a
+// terminal session would leave to the human: 92_agent_log.lua starts a
+// log unprompted, because an unattended run has no screen to lose.
+func (e *Engine) SetHeadless(headless bool) {
+	e.L.SetField(e.runeTable, "headless", glua.LBool(headless))
+}
+
 // DoString executes a raw string of Lua code.
 // The name parameter is used for stack traces.
 func (e *Engine) DoString(name, code string) error {

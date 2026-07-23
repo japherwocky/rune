@@ -105,7 +105,8 @@ go test ./...           # tests
 - **Cognition** — the callback-driven state machine and think-cadence policy.
 - **Action** — tools: `send_command`, `speak`, and the reflex-programming tools
   (`create_trigger` etc.) built on `rune.trigger`.
-- **Memory** — working context + rolling LLM summary + durable state in `rune.store`.
+- **Memory** — working context + durable state in `rune.store`, plus the session log as
+  searchable long-term recall (T12: `rune.log.read`/`search`, `search_log`/`read_log`).
 - **Governance** — budget/rate/oscillation limits; quarantine→re-plan wiring.
 - **Dual-mode** — a second `ui.UI` implementation; the Session is unchanged.
 - **Observability** — `rune.pane`/`rune.bars`/`rune.log`.
@@ -859,7 +860,7 @@ The two tasks that unblock everything and do **not** depend on botmud#20 are T1 
   of those files were touched); a missing/bad config fails fast with a clear error instead
   of a confusing downstream failure or a silent wrong-endpoint guess ✓.
 
-### Phase 3 — headless
+### Phase 3 — headless + memory
 
 #### T10 `[Go+cmd]` — HeadlessUI + `--headless` ✓
 - **Created:** `ui/headless/headless.go`, a `ui.UI` implementing exactly the contract in
@@ -908,14 +909,83 @@ The two tasks that unblock everything and do **not** depend on botmud#20 are T1 
 - **Done when:** `rune --headless <target>` runs the agent with no terminal and exits
   cleanly on signal. ✓
 
-#### T11 `[Go/Lua]` — control surface for headless
-- **Base:** config-driven autonomy (goal/limits from config or a startup script).
-- **Out-of-band:** a small local control (unix socket or signals) for
-  pause/resume/step/status/reload — the reliable kill switch that never depends on the
-  game being up.
-- **In-game (optional, fits the channels model):** supervise via allowlisted `tell`s
-  (`tell mybot pause`); the bot already perceives tells. Never the *only* control path.
-- **Done when:** a headless bot can be paused/stepped/queried without a terminal.
+#### T11 `[Go/Lua]` — control surface for headless — **cut 2026-07-23**
+- **Cut, not deferred.** The point of headless mode is a bot that runs *without* input;
+  a pause/resume/step channel is a supervision affordance for a human who is, by
+  definition, not there. Everything it was meant to guarantee is already covered:
+  containment by T9's governance (rate limit, denylist, oscillation, budget cap), the
+  kill switch by SIGINT/SIGTERM → ctx cancel → clean shutdown (T10, tested), and
+  "what is it doing" by the session log, which T12 makes complete and durable.
+  Recorded here rather than deleted so the reasoning survives if it ever comes back.
+- **Original scope, for reference:** config-driven autonomy; an out-of-band local
+  control (unix socket or signals) for pause/resume/step/status/reload; optionally
+  in-game supervision via allowlisted `tell`s.
+
+#### T12 `[Go+Lua]` — logging as the bot's memory ✓
+- **Why:** two gaps surfaced once T10 made unattended runs real. (1) A headless run's
+  transcript lived only on stdout - lost entirely unless the deployer redirected it.
+  (2) The agent's only history was `rune.perception.transcript()`'s rolling 200 lines
+  (T3); anything older was simply gone, so it could not recall a quest hint, a name, or
+  what happened last time it tried something.
+- **Created `lua/core/92_agent_log.lua` - layered on top of upstream's `60_log.lua`, not
+  inside it.** That file is upstream's and this is a fork, so logging policy lives in a
+  file of our own and upstream pulls can never conflict over it. Its own header
+  documents exactly this seam ("register your own hooks against `rune._log.write` for a
+  different policy"), and everything here goes through that primitive or `rune.log`'s
+  public API. `60_log.lua` is untouched.
+- **Timestamps (`rune.log.timestamps(true)`):** wraps `rune._log.write` itself, which is
+  what makes this work without editing upstream - both `60_log.lua`'s own output/echo
+  hooks and every `rune.log.write` caller already funnel through that one primitive, so
+  wrapping it stamps *every* line, game output and agent reasoning alike. Off by default,
+  so a plain human `/log` stays byte-identical to upstream. Applies from the moment it is
+  enabled, never retroactively (a test pinned this: `rune.log.start`'s own "--- Log
+  started ---" stamp is written before enabling and correctly stays bare).
+- **Agent chrome:** `60_log.lua` deliberately drops `rune.echo` output as "client chrome"
+  - right for `/help` spam, wrong for a bot, whose echoed commands *are* the transcript.
+  The gap was never the LLM's own turns (`96_agent_ui.lua` has logged those since T7): it
+  was **reflex sends**, which fire from a trigger with no LLM hop and therefore produce no
+  `agent_tool_call` at all, and **policy notices** (denied/rate-limited/oscillation/
+  budget), which only ever reached the screen. Both are now captured by pure-observer
+  hooks, matching `96_agent_ui.lua`'s pattern. `91_agent_policy.lua` fires one new hook,
+  **`agent_send(cmd)`**, from its existing choke point - after governance allowed the
+  command, so a denied one is never logged as sent (tested).
+- **Read-back:** new `Host.LogRead(maxLines)` / `Host.LogSearch(pattern, maxResults)`
+  (`session/lua_log.go`), surfaced as `rune._log.read`/`rune._log.search` and wrapped as
+  `rune.log.read(n)` / `rune.log.search(pattern, n)`. Reads open a second read-only handle:
+  `LogWrite` is unbuffered, so an open log's file already holds every line written so far
+  and no flush coordination is needed (tested explicitly - a read sees a write from moments
+  earlier). Both are **bounded** (default 50, hard cap 500) because they scan
+  synchronously on the session goroutine under the 5s watchdog, and because the result is
+  usually on its way into a prompt. A capped `LogSearch` keeps the **most recent** matches,
+  not the first ones - searching a live log is a question about recent history. The tail is
+  a fixed ring indexed by a running count, O(lines) rather than the O(lines x cap) a
+  per-line slice shift would cost on a long-running bot's log.
+- **Agent tools:** `search_log(pattern, max_results?)` and `read_log(lines?)`
+  (`88_agent_tools.lua`). **Still inside the fairness principle (§4) by construction:** the
+  log holds only what already reached the screen plus the bot's own reasoning, so reading
+  it back is memory, never new perception - no rule needed, the property falls out of what
+  the file contains.
+- **Headless auto-start:** `rune.headless` (new `Engine.SetHeadless`, static boot config
+  set before core scripts load - deliberately *not* part of `ClientState`, which is mutable
+  state Go re-pushes as the connection/terminal changes) lets `92_agent_log.lua` start a
+  timestamped log unprompted when there is no terminal. A terminal session is left alone:
+  writing a file nobody asked for is exactly the unwanted side effect T3's
+  `perception.enable()` and T7's pane placement both already avoid.
+- **`/loglines`:** `/loglines [n]` and `/loglines search <pattern>` give a human the same
+  view the agent's tools get.
+- **Tests:** `session/lua_log_test.go` gained 8 file-backed tests (trailing lines oldest
+  first, a cap above the file length, ring wrapping over 500 lines, search keeping the
+  newest matches, no-hits-is-not-an-error, both calls requiring an open log, an invalid
+  pattern, and reading back writes to a still-open log). `lua/agent_log_test.go` (12 tests)
+  covers the Lua policy: timestamps applied/absent/toggled, `agent_send` and `agent_policy`
+  reaching the log, a denied command *not* logged as sent, chrome silent with no log open,
+  read/search from Lua, the nil+message convention with no log, clamping vs. raising, and
+  headless auto-start vs. a terminal session starting nothing. `lua/agent_tools_test.go`
+  gained 3 driving the real turn cycle. Smoke-tested end to end: a real `--headless` boot
+  auto-opened a timestamped log, captured two sends plus a denylist notice, and read and
+  searched them back.
+- **Done when:** an unattended run is durable and self-describing without the deployer
+  doing anything ✓, and the agent can recall context beyond its rolling window ✓.
 
 ## 6. Open decisions
 

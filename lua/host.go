@@ -90,6 +90,17 @@ type Host interface {
 	LogWrite(text string)                 // appends one line; no-op when inactive
 	LogStatus() (string, bool)            // active log path, if any
 
+	// Reading back the active log. Both read from disk (writes are
+	// unbuffered, so an open log's file already holds every line
+	// written so far) and are bounded by their max argument, because
+	// they are called synchronously from Lua on the session goroutine
+	// under the 5s watchdog - an unbounded scan of a long-running
+	// bot's log would trip it. LogSearch keeps the *most recent*
+	// matches when it has to discard, since recent context is what a
+	// caller searching a live log actually wants.
+	LogRead(maxLines int) ([]string, error)                    // last N lines, oldest first
+	LogSearch(pattern string, maxResults int) ([]string, error) // matching lines, oldest first
+
 	// HTTP: perform req off the session goroutine and deliver the
 	// outcome back on it via Engine.OnHTTPResult with the same id.
 	// The id -> callback mapping is Lua state (lua/core/80_http.lua),

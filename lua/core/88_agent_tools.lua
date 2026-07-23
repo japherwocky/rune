@@ -198,6 +198,52 @@ register("list_automation",
     return result
 end)
 
+-- The log read-back tools (92_agent_log.lua). Deliberately memory, not
+-- perception: the session log holds only what already reached the
+-- screen plus the agent's own reasoning, so nothing here can surface
+-- something a human player at the same terminal wouldn't have seen
+-- (PLAN.md §4).
+
+register("search_log",
+    "Search this session's log for lines matching a regular expression - your " ..
+    "own memory of everything seen and done so far, reaching much further back " ..
+    "than the recent output in each observation. Use it to recall something " ..
+    "specific: a name, a direction, a quest hint, what happened last time you " ..
+    "tried something.", {
+    type = "object",
+    properties = {
+        pattern = { type = "string", description = "A regular expression matched against each log line." },
+        max_results = { type = "number", description = "How many matches to return (most recent kept). Default 50, max 500." },
+    },
+    required = { "pattern" },
+}, function(input)
+    if type(input) ~= "table" or type(input.pattern) ~= "string" or input.pattern == "" then
+        error("search_log: input.pattern must be a non-empty string")
+    end
+    local lines, err = rune.log.search(input.pattern, input.max_results)
+    if not lines then
+        error("search_log: " .. tostring(err))
+    end
+    return lines
+end)
+
+register("read_log",
+    "Read the most recent lines of this session's log - game output, your own " ..
+    "commands, and your own reasoning, interleaved in the order they happened. " ..
+    "Use it to look further back than the recent output you were given.", {
+    type = "object",
+    properties = {
+        lines = { type = "number", description = "How many trailing lines to return. Default 50, max 500." },
+    },
+}, function(input)
+    local n = type(input) == "table" and input.lines or nil
+    local lines, err = rune.log.read(n)
+    if not lines then
+        error("read_log: " .. tostring(err))
+    end
+    return lines
+end)
+
 -- /tools - list registered agent tools and their quarantine status
 rune.command.add("tools", function(args)
     local items = registry:items()

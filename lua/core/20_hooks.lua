@@ -47,6 +47,10 @@
 --                          (kind, message) - kind is one of
 --                          "denied_command", "rate_limited", "oscillation",
 --                          "budget_paused", "quarantine_replan"
+--   "agent_send"         -- One agent-attributed command actually put on
+--                          the wire (91_agent_policy.lua), from a tool or
+--                          a reflex: (cmd). Fires after governance allowed
+--                          it, so a denied/rate-limited command never does.
 
 -- Per-event dispatch index, maintained alongside the registry so
 -- rune.hooks.call doesn't scan unrelated events on every line.

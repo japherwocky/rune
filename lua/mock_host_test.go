@@ -1,6 +1,8 @@
 package lua
 
 import (
+	"fmt"
+	"regexp"
 	"strconv"
 	"sync"
 	"time"
@@ -320,6 +322,50 @@ func (m *MockHost) LogStatus() (string, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.LogPath, m.LogActive
+}
+
+// LogRead/LogSearch serve the captured LogWrites rather than a real
+// file - the same "what was written is what reads back" contract the
+// Session implementation has against disk, without needing one.
+func (m *MockHost) LogRead(maxLines int) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.LogActive {
+		return nil, fmt.Errorf("no log is open")
+	}
+	if maxLines <= 0 {
+		return nil, fmt.Errorf("maxLines must be positive, got %d", maxLines)
+	}
+	return lastN(m.LogWrites, maxLines), nil
+}
+
+func (m *MockHost) LogSearch(pattern string, maxResults int) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.LogActive {
+		return nil, fmt.Errorf("no log is open")
+	}
+	if maxResults <= 0 {
+		return nil, fmt.Errorf("maxResults must be positive, got %d", maxResults)
+	}
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return nil, fmt.Errorf("invalid pattern %q: %w", pattern, err)
+	}
+	var hits []string
+	for _, line := range m.LogWrites {
+		if re.MatchString(line) {
+			hits = append(hits, line)
+		}
+	}
+	return lastN(hits, maxResults), nil
+}
+
+func lastN(lines []string, n int) []string {
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return append([]string(nil), lines...)
 }
 
 func (m *MockHost) HTTPRequest(id int, req HTTPRequest) {

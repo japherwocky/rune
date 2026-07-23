@@ -1,6 +1,7 @@
 package session
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -103,5 +104,160 @@ func TestLogSurvivesReload(t *testing.T) {
 	}
 	if !strings.Contains(string(data), "after reload") {
 		t.Errorf("line after reload missing from log:\n%s", data)
+	}
+}
+
+// --- read-back (LogRead / LogSearch, see lua/core/92_agent_log.lua) ---
+
+// writeLogLines opens a log and writes lines through the same
+// Host.LogWrite path Lua uses, so read-back is tested against bytes
+// that actually went to disk rather than a fixture file. The log is
+// left open (read-back while writing is the case that matters) and
+// closed in cleanup - Windows cannot remove t.TempDir's contents while
+// a handle is still held.
+func writeLogLines(t *testing.T, s *Session, lines ...string) string {
+	t.Helper()
+	path := filepath.Join(s.config.ConfigDir, "read.log")
+	if _, err := s.LogStart(path); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.LogStop() })
+	for _, line := range lines {
+		s.LogWrite(line)
+	}
+	return path
+}
+
+func TestLogReadReturnsTrailingLinesOldestFirst(t *testing.T) {
+	s, _, _ := newTestSession(t)
+	writeLogLines(t, s, "one", "two", "three", "four")
+
+	got, err := s.LogRead(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"three", "four"}
+	if len(got) != len(want) {
+		t.Fatalf("LogRead(2) = %q, want %q", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("LogRead(2) = %q, want %q", got, want)
+		}
+	}
+}
+
+// A cap larger than the file must return everything, not pad or fail -
+// the ring is sized by the cap, not by what is actually there.
+func TestLogReadCapAboveFileLength(t *testing.T) {
+	s, _, _ := newTestSession(t)
+	writeLogLines(t, s, "only", "two")
+
+	got, err := s.LogRead(100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0] != "only" || got[1] != "two" {
+		t.Fatalf("LogRead(100) = %q, want [only two]", got)
+	}
+}
+
+// The ring must survive wrapping many times over, which the naive
+// slice-shift implementation would also pass but far more slowly -
+// this pins the ordering, which is the part that is easy to get wrong.
+func TestLogReadRingWrapsCorrectly(t *testing.T) {
+	s, _, _ := newTestSession(t)
+	var lines []string
+	for i := 0; i < 500; i++ {
+		lines = append(lines, fmt.Sprintf("line-%d", i))
+	}
+	writeLogLines(t, s, lines...)
+
+	got, err := s.LogRead(3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"line-497", "line-498", "line-499"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("LogRead(3) after wrapping = %q, want %q", got, want)
+		}
+	}
+}
+
+// Searching a live log should surface what happened *recently*, so a
+// capped search keeps the newest matches and discards the oldest.
+func TestLogSearchKeepsMostRecentMatches(t *testing.T) {
+	s, _, _ := newTestSession(t)
+	writeLogLines(t, s,
+		"kobold appears", "you miss", "kobold dies",
+		"rat appears", "kobold returns")
+
+	got, err := s.LogSearch("kobold", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"kobold dies", "kobold returns"}
+	if len(got) != len(want) {
+		t.Fatalf("LogSearch = %q, want %q", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("LogSearch = %q, want %q", got, want)
+		}
+	}
+}
+
+func TestLogSearchNoMatchesIsEmptyNotError(t *testing.T) {
+	s, _, _ := newTestSession(t)
+	writeLogLines(t, s, "nothing interesting")
+
+	got, err := s.LogSearch("dragon", 10)
+	if err != nil {
+		t.Fatalf("a search with no hits should not error: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("LogSearch = %q, want no results", got)
+	}
+}
+
+func TestLogReadAndSearchRequireAnOpenLog(t *testing.T) {
+	s, _, _ := newTestSession(t)
+
+	if _, err := s.LogRead(10); err == nil {
+		t.Error("LogRead with no open log should error")
+	}
+	if _, err := s.LogSearch("x", 10); err == nil {
+		t.Error("LogSearch with no open log should error")
+	}
+}
+
+func TestLogSearchRejectsInvalidPattern(t *testing.T) {
+	s, _, _ := newTestSession(t)
+	writeLogLines(t, s, "a line")
+
+	if _, err := s.LogSearch("[unclosed", 10); err == nil {
+		t.Error("LogSearch should reject an invalid regexp")
+	}
+}
+
+// Read-back sees lines written moments earlier through the still-open
+// append handle - the property that makes an agent able to search its
+// own log while it is being written.
+func TestLogReadSeesWritesToStillOpenLog(t *testing.T) {
+	s, _, _ := newTestSession(t)
+	writeLogLines(t, s, "first")
+
+	if got, err := s.LogRead(10); err != nil || len(got) != 1 {
+		t.Fatalf("LogRead = %q, %v; want 1 line", got, err)
+	}
+
+	s.LogWrite("second")
+	got, err := s.LogRead(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[1] != "second" {
+		t.Fatalf("LogRead after a further write = %q, want the new line included", got)
 	}
 }

@@ -364,3 +364,83 @@ func TestAgentToolsQuarantineAfterRepeatedFailures(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// The log read-back tools (92_agent_log.lua): the agent reaching its
+// own memory through the real tool path, not just rune.log in Lua.
+func TestAgentToolsSearchLogFindsEarlierLine(t *testing.T) {
+	engine, host, cleanup := setupTest(t)
+	defer cleanup()
+	withAPIKey(host)
+
+	if err := engine.DoString("log", `
+		assert(rune.log.start("/tmp/tools.log"))
+		rune.log.write("Grimwald the smith mentions a rusted key")
+		rune.log.write("a rat scurries past")
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	id := startAgentAndWake(t, engine, host)
+	deliverToolUse(t, engine, host, id, "toolu_1", "search_log", map[string]interface{}{
+		"pattern": "rusted key",
+	})
+
+	content, isError := lastToolResult(t, host)
+	if isError {
+		t.Fatalf("search_log should not error, got %q", content)
+	}
+	if !strings.Contains(content, "Grimwald") {
+		t.Errorf("expected the matching line in the tool result, got %q", content)
+	}
+	if strings.Contains(content, "rat scurries") {
+		t.Errorf("non-matching line leaked into the result: %q", content)
+	}
+}
+
+func TestAgentToolsReadLogReturnsRecentLines(t *testing.T) {
+	engine, host, cleanup := setupTest(t)
+	defer cleanup()
+	withAPIKey(host)
+
+	if err := engine.DoString("log", `
+		assert(rune.log.start("/tmp/tools2.log"))
+		rune.log.write("older line")
+		rune.log.write("newest line")
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	id := startAgentAndWake(t, engine, host)
+	// The window covers the agent's own "[Agent] turn start" line, which
+	// 96_agent_ui.lua logs the moment the turn begins - the agent's
+	// reasoning and the game's output share one stream by design, so a
+	// tight window sees both kinds interleaved.
+	deliverToolUse(t, engine, host, id, "toolu_1", "read_log", map[string]interface{}{"lines": 2})
+
+	content, isError := lastToolResult(t, host)
+	if isError {
+		t.Fatalf("read_log should not error, got %q", content)
+	}
+	if !strings.Contains(content, "newest line") {
+		t.Errorf("expected the most recent game line in the window, got %q", content)
+	}
+	if strings.Contains(content, "older line") {
+		t.Errorf("line outside the requested window leaked in: %q", content)
+	}
+}
+
+// With no log open the tool must fail visibly to the model rather than
+// returning an empty result it would read as "nothing ever happened".
+func TestAgentToolsSearchLogErrorsWithoutOpenLog(t *testing.T) {
+	engine, host, cleanup := setupTest(t)
+	defer cleanup()
+	withAPIKey(host)
+
+	id := startAgentAndWake(t, engine, host)
+	deliverToolUse(t, engine, host, id, "toolu_1", "search_log", map[string]interface{}{"pattern": "x"})
+
+	content, isError := lastToolResult(t, host)
+	if !isError {
+		t.Errorf("expected an is_error tool_result with no log open, got %q", content)
+	}
+}

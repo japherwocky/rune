@@ -103,6 +103,7 @@ Options:
 		ConfigDir:     config.Dir(),
 		UserScripts:   scripts,
 		ConnectTarget: target,
+		Headless:      *runHeadless,
 	})
 
 	if err := sess.Run(ctx); err != nil {

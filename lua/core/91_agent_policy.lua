@@ -223,7 +223,13 @@ function rune.agent_policy.send(cmd)
     -- server's reaction to it - otherwise the only record of what the
     -- agent actually sent lives in a pane scrolling independently from
     -- the game output, making the two impossible to line up in time.
+    -- The hook carries the same fact to observers that need it in a
+    -- durable form rather than on screen: 60_log.lua drops rune.echo
+    -- output as client chrome, so 92_agent_log.lua listens here to get
+    -- reflex sends (which fire with no LLM turn, and so no
+    -- agent_tool_call) into the session log.
     rune.echo(rune.style.gray("[agent] ") .. cmd)
+    rune.hooks.call("agent_send", cmd)
     rune.send(cmd)
 
     if record_and_check_oscillation(cmd) then
