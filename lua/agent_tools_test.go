@@ -1,7 +1,7 @@
 package lua
 
 // T6 tool tests (88_agent_tools.lua): send_command, speak,
-// create_trigger, create_alias, remove_group, list_automation. These
+// create_trigger, remove_group, list_automation. These
 // drive the *real* agent turn cycle (start -> wake -> canned tool_use
 // -> continuation), the same MockHost LLM mechanism as agent_test.go
 // and llm_test.go, rather than reaching into T5's private tool map -
@@ -262,49 +262,31 @@ func TestAgentToolsCreateTriggerRejectsInvalidGroup(t *testing.T) {
 	}
 }
 
-func TestAgentToolsRemoveGroupClearsTriggersAndAliases(t *testing.T) {
+func TestAgentToolsRemoveGroupClearsTriggers(t *testing.T) {
 	engine, host, cleanup := setupTest(t)
 	defer cleanup()
 	withAPIKey(host)
 
 	id := startAgentAndWake(t, engine, host)
-
-	// One response, two tool_use blocks: a trigger and an alias in the
-	// same group.
-	before := len(host.LLMCalls)
-	body := `{
-		"content": [
-			{"type": "tool_use", "id": "toolu_1", "name": "create_trigger", "input": {"pattern": "x", "command": "y", "group": "combat"}},
-			{"type": "tool_use", "id": "toolu_2", "name": "create_alias", "input": {"word": "kk", "expansion": "kill kobold", "group": "combat"}}
-		],
-		"stop_reason": "tool_use",
-		"usage": {"input_tokens": 1, "output_tokens": 1}
-	}`
-	engine.OnLLMResult(id, &HTTPResponse{Status: 200, Body: body}, "")
-	if len(host.LLMCalls) != before+1 {
-		t.Fatalf("expected the turn to continue, got %d calls", len(host.LLMCalls))
-	}
-	id = host.LLMCalls[len(host.LLMCalls)-1].ID
+	id = deliverToolUse(t, engine, host, id, "toolu_1", "create_trigger", map[string]string{"pattern": "x", "command": "y", "group": "combat"})
 
 	if err := engine.DoString("check-created", `
 		assert(rune.trigger.count() == 1)
-		assert(rune.alias.count() == 1)
 	`); err != nil {
 		t.Fatal(err)
 	}
 
-	id = deliverToolUse(t, engine, host, id, "toolu_3", "remove_group", map[string]string{"group": "combat"})
+	deliverToolUse(t, engine, host, id, "toolu_2", "remove_group", map[string]string{"group": "combat"})
 	content, isError := lastToolResult(t, host)
 	if isError {
 		t.Fatalf("remove_group should not error, got %q", content)
 	}
-	if !strings.Contains(content, "2") {
-		t.Errorf("expected the count of removed items (2) in the response, got %q", content)
+	if !strings.Contains(content, "1") {
+		t.Errorf("expected the count of removed items (1) in the response, got %q", content)
 	}
 
 	if err := engine.DoString("check-removed", `
 		assert(rune.trigger.count() == 0, "trigger should be removed")
-		assert(rune.alias.count() == 0, "alias should be removed")
 	`); err != nil {
 		t.Fatal(err)
 	}

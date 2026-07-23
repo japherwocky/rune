@@ -67,8 +67,8 @@
 -- "quarantined" event the instant it disables an entry after 3
 -- consecutive failures (00_init.lua). This module listens and, if (and
 -- only if) the quarantined entry's group starts with "agent-" (the
--- exact convention 88_agent_tools.lua's create_trigger/create_alias
--- already enforce structurally), wakes the LLM. Scoped that way because
+-- exact convention 88_agent_tools.lua's create_trigger already enforces
+-- structurally), wakes the LLM. Scoped that way because
 -- a human's own quarantined trigger must never wake someone else's bot,
 -- and because tool failures (unlike reflex failures) already reach the
 -- model for free, synchronously, as an is_error tool_result within the
@@ -187,7 +187,11 @@ end
 -- create_trigger's installed reflex action (88_agent_tools.lua) use
 -- instead of rune.send directly (see the header for why rune.send
 -- itself is never wrapped). Applies the denylist, then the rate limit,
--- then - once actually sent - oscillation tracking.
+-- then - once actually sent - echoes the command into the main game
+-- window (rune.send itself never echoes anything, human-typed or not,
+-- so without this the only record of what the agent sent lived in the
+-- separate agent pane, impossible to line up in time against the
+-- server's reaction in the main transcript) and tracks oscillation.
 --
 -- Returns true on success, or nil + a reason string + a short category
 -- ("denied" or "rate_limited") on refusal. The category matters to
@@ -214,6 +218,12 @@ function rune.agent_policy.send(cmd)
         return nil, msg, "rate_limited"
     end
 
+    -- Echoed into the main game window, not just the separate agent
+    -- pane, so the command lands inline in the same transcript as the
+    -- server's reaction to it - otherwise the only record of what the
+    -- agent actually sent lives in a pane scrolling independently from
+    -- the game output, making the two impossible to line up in time.
+    rune.echo(rune.style.gray("[agent] ") .. cmd)
     rune.send(cmd)
 
     if record_and_check_oscillation(cmd) then

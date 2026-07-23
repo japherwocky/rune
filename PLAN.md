@@ -451,6 +451,22 @@ The two tasks that unblock everything and do **not** depend on botmud#20 are T1 
   disable the tool, and a 4th call **with valid input** still fails with a "disabled"
   `tool_result` - proving quarantine, not the earlier validation error, is what's now
   blocking it.
+- **2026-07-23 simplification - dropped `create_alias`:** live local runs showed the
+  model never reached for a bespoke shorthand of its own tool calls - it just called
+  `send_command`/`create_trigger` directly - so the tool was pure unused surface: one
+  more schema for the model to weigh every turn, one more kind of automation
+  `remove_group`/`list_automation` had to track and merge. Removed; `remove_group` now
+  only clears triggers and `list_automation` only lists triggers (both simplified from
+  a trigger+alias merge to a single loop). `agent_tools_test.go`'s former
+  `TestAgentToolsRemoveGroupClearsTriggersAndAliases` narrowed to
+  `TestAgentToolsRemoveGroupClearsTriggers`.
+- **2026-07-23 fix - trigger-happy on one-off actions:** the same live runs showed the
+  model installing a `create_trigger` reflex for things that only happen once (walking
+  a fixed route), not just genuinely repetitive ones (combat) - `DEFAULT_SYSTEM`
+  (`87_agent.lua`) said to "prefer" a trigger "for repetitive situations," which the
+  model over-generalized. Reworded both `DEFAULT_SYSTEM` and `create_trigger`'s own
+  `description` to require recurrence ("something that will keep recurring many times
+  before it's done") and explicitly say NOT to use it for a one-off action.
 - **Done when:** the agent can install, fire, list, and clear its own triggers by group. ✓
 
 #### T7 `[Lua]` — observability (live mode) ✓
@@ -663,7 +679,7 @@ The two tasks that unblock everything and do **not** depend on botmud#20 are T1 
   deny-or-confirm:** an interactive confirm needs a UI affordance neither run mode has yet
   (live mode has no such prompt; headless mode doesn't exist until T10/T11) - denying is the
   strictly safer half of "denylist/confirm" and fully satisfies "contained". Checked only at
-  send time, never at `create_trigger`/`create_alias` creation time - a single robust
+  send time, never at `create_trigger` creation time - a single robust
   enforcement point beats statically analyzing trigger definitions whose `%N` capture
   substitution could produce a denylisted command dynamically in a way creation-time
   checking could never catch anyway.
@@ -706,7 +722,7 @@ The two tasks that unblock everything and do **not** depend on botmud#20 are T1 
   with the codebase's existing defensive style, e.g. `15_registry.lua`'s
   `not rune.group or ...`). `91_agent_policy.lua` listens and wakes the LLM **only when the
   quarantined entry's `group` starts with `"agent-"`** - the exact convention
-  `create_trigger`/`create_alias` already enforce structurally (T6) - so a human's own
+  `create_trigger` already enforces structurally (T6) - so a human's own
   quarantined trigger can never wake somebody else's bot.
   - **Tool quarantine deliberately does NOT wake the LLM** (scope is triggers/aliases only,
     via the group-prefix check): a tool's failure already reaches the model for free,
@@ -746,6 +762,17 @@ The two tasks that unblock everything and do **not** depend on botmud#20 are T1 
   all independently tested) ✓ and a failing reflex re-engages cognition (quarantine → re-plan,
   tested end-to-end through the real `create_trigger` → quarantine → wake path, not a
   synthetic shortcut) ✓.
+- **2026-07-23 fix - agent commands invisible against the game transcript:** live local
+  runs showed T7's reasoning pane and the main game window scrolling independently with
+  no shared anchor, so it was effectively impossible to tell which server line an agent
+  command was actually reacting to - the only record of what got sent lived in the
+  separate `agent` pane's `[tool] name(input) -> result` line, never in the main
+  transcript alongside the game's own response. `rune.agent_policy.send` now echoes every
+  agent-attributed command into the main window (`rune.echo(rune.style.gray("[agent] ")
+  .. cmd)`) right before `rune.send(cmd)` - the one choke point already shared by
+  `send_command`, `speak`, and `create_trigger`'s reflex action, so this covers all three
+  for free. `rune.send`/`rune.send_raw` themselves still echo nothing, human-typed or
+  not - this is additive at the governance boundary, not a change to shared plumbing.
 
 #### T9b `[Go+Lua]` — OpenAI-compatible provider (llama.cpp, local/self-hosted) ✓
 - **Why:** run the agent against a local `llama.cpp` (`llama-server`) instance - or any

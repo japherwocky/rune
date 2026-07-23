@@ -9,13 +9,13 @@
 -- (hooks, timers, triggers, ...): a tool that keeps throwing is
 -- disabled individually rather than derailing every future turn.
 --
--- Group discipline: create_trigger/create_alias ask the model for a
--- short label ("combat", "nav") and structurally prepend "agent-" to
--- it themselves - the model cannot forget the prefix or collide with
--- a human's own trigger groups by omitting it, because the prefix
--- isn't something the model ever gets to spell out. remove_group and
--- list_automation use the same "agent-<label>" -> "agent-" convention
--- to prune/inspect only what the agent itself installed.
+-- Group discipline: create_trigger asks the model for a short label
+-- ("combat", "nav") and structurally prepends "agent-" to it itself -
+-- the model cannot forget the prefix or collide with a human's own
+-- trigger groups by omitting it, because the prefix isn't something
+-- the model ever gets to spell out. remove_group and list_automation
+-- use the same "agent-<label>" -> "agent-" convention to prune/inspect
+-- only what the agent itself installed.
 
 local green, yellow, cyan, dim =
     rune.style.green, rune.style.yellow, rune.style.cyan, rune.style.gray
@@ -110,10 +110,12 @@ end)
 
 register("create_trigger",
     "Install a reflex: when a server output line matches pattern, send command " ..
-    "automatically, without waiting for another turn. Use this for repetitive " ..
-    "situations (combat rounds, a flee-and-chase sequence) instead of reacting to " ..
-    "every line yourself - it runs at machine speed and costs nothing until it " ..
-    "stops matching anything useful.", {
+    "automatically, without waiting for another turn. Use this only for a " ..
+    "situation that will keep recurring many times before it's done (combat " ..
+    "rounds, a flee-and-chase sequence) - it runs at machine speed and costs " ..
+    "nothing until it stops matching anything useful. Do NOT use this for a " ..
+    "one-off action like walking a route or a single conversation; just send " ..
+    "the command(s) directly instead.", {
     type = "object",
     properties = {
         pattern = { type = "string", description = "A regular expression matched against each server output line." },
@@ -164,35 +166,9 @@ register("create_trigger",
     return "created trigger in group " .. group
 end)
 
-register("create_alias",
-    "Install a shorthand: typing word (as the first word of a command) expands to " ..
-    "the full expansion command instead. Mainly useful to shrink your own repeated " ..
-    "multi-step send_command calls into one word.", {
-    type = "object",
-    properties = {
-        word = { type = "string", description = "The exact word this alias matches (the first word of input)." },
-        expansion = { type = "string", description = "The command to run instead. Extra words typed after the alias word are appended." },
-        group = { type = "string", description = "Short label, e.g. 'combat' (stored as agent-<group>)." },
-    },
-    required = { "word", "expansion", "group" },
-}, function(input)
-    if type(input) ~= "table" then
-        error("create_alias: input must be an object")
-    end
-    if type(input.word) ~= "string" or input.word == "" then
-        error("create_alias: input.word must be a non-empty string")
-    end
-    if type(input.expansion) ~= "string" or input.expansion == "" then
-        error("create_alias: input.expansion must be a non-empty string")
-    end
-    local group = agent_group(input.group)
-    rune.alias.exact(input.word, input.expansion, { group = group })
-    return "created alias in group " .. group
-end)
-
 register("remove_group",
-    "Remove every trigger/alias previously installed under the given group label " ..
-    "(the same short label passed to create_trigger/create_alias) - use this when a " ..
+    "Remove every trigger previously installed under the given group label " ..
+    "(the same short label passed to create_trigger) - use this when a " ..
     "fight ends, a zone changes, or a reflex is no longer wanted.", {
     type = "object",
     properties = {
@@ -204,24 +180,19 @@ register("remove_group",
         error("remove_group: input must be an object")
     end
     local group = agent_group(input.group)
-    local removed = rune.trigger.remove_group(group) + rune.alias.remove_group(group)
-    return removed .. " automation(s) removed from group " .. group
+    local removed = rune.trigger.remove_group(group)
+    return removed .. " trigger(s) removed from group " .. group
 end)
 
 register("list_automation",
-    "List every trigger and alias the agent has installed (only its own agent-* " ..
-    "groups, not the human player's own triggers/aliases).",
+    "List every trigger the agent has installed (only its own agent-* groups, " ..
+    "not the human player's own triggers).",
     { type = "object", properties = {} },
     function()
     local result = {}
     for _, t in ipairs(rune.trigger.list()) do
         if t.group and t.group:match("^agent%-") then
             table.insert(result, { kind = "trigger", pattern = t.match, command = t.value, group = t.group, enabled = t.enabled })
-        end
-    end
-    for _, a in ipairs(rune.alias.list()) do
-        if a.group and a.group:match("^agent%-") then
-            table.insert(result, { kind = "alias", word = a.match, expansion = a.value, group = a.group, enabled = a.enabled })
         end
     end
     return result
