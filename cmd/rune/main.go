@@ -15,6 +15,8 @@ import (
 	"github.com/mmcdole/rune/lua"
 	"github.com/mmcdole/rune/network"
 	"github.com/mmcdole/rune/session"
+	"github.com/mmcdole/rune/ui"
+	"github.com/mmcdole/rune/ui/headless"
 	"github.com/mmcdole/rune/ui/tui"
 	"github.com/mmcdole/rune/version"
 )
@@ -48,6 +50,7 @@ func classifyArgs(args []string) (scripts []string, target string, err error) {
 
 func main() {
 	showVersion := flag.Bool("version", false, "print version and exit")
+	runHeadless := flag.Bool("headless", false, "run without a terminal UI, logging to stdout (see PLAN.md T10)")
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(),
 			`usage: rune [host [port] | host:port | world] [script.lua ...]
@@ -89,8 +92,13 @@ Options:
 	defer cancel()
 
 	tcpClient := network.NewTCPClient()
-	tuiInstance := tui.NewBubbleTeaUI()
-	sess := session.New(tcpClient, tuiInstance, session.Config{
+	var uiInstance ui.UI
+	if *runHeadless {
+		uiInstance = headless.New(ctx, os.Stdout)
+	} else {
+		uiInstance = tui.NewBubbleTeaUI()
+	}
+	sess := session.New(tcpClient, uiInstance, session.Config{
 		CoreScripts:   lua.CoreScripts,
 		ConfigDir:     config.Dir(),
 		UserScripts:   scripts,

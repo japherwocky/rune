@@ -861,20 +861,52 @@ The two tasks that unblock everything and do **not** depend on botmud#20 are T1 
 
 ### Phase 3 — headless
 
-#### T10 `[Go+cmd]` — HeadlessUI + `--headless`
-- **Create:** `ui/headless/headless.go` implementing `ui.UI` (see `ui/interface.go` for
-  the full contract): `Print`/`Echo`/`SetPrompt`/`UpdateBars`/pane methods → structured
-  logging (stdout/JSON/file) or no-ops; `Input()`/`Outbound()` return channels driven by
-  the control surface (T11) rather than a keyboard; `Run()` blocks until context
-  cancel/shutdown; `Quit()` unblocks it.
-- **Wire:** add a `--headless` flag in `cmd/rune/main.go` (around line 85) that
-  constructs `headless.New()` instead of `tui.NewBubbleTeaUI()`. **The Session is
-  unchanged** — this is the whole point of the `ui.UI` seam. Shutdown already flows
-  through `signal.NotifyContext` (SIGINT/SIGTERM) → ctx cancel → `Session.Run` returns.
-- **Tests:** a headless run boots, connects, the agent loop runs, output is logged, and
-  SIGTERM shuts down cleanly. Reuse e2e harness patterns.
+#### T10 `[Go+cmd]` — HeadlessUI + `--headless` ✓
+- **Created:** `ui/headless/headless.go`, a `ui.UI` implementing exactly the contract in
+  `ui/interface.go`. Content methods log a plain line to an `io.Writer` (`os.Stdout` in
+  production): `Print`/`Echo` write as-is (headless has one transcript, not a separate
+  scrollback vs. echo distinction); `SetPrompt` tags with `[prompt] ` and drops a clear
+  (empty text) rather than logging a bare tag; `WritePane(name, text)` tags with
+  `[pane:<name>] ` - this is how the agent stays observable with no reasoning pane to
+  look at (`96_agent_ui.lua`'s `agent` pane just becomes `[pane:agent] ...` lines in the
+  same stream). Everything visual-only - `UpdateBars`/`UpdateBinds`/`UpdateLayout`,
+  `ShowPicker`, `CreatePane`/`TogglePane`/`SetPaneVisible`/`ClearPane`, the pane-scroll
+  primitives, `InputSetCursor` - is a no-op; `OpenEditor` returns `("", false)` (no
+  terminal to suspend for `$EDITOR`). `Input()`/`Outbound()` return channels that start
+  and stay empty until T11 exists to drive them.
+- **`Run()`/`Quit()` contract:** `New(ctx, w)` takes the context at construction (the
+  interface's `Run()` takes no arguments, so this is the only way in) and `Run()` blocks
+  on `select { <-ctx.Done(); <-h.done }` - either the caller's context or an explicit
+  `Quit()` unblocks it, whichever comes first; both converge on the same `sync.Once`
+  close so either order, or both, is safe. This mirrors exactly what `cmd/rune/main.go`
+  already had: `signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)`'s `ctx` was
+  already being passed into `Session.Run`, just never into the UI (`BubbleTeaUI.Run()`
+  blocks on Bubble Tea's own program loop instead, which has its own independent
+  SIGINT/SIGTERM handling) - headless needed that same `ctx` threaded one level further.
+- **Wired:** `cmd/rune/main.go` gained a `-headless` flag; when set, `headless.New(ctx,
+  os.Stdout)` replaces `tui.NewBubbleTeaUI()` and `Session` construction is otherwise
+  identical - confirming the `ui.UI` seam needed zero `Session`/engine changes, per plan.
+- **Deviation from the plan's "stdout/JSON/file" phrasing:** shipped stdout-only, plain
+  (untagged-except-prompt/pane) lines - no JSON mode, no file mode. `io.Writer` is the
+  seam a JSON or file writer would plug into later without touching this package; adding
+  one before anything needed it would be exactly the speculative-generality this
+  codebase's PLAN.md entries elsewhere argue against (e.g. T7's "$" cost estimate, T9's
+  budget default).
+- **Tests:** `ui/headless/headless_test.go` (Go unit, 7 tests) - `Print`/`Echo` log
+  verbatim, `SetPrompt` tags and drops empty, `WritePane` tags with its name, every
+  visual-only method is a confirmed no-op (including `OpenEditor`), `Run` blocks until
+  context cancel and separately until `Quit` (both proven with a timeout race, not just
+  inspection), `Quit` is idempotent and safe post-`Run`, `Input`/`Outbound` start empty.
+  `test/e2e/headless_test.go` (imperative Go, reusing `harness_test.go`'s `fakeMUD`) -
+  a real `Session` + real `network.TCPClient` + `headless.UI` against a scripted MUD:
+  boots via `Config.ConnectTarget` (headless has no keyboard to type `/connect` at),
+  server output shows up in the captured writer, then cancelling the *same* `ctx` handed
+  to both `headless.New` and `Session.Run` - standing in for a real SIGTERM - unwinds
+  the whole session within the test's timeout. Manually smoke-tested too: a built binary
+  run with `--headless`, no connect target, logged its boot banner to stdout and exited
+  cleanly within ~1s of a real `SIGTERM`.
 - **Done when:** `rune --headless <target>` runs the agent with no terminal and exits
-  cleanly on signal.
+  cleanly on signal. ✓
 
 #### T11 `[Go/Lua]` — control surface for headless
 - **Base:** config-driven autonomy (goal/limits from config or a startup script).
