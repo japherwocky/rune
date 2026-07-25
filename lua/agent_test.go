@@ -109,7 +109,7 @@ func TestAgentPromptWakesAndSendsRequest(t *testing.T) {
 		t.Fatalf("expected 1 message, got %d", len(msgs))
 	}
 	content := msgs[0].(map[string]interface{})["content"].(string)
-	if !strings.Contains(content, "## Goal") || !strings.Contains(content, "none yet") {
+	if !strings.Contains(content, "## Your goal") || !strings.Contains(content, "none yet") {
 		t.Errorf("observation message missing expected sections: %s", content)
 	}
 

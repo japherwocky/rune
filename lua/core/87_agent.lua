@@ -38,7 +38,11 @@ local DEFAULT_SYSTEM = "You are an autonomous agent playing a MUD through the " 
     "the game's GMCP protocol (your own vitals/status, the current room, " ..
     "channel chatter, and recent scrollback) - exactly what a skilled human " ..
     "player would see, never more. Act by calling tools; never invent " ..
-    "information you have not been given."
+    "information you have not been given. Your text response is your own " ..
+    "private plan - it is never shown to the game and nothing in it " ..
+    "happens. Never write dialogue, actions, or outcomes for other " ..
+    "characters or the world; only a tool result or the next turn's " ..
+    "Recent output tells you what actually happened."
 
 -- name -> {name, description, input_schema, fn}
 local tools = {}
@@ -105,11 +109,20 @@ end
 -- growing chat history across turns (that would blow out context
 -- over a long session) - state.goal is the only thing that persists
 -- turn to turn, in the model's own words.
+--
+-- The heading spells out "your own words, not confirmed fact" rather
+-- than a bare "## Goal": reply.text is saved and replayed here
+-- verbatim (set_goal below), so if a turn's text reads as narrative
+-- rather than a plan, an unqualified heading would hand it back next
+-- turn looking like established ground truth - inviting the model to
+-- treat its own invention as something that already happened and
+-- continue it, rather than as its own prior, possibly-wrong words.
 local function build_observation()
     local snap = rune.perception.snapshot()
     local transcript = rune.perception.transcript()
     return table.concat({
-        "## Goal\n" .. (goal() or "(none yet - decide what to do)"),
+        "## Your goal (your own words from the end of your last turn - " ..
+            "not confirmed fact)\n" .. (goal() or "(none yet - decide what to do)"),
         "## Vitals\n" .. (rune.json.encode(snap.vitals) or "{}"),
         "## Status\n" .. (rune.json.encode(snap.status) or "{}"),
         "## Room\n" .. (rune.json.encode(snap.room) or "{}"),

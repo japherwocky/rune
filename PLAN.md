@@ -357,8 +357,8 @@ The two tasks that unblock everything and do **not** depend on botmud#20 are T1 
     literally as spec'd. Deliberately **not** rate-limited beyond that (no cooldown
     between thinks): spamming is T9's job ("governance: budget, rate-limit,
     oscillation"), not T5's - see the design-choice note in `87_agent.lua`'s header.
-- **Turn:** each turn starts from **one fresh message** - `## Goal` (from `rune.store`,
-  persists across turns and reloads) + `## Vitals`/`## Status`/`## Room`
+- **Turn:** each turn starts from **one fresh message** - `## Your goal` (from
+  `rune.store`, persists across turns and reloads) + `## Vitals`/`## Status`/`## Room`
   (`rune.json.encode`d snapshots) + `## Recent output` (transcript) - not a growing chat
   history (that would blow out context over a long session). `stop_reason == "tool_use"`
   appends the assistant's `content` verbatim plus a `tool_result` user message and
@@ -391,6 +391,21 @@ The two tasks that unblock everything and do **not** depend on botmud#20 are T1 
   error surfaced as `is_error`, low-hp/combat-start/channel wake sources (combat-start
   specifically proven edge-triggered), stop unwinding hooks/timer/perception and
   dropping an in-flight result.
+- **2026-07-25 fix - fabricated narrative compounding via the goal:** live runs on a
+  real MUD showed the model writing whole invented NPC exchanges (names, dialogue, a
+  plot) into a turn's `reply.text` instead of a short plan - and since `set_goal`
+  persists that text verbatim and `build_observation` re-serves it next turn under a
+  bare `## Goal` heading, the model read its own fiction back as established context
+  and continued it, in one case then issuing a real `send_command` acting out a line
+  the fiction had predicted. Two changes, both prompt-level (not a code guardrail on
+  `set_goal` itself): `DEFAULT_SYSTEM` now says explicitly that its text response is a
+  private plan nothing else ever sees, and that only a tool result or the next turn's
+  `## Recent output` reflects what actually happened; the heading became `## Your goal
+  (your own words from the end of your last turn - not confirmed fact)` so even
+  narrative-flavored text is harder to mistake for ground truth on re-read.
+  `perception.transcript()` (T3) was confirmed unaffected - it only ever listens to the
+  real "output" hook, never `rune.echo`, so this was never a contamination-via-echo
+  issue.
 - **Done when:** the loop completes a full observe→think→act→observe cycle against a
   mock LLM without blocking the Session. ✓
 
