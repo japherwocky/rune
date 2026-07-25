@@ -49,13 +49,27 @@ function rune.pane.scroll_to_bottom(name)
 end
 
 -- ============================================================
+-- CLIPBOARD
+-- ============================================================
+
+rune.clipboard = {}
+
+-- Copy text to the system clipboard. Uses OSC 52, so it works over
+-- SSH; the terminal emulator has to support it.
+function rune.clipboard.set(text)
+    rune._ui.set_clipboard(text)
+end
+
+-- ============================================================
 -- PANE SCROLLING BINDINGS
 -- ============================================================
 
 rune.bind("pageup", function() rune.pane.scroll_up("main", 20) end)
 rune.bind("pagedown", function() rune.pane.scroll_down("main", 20) end)
-rune.bind("home", function() rune.pane.scroll_to_top("main") end)
-rune.bind("end", function() rune.pane.scroll_to_bottom("main") end)
+-- Bare Home/End are deliberately unbound: they fall through to the
+-- input widget as cursor-to-start/end, matching the composer's keymap.
+rune.bind("ctrl+home", function() rune.pane.scroll_to_top("main") end)
+rune.bind("ctrl+end", function() rune.pane.scroll_to_bottom("main") end)
 
 -- ============================================================
 -- STATUS BAR

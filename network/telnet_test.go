@@ -120,7 +120,7 @@ func TestParser(t *testing.T) {
 	}
 
 	// Test receiving data with IAC GA
-	events := parser.Receive(append([]byte("Hello, rust!"), CmdIAC, CmdGA))
+	events := parser.Receive(append([]byte("Hello, world!"), CmdIAC, CmdGA))
 	kinds := eventKinds(events)
 	expected := []TelnetEventKind{TelnetEventDataReceive, TelnetEventIAC}
 	if len(kinds) != len(expected) {
@@ -195,7 +195,7 @@ func TestParser(t *testing.T) {
 }
 
 func TestSubnegSeparateReceives(t *testing.T) {
-	parser := NewParserWithCapacity(10)
+	parser := NewParser(NewCompatibilityTable())
 	parser.Options.SupportLocal(OptGMCP)
 	parser.Will(OptGMCP)
 
@@ -296,8 +296,9 @@ func TestUnescape(t *testing.T) {
 	}
 }
 
+// A doubled IAC followed by a data byte must round-trip through
+// escape/unescape unchanged.
 func TestEscapeRoundtripBugOne(t *testing.T) {
-	// The original libtelnet-rs mishandles this input
 	data := []byte{CmdIAC, CmdIAC, 228}
 	escaped := EscapeIAC(data)
 	unescaped := UnescapeIAC(escaped)
@@ -306,8 +307,9 @@ func TestEscapeRoundtripBugOne(t *testing.T) {
 	}
 }
 
+// A data byte followed by a doubled IAC must round-trip through
+// escape/unescape unchanged.
 func TestEscapeRoundtripBugTwo(t *testing.T) {
-	// The original libtelnet-rs mishandles this input
 	data := []byte{228, CmdIAC, CmdIAC}
 	escaped := EscapeIAC(data)
 	unescaped := UnescapeIAC(escaped)
@@ -319,7 +321,7 @@ func TestEscapeRoundtripBugTwo(t *testing.T) {
 func TestBadSubnegBuffer(t *testing.T) {
 	// Configure opt 0xFF (IAC) as local supported, and local state enabled.
 	entry := CompatibilityEntry{Local: true, Remote: false, LocalState: true, RemoteState: false}
-	table := FromOptions([][2]byte{{CmdIAC, entry.toU8()}})
+	table := fromOptions([][2]byte{{CmdIAC, entry.toU8()}})
 	parser := NewParser(table)
 
 	// Receive a malformed subnegotiation - this should not panic
@@ -367,12 +369,13 @@ func TestCompatibilityEntryBitmask(t *testing.T) {
 	}
 }
 
-// Tests ported from libmudtelnet compat_tests
+// Malformed-stream regression inputs: each must parse without
+// panicking, whatever it decodes to.
 
 func TestParserDiff1(t *testing.T) {
 	// options: [(255, 254)]
 	// received_data: [[255, 255, 255, 255, 255, 254, 255, 0]]
-	table := FromOptions([][2]byte{{255, 254}})
+	table := fromOptions([][2]byte{{255, 254}})
 	parser := NewParser(table)
 	parser.Receive([]byte{255, 255, 255, 255, 255, 254, 255, 0})
 	// Should not panic
@@ -384,7 +387,7 @@ func TestParserDiff2(t *testing.T) {
 }
 
 func TestParserDiff3(t *testing.T) {
-	table := FromOptions([][2]byte{{0, 1}})
+	table := fromOptions([][2]byte{{0, 1}})
 	parser := NewParser(table)
 	parser.Receive([]byte{255, 253, 0})
 }
@@ -420,7 +423,7 @@ func TestParserDiff9(t *testing.T) {
 }
 
 func TestParserDiff10(t *testing.T) {
-	table := FromOptions([][2]byte{{255, 254}, {1, 0}})
+	table := fromOptions([][2]byte{{255, 254}, {1, 0}})
 	parser := NewParser(table)
 	parser.Receive([]byte{255, 253, 255})
 }
@@ -546,24 +549,6 @@ func TestOutputBufferPromptConsumeHeldCR(t *testing.T) {
 	}
 }
 
-func TestSendText(t *testing.T) {
-	ev := SendText("hello")
-	if ev.Kind != TelnetEventDataSend {
-		t.Errorf("Expected DataSend, got %v", ev.Kind)
-	}
-	expected := []byte("hello\r\n")
-	if !bytes.Equal(ev.Data, expected) {
-		t.Errorf("Expected %v, got %v", expected, ev.Data)
-	}
-
-	// Test with IAC in text
-	ev = SendText(string([]byte{0xFF, 0x41}))
-	expected = []byte{0xFF, 0xFF, 0x41, '\r', '\n'}
-	if !bytes.Equal(ev.Data, expected) {
-		t.Errorf("Expected %v, got %v", expected, ev.Data)
-	}
-}
-
 func TestNegotiationWILL(t *testing.T) {
 	parser := NewParserDefault()
 	parser.Options.SupportRemote(OptEcho)
@@ -626,8 +611,22 @@ func TestNegotiationDO(t *testing.T) {
 
 	// Check state
 	entry := parser.Options.Get(OptNAWS)
-	if !entry.LocalState || !entry.RemoteState {
-		t.Error("Both LocalState and RemoteState should be true after DO")
+	if !entry.LocalState {
+		t.Error("LocalState should be true after accepted DO")
+	}
+	if entry.RemoteState {
+		t.Error("RemoteState must stay false: the server never sent WILL")
+	}
+}
+
+// TestDefaultCompatibilityRefusesUnimplementedDirections verifies the
+// remote-only options: the server's WILL is accepted, but its DO is
+// refused - the client never echoes to the server or sends EOR marks.
+func TestDefaultCompatibilityRefusesUnimplementedDirections(t *testing.T) {
+	for _, opt := range []byte{OptEcho, OptEOR} {
+		parser := NewParser(DefaultCompatibility())
+		events := parser.Receive([]byte{CmdIAC, CmdDO, opt})
+		assertReply(t, events, []byte{CmdIAC, CmdWONT, opt}, "DO", opt)
 	}
 }
 
@@ -646,36 +645,60 @@ func TestNegotiationDOUnsupported(t *testing.T) {
 	}
 }
 
-func TestLinemodeEnabled(t *testing.T) {
-	parser := NewParserDefault()
-	parser.Options.SupportRemote(OptLinemode)
-
-	if parser.LinemodeEnabled() {
-		t.Error("LinemodeEnabled should be false initially")
+func TestDoubleIACInData(t *testing.T) {
+	tests := []struct {
+		name string
+		wire []byte
+		want []byte
+	}{
+		{
+			name: "middle of data",
+			wire: append(append([]byte("Hello"), CmdIAC, CmdIAC), []byte("World")...),
+			want: append(append([]byte("Hello"), CmdIAC), []byte("World")...),
+		},
+		{
+			name: "three byte input is not negotiation",
+			wire: []byte{CmdIAC, CmdIAC, OptEcho},
+			want: []byte{CmdIAC, OptEcho},
+		},
 	}
 
-	// Enable via WILL
-	parser.Receive([]byte{CmdIAC, CmdWILL, OptLinemode})
-
-	if !parser.LinemodeEnabled() {
-		t.Error("LinemodeEnabled should be true after WILL")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			parser := NewParserDefault()
+			events := parser.Receive(tt.wire)
+			if len(events) != 1 {
+				t.Fatalf("events = %+v, want one data event", events)
+			}
+			if events[0].Kind != TelnetEventDataReceive {
+				t.Fatalf("event kind = %v, want DataReceive", events[0].Kind)
+			}
+			if !bytes.Equal(events[0].Data, tt.want) {
+				t.Errorf("data = %v, want %v", events[0].Data, tt.want)
+			}
+		})
 	}
 }
 
-func TestDoubleIACInData(t *testing.T) {
+func TestDoubleIACSplitAcrossReceives(t *testing.T) {
 	parser := NewParserDefault()
 
-	// Data with escaped IAC: "Hello\xff\xffWorld"
-	events := parser.Receive([]byte{72, 101, 108, 108, 111, 255, 255, 87, 111, 114, 108, 100})
+	events := parser.Receive(append([]byte("Hello"), CmdIAC))
+	if len(events) != 1 || events[0].Kind != TelnetEventDataReceive || string(events[0].Data) != "Hello" {
+		t.Fatalf("first receive events = %+v, want data Hello", events)
+	}
 
+	events = parser.Receive(append([]byte{CmdIAC}, []byte("World")...))
+	want := append([]byte{CmdIAC}, []byte("World")...)
 	if len(events) != 1 {
-		t.Fatalf("Expected 1 event, got %d: %+v", len(events), events)
+		t.Fatalf("second receive events = %+v, want one data event", events)
 	}
 	if events[0].Kind != TelnetEventDataReceive {
-		t.Errorf("Expected DataReceive, got %v", events[0].Kind)
+		t.Fatalf("event kind = %v, want DataReceive", events[0].Kind)
 	}
-	// The doubled IAC in data stream should pass through as-is in raw form
-	// (unescaping happens in subnegotiation payloads, not raw data)
+	if !bytes.Equal(events[0].Data, want) {
+		t.Errorf("data = %v, want %v", events[0].Data, want)
+	}
 }
 
 func TestIncompleteIAC(t *testing.T) {

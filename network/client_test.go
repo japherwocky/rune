@@ -402,6 +402,110 @@ func TestGMCPSendRequiresNegotiation(t *testing.T) {
 
 // --- prompt emission ---
 
+// TestSendEscapesIAC verifies outgoing line data doubles IAC bytes so
+// the server reads them as data. Protocol frames stay untouched - the
+// negotiation loopback tests pin those byte-exact.
+func TestSendEscapesIAC(t *testing.T) {
+	done := make(chan struct{})
+	addr := telnetServer(t, func(t *testing.T, conn net.Conn) {
+		defer close(done)
+		expectBytes(t, conn, []byte{'a', 0xFF, 0xFF, 'b', '\r', '\n'}, "escaped line send")
+	})
+
+	c := connectLoopback(t, addr)
+	if err := c.Send("a\xffb"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server never saw the escaped bytes")
+	}
+}
+
+// TestUnterminatedPromptSurvivesPromptlessNegotiation pins the
+// prompt-mode policy: negotiating SGA or EOR is not evidence of prompt
+// termination (WILL is a promise, DO concerns our output), so a server
+// that negotiates either but never sends GA/EOR keeps its unterminated
+// prompts visible.
+func TestUnterminatedPromptSurvivesPromptlessNegotiation(t *testing.T) {
+	for _, neg := range []struct {
+		name  string
+		bytes []byte
+	}{
+		{"WILL SGA", []byte{CmdIAC, CmdWILL, OptSGA}},
+		{"DO EOR", []byte{CmdIAC, CmdDO, OptEOR}},
+	} {
+		t.Run(neg.name, func(t *testing.T) {
+			addr := telnetServer(t, func(t *testing.T, conn net.Conn) {
+				conn.Write(neg.bytes)
+				time.Sleep(50 * time.Millisecond)
+				conn.Write([]byte("Enter your name: "))
+
+				buf := make([]byte, 1)
+				conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+				conn.Read(buf)
+			})
+
+			c := connectLoopback(t, addr)
+			out := nextOutput(t, c, OutputPrompt, "unterminated prompt after "+neg.name)
+			if out.Payload != "Enter your name: " {
+				t.Fatalf("prompt = %q, want %q", out.Payload, "Enter your name: ")
+			}
+		})
+	}
+}
+
+// TestFirstGASwitchesOffUnterminatedPeek verifies the received-mark
+// switch: after the first GA-terminated prompt, a later partial line
+// is no longer peeked at read boundaries - it renders exactly once,
+// when its own GA arrives.
+func TestFirstGASwitchesOffUnterminatedPeek(t *testing.T) {
+	addr := telnetServer(t, func(t *testing.T, conn net.Conn) {
+		conn.Write(append([]byte("HP:100> "), CmdIAC, CmdGA))
+		time.Sleep(50 * time.Millisecond)
+		conn.Write([]byte("HP:90> ")) // partial, terminator still in flight
+		time.Sleep(50 * time.Millisecond)
+		conn.Write([]byte{CmdIAC, CmdGA})
+		conn.Write([]byte("marker\r\n"))
+
+		buf := make([]byte, 1)
+		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		conn.Read(buf)
+	})
+
+	c := connectLoopback(t, addr)
+	var prompts []string
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case out := <-c.Output():
+			switch out.Kind {
+			case OutputPrompt:
+				prompts = append(prompts, out.Payload)
+			case OutputLine:
+				if out.Payload == "marker" {
+					count := 0
+					for _, p := range prompts {
+						if p == "HP:90> " {
+							count++
+						}
+					}
+					if count != 1 {
+						t.Fatalf("second prompt emitted %d times, want exactly 1 (via GA); prompts=%q", count, prompts)
+					}
+					return
+				}
+			case OutputDisconnect:
+				t.Fatal("connection dropped while waiting for marker")
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for marker line")
+		}
+	}
+}
+
 // TestPromptEmittedOncePerGABatch pins the duplicate-prompt bug: a
 // line and a GA-terminated prompt arriving in one read must produce
 // exactly one prompt event. Before the fix, the unterminated-mode

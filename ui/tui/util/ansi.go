@@ -3,6 +3,7 @@ package util
 import (
 	"strings"
 
+	"github.com/charmbracelet/x/ansi"
 	"github.com/mattn/go-runewidth"
 	"github.com/mmcdole/rune/text"
 )
@@ -12,15 +13,27 @@ func VisibleLen(s string) int {
 	return runewidth.StringWidth(text.StripANSI(s))
 }
 
-// FilterClearSequences removes ANSI sequences that would clear the screen.
-// MUD clients typically ignore these to prevent server-side screen wipes.
-func FilterClearSequences(line string) string {
-	// Filter clear screen sequences
-	line = strings.ReplaceAll(line, "\x1b[2J", "")   // Clear entire screen
-	line = strings.ReplaceAll(line, "\x1b[H", "")    // Move cursor to home
-	line = strings.ReplaceAll(line, "\x1b[0;0H", "") // Move cursor to 0,0
-	line = strings.ReplaceAll(line, "\x1b[1;1H", "") // Move cursor to 1,1
-	return line
+// SplitLines splits text into lines, treating lone CR and CRLF as
+// line breaks.
+func SplitLines(s string) []string {
+	if !strings.ContainsAny(s, "\r\n") {
+		return []string{s}
+	}
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "\n")
+	return strings.Split(s, "\n")
+}
+
+// WrapLine soft-wraps one line into rows of at most width columns,
+// returning at least one row. ANSI codes and wide runes are handled. A
+// line that fits, or a width below 1, passes through unchanged. The
+// byte-length check is a fast bound: a rune's display width never
+// exceeds its byte count.
+func WrapLine(line string, width int) []string {
+	if width < 1 || len(line) <= width || VisibleLen(line) <= width {
+		return []string{line}
+	}
+	return strings.Split(ansi.Wrap(line, width, ""), "\n")
 }
 
 // tabStop is the classic terminal tab width.

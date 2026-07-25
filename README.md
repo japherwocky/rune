@@ -10,6 +10,7 @@ A modern MUD client built with Go and Lua.
 Rune combines Go's performance and concurrency with Lua's flexibility for scripting. The architecture follows a kernel philosophy: Go handles I/O, memory, and concurrency while Lua handles logic, features, and presentation.
 
 Guides, cookbook recipes, and the full API reference live at **[runemud.com](https://runemud.com)**.
+Questions, ideas, and feedback are welcome in the **[Rune Discord](https://discord.gg/gNZkrJ2jHe)**.
 
 ## Features
 
@@ -100,6 +101,10 @@ rune.gmcp.on("Char.Vitals", function(data)
     end
 end)
 ```
+
+Everything Rune reads and writes — scripts, saved worlds, state, and
+logs — lives in `~/.config/rune`. Use `rune --config-dir <dir>` or
+`RUNE_CONFIG_DIR=<dir>` to keep it in a different directory.
 
 The [scripting basics](https://runemud.com/getting-started/scripting-basics/)
 guide picks up from here.

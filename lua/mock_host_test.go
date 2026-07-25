@@ -23,9 +23,9 @@ type MockHost struct {
 	ConnectCalls    []string
 	DisconnectCalls int
 	ReloadCalls     int
-	LoadCalls       []string
 	PaneCalls       []struct{ Op, Name, Data string }
 	PickerCalls     []ui.ShowPickerMsg
+	ClipboardCalls  []string
 	ScheduledTimers []struct {
 		ID       int
 		Duration time.Duration
@@ -53,8 +53,9 @@ type MockHost struct {
 	StoreData map[string]string
 
 	// GMCP capture (see Host.GMCPSend)
-	GMCPSends []struct{ Package, Data string }
-	GMCPErr   error // when set, GMCPSend fails with this error
+	GMCPSends      []struct{ Package, Data string }
+	GMCPErr        error // when set, GMCPSend fails with this error
+	GMCPNegotiated bool  // what GMCPActive reports
 
 	// HTTP capture (see Host.HTTPRequest)
 	HTTPCalls []MockHTTPCall
@@ -124,16 +125,16 @@ func (m *MockHost) GMCPSend(pkg, data string) error {
 	return nil
 }
 
+func (m *MockHost) GMCPActive() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.GMCPNegotiated
+}
+
 func (m *MockHost) Reload() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.ReloadCalls++
-}
-
-func (m *MockHost) Load(path string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.LoadCalls = append(m.LoadCalls, path)
 }
 
 func (m *MockHost) RefreshBars() {
@@ -170,12 +171,6 @@ func (m *MockHost) PaneClear(name string) {
 	m.PaneCalls = append(m.PaneCalls, struct{ Op, Name, Data string }{"clear", name, ""})
 }
 
-func (m *MockHost) GetClientState() ClientState {
-	return ClientState{
-		ScrollMode: "live",
-	}
-}
-
 func (m *MockHost) OnConfigChange() {
 	// No-op for tests - config change notifications not tracked
 }
@@ -184,6 +179,12 @@ func (m *MockHost) ShowPicker(opts ui.ShowPickerMsg) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.PickerCalls = append(m.PickerCalls, opts)
+}
+
+func (m *MockHost) ClipboardSet(text string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ClipboardCalls = append(m.ClipboardCalls, text)
 }
 
 func (m *MockHost) GetHistory() []string {
@@ -343,13 +344,7 @@ func (m *MockHost) InputGetCursor() int {
 func (m *MockHost) InputSetCursor(pos int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if pos < 0 {
-		pos = 0
-	}
-	if pos > len(m.InputText) {
-		pos = len(m.InputText)
-	}
-	m.InputCursor = pos
+	m.InputCursor = input.ClampByteCursor(m.InputText, pos)
 }
 
 func (m *MockHost) OpenEditor(initial string) (string, bool) {

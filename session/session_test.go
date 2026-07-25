@@ -4,15 +4,16 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/mmcdole/rune/event"
 	"github.com/mmcdole/rune/input"
 	"github.com/mmcdole/rune/lua"
+	"github.com/mmcdole/rune/network"
 	runetext "github.com/mmcdole/rune/text"
+	"github.com/mmcdole/rune/ui"
 )
 
 // newTestSession boots a Session against mocks with the real embedded
-// core scripts, without starting Run's goroutines - tests drive
-// handleEvent directly, exactly as the event loop would.
+// core scripts, without starting Run's goroutines - tests call the
+// same handlers the event loop dispatches to, synchronously.
 func newTestSession(t *testing.T) (*Session, *mockNetwork, *mockUI) {
 	t.Helper()
 
@@ -33,15 +34,15 @@ func newTestSession(t *testing.T) (*Session, *mockNetwork, *mockUI) {
 }
 
 func userInput(s *Session, text string) {
-	s.handleEvent(event.Event{Type: event.UserInput, Payload: event.Line(text)})
+	s.handleSubmission(input.Command(text))
 }
 
 func serverLine(s *Session, text string) {
-	s.handleEvent(event.Event{Type: event.NetLine, Payload: event.Line(text)})
+	s.handleNetworkOutput(network.Output{Kind: network.OutputLine, Payload: text})
 }
 
 func serverPrompt(s *Session, text string) {
-	s.handleEvent(event.Event{Type: event.NetPrompt, Payload: event.Line(text)})
+	s.handleNetworkOutput(network.Output{Kind: network.OutputPrompt, Payload: text})
 }
 
 func contains(list []string, substr string) bool {
@@ -113,7 +114,7 @@ func TestDisconnectEventUpdatesStateAndNotifiesLua(t *testing.T) {
 	net.connected = true
 	s.clientState.Connected = true
 
-	s.handleEvent(event.Event{Type: event.SysDisconnect})
+	s.handleNetworkOutput(network.Output{Kind: network.OutputDisconnect})
 
 	if s.clientState.Connected {
 		t.Error("clientState still connected after disconnect")
@@ -138,13 +139,10 @@ func TestReloadIsDeferredAndRebuildsVM(t *testing.T) {
 
 	// The reload callback is queued, not executed inline
 	select {
-	case ev := <-s.events:
-		if ev.Type != event.AsyncResult {
-			t.Fatalf("expected AsyncResult, got %v", ev.Type)
-		}
-		s.handleEvent(ev)
+	case cb := <-s.asyncResults:
+		cb()
 	default:
-		t.Fatal("reload did not queue an event")
+		t.Fatal("reload did not queue a callback")
 	}
 
 	if printed := uiMock.drainPrinted(); !contains(printed, "Scripts reloaded") {
@@ -225,7 +223,7 @@ func TestHistoryPreservesModeAndDedupesWholeSubmission(t *testing.T) {
 
 func TestSetInputSubmissionForwardsExplicitMode(t *testing.T) {
 	s, _, uiMock := newTestSession(t)
-	want := input.Verbatim("one line;still data")
+	want := input.Verbatim("café;still data")
 
 	s.SetInputSubmission(want)
 
@@ -235,8 +233,35 @@ func TestSetInputSubmissionForwardsExplicitMode(t *testing.T) {
 	if got := s.GetInput(); got != want.Text {
 		t.Fatalf("Session input mirror = %q, want %q", got, want.Text)
 	}
-	if got, wantCursor := s.InputGetCursor(), len([]rune(want.Text)); got != wantCursor {
+	if got, wantCursor := s.InputGetCursor(), len(want.Text); got != wantCursor {
 		t.Fatalf("Session cursor mirror = %d, want %d", got, wantCursor)
+	}
+}
+
+func TestInputCursorConvertsAtUIBoundary(t *testing.T) {
+	s, _, uiMock := newTestSession(t)
+
+	s.handleUIMessage(ui.InputChangedMsg{Text: "café gob", Cursor: 8})
+	if got, want := s.InputGetCursor(), len("café gob"); got != want {
+		t.Fatalf("cursor after input change = %d, want %d", got, want)
+	}
+
+	s.handleUIMessage(ui.CursorMovedMsg{Cursor: 4})
+	if got, want := s.InputGetCursor(), len("café"); got != want {
+		t.Fatalf("cursor after UI move = %d, want %d", got, want)
+	}
+
+	s.InputSetCursor(4)
+	if got, want := s.InputGetCursor(), 3; got != want {
+		t.Fatalf("cursor inside UTF-8 sequence = %d, want %d", got, want)
+	}
+	if got, want := uiMock.inputCursor[len(uiMock.inputCursor)-1], 3; got != want {
+		t.Fatalf("widget cursor = %d, want %d", got, want)
+	}
+
+	s.InputSetCursor(len("café"))
+	if got, want := uiMock.inputCursor[len(uiMock.inputCursor)-1], 4; got != want {
+		t.Fatalf("widget cursor after multibyte text = %d, want %d", got, want)
 	}
 }
 

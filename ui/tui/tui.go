@@ -177,6 +177,11 @@ func (b *BubbleTeaUI) ShowPicker(opts ui.ShowPickerMsg) {
 	b.send(opts)
 }
 
+// SetClipboard asks the terminal to set the system clipboard.
+func (b *BubbleTeaUI) SetClipboard(text string) {
+	b.send(ui.SetClipboardMsg(text))
+}
+
 // SetInput sets the input line content.
 func (b *BubbleTeaUI) SetInput(text string) {
 	b.send(ui.SetInputMsg(text))
@@ -189,7 +194,7 @@ func (b *BubbleTeaUI) SetInputSubmission(submission input.Submission) {
 
 // --- Input Primitives for Lua ---
 
-// InputSetCursor sets the cursor position.
+// InputSetCursor sets the widget cursor to a zero-based rune offset.
 func (b *BubbleTeaUI) InputSetCursor(pos int) {
 	b.send(ui.InputSetCursorMsg(pos))
 }

@@ -45,6 +45,13 @@ func (m *Model) layoutDock(entries []ui.LayoutEntry) (string, int) {
 			continue
 		}
 
+		// Options are per-entry but the widget instance is shared, so
+		// pass the bag unconditionally: an entry without options must
+		// reset whatever a previous entry configured this render pass.
+		if c, ok := w.(widget.Configurable); ok {
+			c.SetOptions(entry.Opts)
+		}
+
 		// Width can affect intrinsic height (notably soft-wrapped composer
 		// text), so make the current width available before asking for it.
 		// Existing fixed-height widgets ignore the zero height.
@@ -83,6 +90,8 @@ func (m *Model) View() string {
 	if viewportHeight < 1 {
 		viewportHeight = 1
 	}
+	// The viewport spans the full terminal width; splitRows wraps
+	// appended rows to the same m.width.
 	m.viewport.SetSize(m.width, viewportHeight)
 
 	var parts []string

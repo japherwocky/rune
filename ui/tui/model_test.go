@@ -184,6 +184,84 @@ func TestEchoFlushesPendingServerLines(t *testing.T) {
 	}
 }
 
+// wantScrollback asserts the scrollback holds exactly want, in order.
+func wantScrollback(t *testing.T, m *Model, want ...string) {
+	t.Helper()
+	if got := m.scrollback.Count(); got != len(want) {
+		t.Fatalf("scrollback has %d rows, want %d", got, len(want))
+	}
+	for i, w := range want {
+		if got := m.scrollback.At(i); got != w {
+			t.Fatalf("scrollback[%d] = %q, want %q", i, got, w)
+		}
+	}
+}
+
+// TestMultiLinePrintSplitsIntoRows pins issue #49: a Print carrying
+// embedded newlines must become one scrollback row per line, with
+// lone CR and CRLF treated as line breaks.
+func TestMultiLinePrintSplitsIntoRows(t *testing.T) {
+	m := newBareModel(t)
+
+	next, _ := m.Update(ui.PrintLineMsg("row 1\rrow 2\r\nrow 3"))
+	m = next.(*Model)
+
+	wantScrollback(t, m, "row 1", "row 2", "row 3")
+}
+
+// TestMultiLinePrintSplitsInsideBatchWindow verifies the batched path
+// splits too: a multi-line Print arriving inside an open window lands
+// as individual rows when the tick flushes.
+func TestMultiLinePrintSplitsInsideBatchWindow(t *testing.T) {
+	m := newBareModel(t)
+
+	next, _ := m.Update(ui.PrintLineMsg("first")) // immediate, opens window
+	m = next.(*Model)
+	next, _ = m.Update(ui.PrintLineMsg("row 1\nrow 2")) // batched
+	m = next.(*Model)
+	next, _ = m.Update(tickMsg{})
+	m = next.(*Model)
+
+	wantScrollback(t, m, "first", "row 1", "row 2")
+}
+
+// TestOverlongPrintWordWrapsToWidth pins issue #49: a line wider than
+// the terminal word-wraps into multiple rows at the last space rather
+// than being clipped. The model is 80 columns wide (newBareModel).
+func TestOverlongPrintWordWrapsToWidth(t *testing.T) {
+	m := newBareModel(t)
+
+	head := strings.Repeat("x", 60)
+	tail := strings.Repeat("y", 30)
+	next, _ := m.Update(ui.PrintLineMsg(head + " " + tail))
+	m = next.(*Model)
+
+	wantScrollback(t, m, head, tail)
+}
+
+// TestOverlongUnbreakableWordHardWraps verifies a single word wider
+// than the terminal is broken at the width rather than clipped.
+func TestOverlongUnbreakableWordHardWraps(t *testing.T) {
+	m := newBareModel(t)
+
+	next, _ := m.Update(ui.EchoLineMsg(strings.Repeat("z", 100)))
+	m = next.(*Model)
+
+	wantScrollback(t, m, strings.Repeat("z", 80), strings.Repeat("z", 20))
+}
+
+// TestMultiLineEchoSplitsIntoRows verifies the echo path splits like
+// Print, and that tab columns restart on each row rather than carrying
+// across the whole message.
+func TestMultiLineEchoSplitsIntoRows(t *testing.T) {
+	m := newBareModel(t)
+
+	next, _ := m.Update(ui.EchoLineMsg("> dump\na\tb"))
+	m = next.(*Model)
+
+	wantScrollback(t, m, "> dump", "a       b")
+}
+
 func TestEchoExpandsPreservedTabsBeforeScrollback(t *testing.T) {
 	m := newBareModel(t)
 
@@ -257,6 +335,30 @@ func TestBarCannotClobberBuiltinWidget(t *testing.T) {
 
 	if _, isInput := m.widgets["input"].(*widget.Input); !isInput {
 		t.Fatal("removing the colliding bar deleted the input widget")
+	}
+}
+
+// TestLayoutEntryOptsReachWidget verifies layoutDock hands each
+// entry's option bag to Configurable widgets — and that a second
+// separator entry without options resets the shared instance instead
+// of inheriting the first entry's char.
+func TestLayoutEntryOptsReachWidget(t *testing.T) {
+	m := newTestModel(t)
+
+	// No "input" entry: the input widget draws its own default rule,
+	// which would mask a separator that failed to reset.
+	next, _ := m.Update(ui.UpdateLayoutMsg{
+		Top:    []ui.LayoutEntry{{Name: "separator", Opts: map[string]string{"char": "═"}}},
+		Bottom: []ui.LayoutEntry{{Name: "separator"}},
+	})
+	m = next.(*Model)
+
+	view := m.View()
+	if !strings.Contains(view, strings.Repeat("═", m.width)) {
+		t.Error("configured separator rule missing from view")
+	}
+	if !strings.Contains(view, strings.Repeat("─", m.width)) {
+		t.Error("option-less separator entry did not reset to the default rule")
 	}
 }
 
@@ -441,5 +543,50 @@ func TestPrintedTabsAreExpanded(t *testing.T) {
 	m = next.(*Model)
 	if got := m.lastPrompt; got != "HP      > " {
 		t.Errorf("prompt = %q, want tab expanded", got)
+	}
+}
+
+// TestHomeEndEditInputWhileCtrlVariantsScroll pins the default key
+// split: with no binds registered, bare Home/End fall through to the
+// input widget as cursor movement, while Ctrl+Home/Ctrl+End hit the Go
+// scroll fallback (the path that keeps degraded mode navigable).
+func TestHomeEndEditInputWhileCtrlVariantsScroll(t *testing.T) {
+	m := newTestModel(t)
+
+	typed := "say hello"
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(typed)})
+	m = next.(*Model)
+
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyHome})
+	m = next.(*Model)
+	if m.viewport.Mode() != widget.ModeLive {
+		t.Fatal("Home scrolled the viewport instead of reaching the input")
+	}
+	if pos := m.inputCtl.input.Position(); pos != 0 {
+		t.Fatalf("Home left cursor at %d, want 0", pos)
+	}
+
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnd})
+	m = next.(*Model)
+	if m.viewport.Mode() != widget.ModeLive {
+		t.Fatal("End scrolled the viewport instead of reaching the input")
+	}
+	if pos := m.inputCtl.input.Position(); pos != len(typed) {
+		t.Fatalf("End left cursor at %d, want %d", pos, len(typed))
+	}
+
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlHome})
+	m = next.(*Model)
+	if m.viewport.Mode() == widget.ModeLive {
+		t.Fatal("Ctrl+Home did not scroll the viewport to the top")
+	}
+
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlEnd})
+	m = next.(*Model)
+	if m.viewport.Mode() != widget.ModeLive {
+		t.Fatal("Ctrl+End did not return the viewport to live")
+	}
+	if got := m.inputCtl.input.Value(); got != typed {
+		t.Fatalf("input draft = %q, want %q", got, typed)
 	}
 }

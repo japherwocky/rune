@@ -20,6 +20,12 @@ type Host interface {
 	// has not negotiated GMCP.
 	GMCPSend(pkg, data string) error
 
+	// GMCPActive reports whether GMCP is negotiated on the current
+	// connection (false when disconnected). Negotiation is a
+	// connection-lifetime fact, so Lua queries it live instead of
+	// caching it in the VM, where it would go stale across /reload.
+	GMCPActive() bool
+
 	// UI
 	Print(text string)
 	PaneCreate(name string)
@@ -28,11 +34,13 @@ type Host interface {
 	PaneSetVisible(name string, visible bool)
 	PaneClear(name string)
 	ShowPicker(opts ui.ShowPickerMsg)
+	ClipboardSet(text string)
 	GetInput() string
 	SetInput(text string)
 	SetInputSubmission(submission input.Submission)
 
 	// Input primitives
+	// Cursor positions are zero-based UTF-8 byte offsets.
 	InputGetCursor() int
 	InputSetCursor(pos int)
 	OpenEditor(initial string) (string, bool)
@@ -52,7 +60,6 @@ type Host interface {
 	// System
 	Quit()
 	Reload()
-	Load(path string)
 	RefreshBars() // Force immediate bar refresh
 
 	// History

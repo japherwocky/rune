@@ -53,7 +53,9 @@ Data-flow: `"output"`, `"prompt"`, `"echo"` support returning `false` to gag or 
 
 This fork has no docs site (dropped along with `website/`); the Lua core in `lua/core/` is the source of truth for the public API surface. Go primitives (`rune._*`) are internal. Slash commands are registry-based; `/help` is generated from the registry.
 
-User scripts auto-load from `~/.config/rune/init.lua` at startup.
+User scripts auto-load from `<config-dir>/init.lua` at startup. The default is
+`~/.config/rune`; `--config-dir` overrides `RUNE_CONFIG_DIR`, which overrides
+the platform default.
 
 ## Testing
 
