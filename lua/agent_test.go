@@ -99,7 +99,7 @@ func TestAgentPromptWakesAndSendsRequest(t *testing.T) {
 	for _, def := range body["tools"].([]interface{}) {
 		toolNames[def.(map[string]interface{})["name"].(string)] = true
 	}
-	for _, want := range []string{"send_command", "speak", "create_trigger", "remove_group", "list_automation"} {
+	for _, want := range []string{"send_command", "speak"} {
 		if !toolNames[want] {
 			t.Errorf("expected built-in tool %q in request tools, got %v", want, toolNames)
 		}

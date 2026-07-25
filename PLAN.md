@@ -468,7 +468,23 @@ The two tasks that unblock everything and do **not** depend on botmud#20 are T1 
   model over-generalized. Reworded both `DEFAULT_SYSTEM` and `create_trigger`'s own
   `description` to require recurrence ("something that will keep recurring many times
   before it's done") and explicitly say NOT to use it for a one-off action.
-- **Done when:** the agent can install, fire, list, and clear its own triggers by group. ✓
+- **2026-07-25 removal - dropped `create_trigger`/`remove_group`/`list_automation`
+  entirely:** despite the two fixes above, live use kept showing the same root problem -
+  a two-layer agent (some actions direct, some running unattended as self-installed
+  triggers) was hard for both the human watching and the model itself to reason about;
+  confusing enough in practice to outweigh the machine-speed win. `88_agent_tools.lua`
+  now ships only `send_command`/`speak` (plus T12's `search_log`/`read_log`).
+  `DEFAULT_SYSTEM` (`87_agent.lua`) dropped its trigger-usage guidance. T9's
+  quarantine -> re-plan hook (`91_agent_policy.lua`) is removed too, not left inert -
+  `create_trigger` was the only thing that ever tagged a registry entry with an
+  `"agent-"` group, so the hook's condition could no longer be satisfied by anything;
+  rate limit, denylist, oscillation, and budget are unaffected; they gate
+  `rune.agent_policy.send`, which `send_command`/`speak` still call. Removed 7 tests in
+  `agent_tools_test.go` and 2 in `agent_policy_test.go` that existed solely to cover the
+  removed surface (the generic 3-strikes quarantine mechanism they partly overlapped
+  with stays covered elsewhere - see `engine_test.go`/`gmcp_test.go`).
+- **Done when:** the agent can send commands and speak, tools that fail are quarantined
+  individually. ✓
 
 #### T7 `[Lua]` — observability (live mode) ✓
 - **Created:** `lua/core/96_agent_ui.lua` - **not** `NN` picked naively. `rune.pane` is

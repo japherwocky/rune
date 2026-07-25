@@ -20,11 +20,10 @@
 --     interleaved-but-unstamped lines only half-answer it.
 --   - Agent chrome: 60_log.lua deliberately drops rune.echo output as
 --     "client chrome" - right for /help spam, wrong for a bot, whose
---     echoed commands *are* the transcript. The gap was never the LLM's
---     own turns (96_agent_ui.lua already logs those): it was reflex
---     sends, which fire from a trigger with no LLM hop and so produce
---     no agent_tool_call, and policy notices (denied/rate-limited/
---     oscillation/budget), which only ever reached the screen.
+--     echoed commands *are* the transcript. 96_agent_ui.lua already
+--     logs the LLM's own turns; this covers what only ever reached the
+--     screen otherwise: the actual sent command text (agent_send) and
+--     policy notices (denied/rate-limited/oscillation/budget).
 --   - Headless auto-start: with no terminal there is no scrollback to
 --     lose, so an unattended run opens a log unprompted.
 --
@@ -106,12 +105,11 @@ end
 -- while no log is open, so these cost nothing in a session that never
 -- started one.
 
--- Reflex sends and tool-driven sends both pass through
--- rune.agent_policy.send, which fires this for each one actually put on
--- the wire. The LLM's own tool calls are logged separately (and more
--- richly, with their arguments) by 96_agent_ui.lua; this is what makes
--- a reflex - which runs with no LLM turn anywhere near it - visible at
--- all.
+-- Every governed send passes through rune.agent_policy.send, which
+-- fires this for each one actually put on the wire - the log-side
+-- twin of that function's own on-screen echo. 96_agent_ui.lua already
+-- logs the LLM's tool calls separately (and more richly, with their
+-- arguments); this is the plain sent-command text on its own line.
 rune.hooks.on("agent_send", function(cmd)
     rune.log.write("[agent] " .. cmd)
 end, { name = "agent-log-send" })

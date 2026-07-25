@@ -46,10 +46,10 @@
 --   "agent_policy"       -- A governance intervention (91_agent_policy.lua):
 --                          (kind, message) - kind is one of
 --                          "denied_command", "rate_limited", "oscillation",
---                          "budget_paused", "quarantine_replan"
+--                          "budget_paused"
 --   "agent_send"         -- One agent-attributed command actually put on
---                          the wire (91_agent_policy.lua), from a tool or
---                          a reflex: (cmd). Fires after governance allowed
+--                          the wire (91_agent_policy.lua), from send_command
+--                          or speak: (cmd). Fires after governance allowed
 --                          it, so a denied/rate-limited command never does.
 
 -- Per-event dispatch index, maintained alongside the registry so

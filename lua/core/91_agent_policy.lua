@@ -1,14 +1,12 @@
 -- Agent Governance
 -- Safety nets around the agent core (87_agent.lua) and its tools
--- (88_agent_tools.lua) - PLAN.md T9. A capable reflex layer cuts both
--- ways: the same triggers that let the agent play at machine speed can
--- also spam the MUD, drain a budget, or get stuck in a loop with no LLM
--- watching. Four independent mechanisms:
+-- (88_agent_tools.lua) - PLAN.md T9. A tool-calling agent can spam the
+-- MUD, drain a budget, or get stuck in a loop just as easily as it can
+-- play well. Four independent mechanisms:
 --
---   - Rate limit: caps agent-attributed outgoing sends (send_command,
---     speak, and create_trigger's installed reflex action - NOT human
---     input, see "Why not wrap rune.send" below) to
---     config.max_commands_per_second (default 3), fixed 1-second
+--   - Rate limit: caps agent-attributed outgoing sends (send_command
+--     and speak - NOT human input, see "Why not wrap rune.send" below)
+--     to config.max_commands_per_second (default 3), fixed 1-second
 --     window via os.time(). On by default - a safety net, not an
 --     opt-in. "Covers channel output too" (PLAN.md) falls out for
 --     free: speak() funnels through the same send() as send_command.
@@ -23,8 +21,8 @@
 --     means nothing is changing in response to repeating it - wakes the
 --     LLM and clears the window. Detects same-command (period-1)
 --     repetition specifically, not arbitrary-period cycles ("A, B, A,
---     B, ...") - the dominant real failure mode (one stuck reflex, or
---     the model repeating one tool call) and far simpler to test.
+--     B, ...") - the dominant real failure mode (the model repeating
+--     one tool call) and far simpler to test.
 --   - Budget: accumulates reply.usage into a running $ total and stops
 --     the agent once config.budget_usd is hit. Off by default (nil,
 --     like 96_agent_ui.lua's own pricing slot) - there is no safe
@@ -43,42 +41,20 @@
 -- be blocked by the agent's own denylist, and a human's typing speed
 -- must never be capped by the agent's rate limit) - governance can only
 -- live at the agent-attribution boundary, i.e. the specific call sites
--- that originate from the agent's own tools/reflexes, not the shared
--- primitive every keystroke eventually reaches. rune.agent_policy.send
--- is that boundary; 88_agent_tools.lua calls it instead of rune.send
--- directly from send_command, speak, and the function create_trigger
--- now installs (a function, not the plain string action it used to
--- register - see the comment there) in place of rune.send.
+-- that originate from the agent's own tools, not the shared primitive
+-- every keystroke eventually reaches. rune.agent_policy.send is that
+-- boundary; 88_agent_tools.lua calls it instead of rune.send directly
+-- from send_command and speak.
 --
 -- Caveat: rune.send itself still expands ";"-chains and "#N" repeats
 -- *after* this choke point, so one governed call can still put more
--- than one line on the wire. This was already true of create_trigger's
--- command field before T9 (its docs always allowed ";"-separated
--- commands) - not a regression, just not fully closed by the limiter.
--- It counts governed calls, not wire lines.
+-- than one line on the wire. Not a regression, just not fully closed by
+-- the limiter - it counts governed calls, not wire lines.
 --
 -- Despite the plan's "[Lua + small Go]" label, no new Go primitive
 -- turned out to be necessary: os.time() (already available to every
--- script, see 60_log.lua's os.date use) covers the rate limiter, and
--- the quarantine signal is a new hook fired from rune.guarded_call
--- itself (00_init.lua), which was already pure Lua.
---
--- Quarantine -> re-plan, the payoff loop: rune.guarded_call fires a new
--- "quarantined" event the instant it disables an entry after 3
--- consecutive failures (00_init.lua). This module listens and, if (and
--- only if) the quarantined entry's group starts with "agent-" (the
--- exact convention 88_agent_tools.lua's create_trigger already enforces
--- structurally), wakes the LLM. Scoped that way because
--- a human's own quarantined trigger must never wake someone else's bot,
--- and because tool failures (unlike reflex failures) already reach the
--- model for free, synchronously, as an is_error tool_result within the
--- very turn that caused them - only a reflex, which runs entirely
--- outside any turn with no LLM watching, actually needs an out-of-band
--- wake to be noticed at all. For the same reason, a rate-limited (not
--- denylisted) reflex send does NOT count as a guarded_call failure -
--- see send() below - so a legitimately fast reflex hitting the limiter
--- during a burst degrades to "throttled" rather than escalating into
--- "quarantined".
+-- script, see 60_log.lua's os.date use) covers the rate limiter's
+-- clock.
 
 rune.agent_policy = {}
 
@@ -183,22 +159,19 @@ local function record_and_check_oscillation(cmd)
     return true
 end
 
--- rune.agent_policy.send(cmd) - the one path send_command, speak, and
--- create_trigger's installed reflex action (88_agent_tools.lua) use
--- instead of rune.send directly (see the header for why rune.send
--- itself is never wrapped). Applies the denylist, then the rate limit,
--- then - once actually sent - echoes the command into the main game
--- window (rune.send itself never echoes anything, human-typed or not,
--- so without this the only record of what the agent sent lived in the
--- separate agent pane, impossible to line up in time against the
--- server's reaction in the main transcript) and tracks oscillation.
+-- rune.agent_policy.send(cmd) - the one path send_command and speak
+-- (88_agent_tools.lua) use instead of rune.send directly (see the
+-- header for why rune.send itself is never wrapped). Applies the
+-- denylist, then the rate limit, then - once actually sent - echoes
+-- the command into the main game window (rune.send itself never
+-- echoes anything, human-typed or not, so without this the only
+-- record of what the agent sent would be the is_error-free tool_result
+-- the model itself sees, never the human's own screen) and tracks
+-- oscillation.
 --
 -- Returns true on success, or nil + a reason string + a short category
--- ("denied" or "rate_limited") on refusal. The category matters to
--- callers: create_trigger's reflex action raises (counts toward that
--- trigger's own quarantine) only for "denied", never for
--- "rate_limited" - see the header's closing paragraph. send_command and
--- speak raise on either, which is fine: reaching 3 consecutive
+-- ("denied" or "rate_limited") on refusal - send_command and speak
+-- both raise on either, which is fine: reaching 3 consecutive
 -- rate-limited *tool* calls in a row would require the model itself to
 -- retry blindly 3 times despite each one saying so, which is closer to
 -- oscillation than bad luck.
@@ -218,16 +191,12 @@ function rune.agent_policy.send(cmd)
         return nil, msg, "rate_limited"
     end
 
-    -- Echoed into the main game window, not just the separate agent
-    -- pane, so the command lands inline in the same transcript as the
-    -- server's reaction to it - otherwise the only record of what the
-    -- agent actually sent lives in a pane scrolling independently from
-    -- the game output, making the two impossible to line up in time.
-    -- The hook carries the same fact to observers that need it in a
-    -- durable form rather than on screen: 60_log.lua drops rune.echo
-    -- output as client chrome, so 92_agent_log.lua listens here to get
-    -- reflex sends (which fire with no LLM turn, and so no
-    -- agent_tool_call) into the session log.
+    -- Echoed into the main game window so the command lands inline in
+    -- the same transcript as the server's reaction to it. The hook
+    -- carries the same fact to observers that need it in a durable
+    -- form rather than on screen: 60_log.lua drops rune.echo output as
+    -- client chrome, so 92_agent_log.lua listens here to get every
+    -- governed send into the session log too.
     rune.echo(rune.style.gray("[agent] ") .. cmd)
     rune.hooks.call("agent_send", cmd)
     rune.send(cmd)
@@ -282,15 +251,6 @@ rune.hooks.on("agent_reply", function(reply)
         rune.agent.stop()
     end
 end, { name = "agent-policy-budget" })
-
--- Quarantine -> re-plan (see the header for the full rationale).
-rune.hooks.on("quarantined", function(label, data)
-    if not (data.group and data.group:match("^agent%-")) then
-        return
-    end
-    notify("quarantine_replan", label .. " was disabled after repeated failures")
-    rune.agent.wake("quarantine: " .. tostring(data.name or label))
-end, { name = "agent-policy-quarantine-replan" })
 
 -- A read-only snapshot for tests and /policy.
 function rune.agent_policy.status()

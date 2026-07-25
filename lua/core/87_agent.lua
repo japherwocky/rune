@@ -21,11 +21,10 @@
 -- Tools are dispatched through a flat name -> fn map this module
 -- owns (register_tool/unregister_tool). T5 has no opinion on what
 -- tools exist - it ships empty, so tests can register fakes and T6
--- can later register the real ones (send_command, create_trigger,
--- ...) without this file changing. T6's own registry-backed
--- governance (groups, quarantine) wraps its tool functions before
--- registering them here; this module only needs a name and a plain
--- Lua function.
+-- can later register the real ones (send_command, speak, ...)
+-- without this file changing. T6's own registry-backed quarantine
+-- wraps its tool functions before registering them here; this module
+-- only needs a name and a plain Lua function.
 
 rune.agent = {}
 
@@ -39,12 +38,7 @@ local DEFAULT_SYSTEM = "You are an autonomous agent playing a MUD through the " 
     "the game's GMCP protocol (your own vitals/status, the current room, " ..
     "channel chatter, and recent scrollback) - exactly what a skilled human " ..
     "player would see, never more. Act by calling tools; never invent " ..
-    "information you have not been given. Only install a trigger for " ..
-    "something that will keep recurring many times before it's done, like a " ..
-    "multi-round fight - it saves you from reacting to every line yourself. " ..
-    "A one-off action (walking somewhere, a single conversation, anything " ..
-    "you'll only do once) is just a direct command; installing a trigger " ..
-    "for it is pure overhead with nothing to pay it back."
+    "information you have not been given."
 
 -- name -> {name, description, input_schema, fn}
 local tools = {}

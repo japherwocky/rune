@@ -1,12 +1,11 @@
 package lua
 
 // T9 governance tests (91_agent_policy.lua): the irreversible-command
-// denylist, the rate limiter, oscillation detection, the budget cap,
-// and the quarantine -> re-plan hook (00_init.lua's new "quarantined"
-// event). Most exercise rune.agent_policy.send directly, the same
-// choke point 88_agent_tools.lua's send_command/speak/create_trigger
-// now call instead of rune.send - see agent_tools_test.go for the
-// tool-level integration proof (TestAgentToolsSendCommandRespectsDenylist).
+// denylist, the rate limiter, oscillation detection, and the budget
+// cap. Most exercise rune.agent_policy.send directly, the same choke
+// point 88_agent_tools.lua's send_command/speak call instead of
+// rune.send - see agent_tools_test.go for the tool-level integration
+// proof (TestAgentToolsSendCommandRespectsDenylist).
 //
 // Rate-limit tests monkeypatch the Lua global os.time (an ordinary
 // reassignable stdlib global in gopher-lua, not part of the rune._*
@@ -17,8 +16,6 @@ package lua
 import (
 	"strings"
 	"testing"
-
-	"github.com/mmcdole/rune/text"
 )
 
 func TestAgentPolicySendDeniesQuit(t *testing.T) {
@@ -248,75 +245,6 @@ func TestAgentPolicyBudgetInactiveWithoutPricing(t *testing.T) {
 // quarantined by the existing 3-failures machinery (00_init.lua), and
 // this module's "quarantined" listener wakes the LLM because the
 // trigger's group starts with "agent-".
-func TestAgentPolicyQuarantinedAgentTriggerWakesAgent(t *testing.T) {
-	engine, host, cleanup := setupTest(t)
-	defer cleanup()
-	withAPIKey(host)
-
-	id := startAgentAndWake(t, engine, host)
-	id = deliverToolUse(t, engine, host, id, "toolu_1", "create_trigger", map[string]interface{}{
-		"pattern": "^A large kobold",
-		"command": "quit", // denylisted -> every firing raises, tripping quarantine
-		"group":   "combat",
-	})
-	deliverEndTurn(engine, host, id, "reflex installed")
-
-	host.DrainNetworkCalls()
-	before := len(host.LLMCalls)
-
-	for i := 0; i < 3; i++ {
-		engine.OnOutput(text.NewLine("A large kobold is here, looking mean."))
-	}
-
-	if sent := host.DrainNetworkCalls(); len(sent) != 0 {
-		t.Fatalf("a denylisted reflex must never reach the wire, got %v", sent)
-	}
-
-	if err := engine.DoString("check-quarantined", `
-		local triggers = rune.trigger.list()
-		assert(#triggers == 1, "expected the trigger to still exist (quarantined, not removed)")
-		assert(triggers[1].enabled == false, "expected the trigger to be quarantined")
-	`); err != nil {
-		t.Fatal(err)
-	}
-
-	if len(host.LLMCalls) != before+1 {
-		t.Fatalf("expected quarantine to wake the agent into a new think, had %d now have %d", before, len(host.LLMCalls))
-	}
-}
-
-// The scoping half of the same story: a human's own quarantined
-// trigger (no "agent-" group) must never wake somebody else's bot.
-func TestAgentPolicyIgnoresNonAgentQuarantine(t *testing.T) {
-	engine, host, cleanup := setupTest(t)
-	defer cleanup()
-	withAPIKey(host)
-
-	if err := engine.DoString("setup", `
-		rune.agent.start({ model = "claude-haiku-4-5" })
-		rune.trigger.regex("^boom$", function() error("nope") end, {})
-	`); err != nil {
-		t.Fatal(err)
-	}
-	if len(host.LLMCalls) != 0 {
-		t.Fatalf("starting must not itself think, got %d calls", len(host.LLMCalls))
-	}
-
-	for i := 0; i < 3; i++ {
-		engine.OnOutput(text.NewLine("boom"))
-	}
-
-	if err := engine.DoString("check", `
-		local triggers = rune.trigger.list()
-		assert(#triggers == 1 and triggers[1].enabled == false, "expected the human trigger to be quarantined")
-	`); err != nil {
-		t.Fatal(err)
-	}
-	if len(host.LLMCalls) != 0 {
-		t.Fatalf("a human trigger's quarantine must never wake the agent, got %d LLM calls", len(host.LLMCalls))
-	}
-}
-
 func TestAgentPolicyStatusReflectsConfig(t *testing.T) {
 	engine, _, cleanup := setupTest(t)
 	defer cleanup()
