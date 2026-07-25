@@ -98,38 +98,28 @@ func TestAgentUIPricingOptional(t *testing.T) {
 	}
 }
 
-func TestAgentUIPaneWritesDuringTurn(t *testing.T) {
+func TestAgentUIEchoesDuringTurn(t *testing.T) {
 	engine, host, cleanup := setupTest(t)
 	defer cleanup()
 	withAPIKey(host)
 
-	writesBefore := countPaneWrites(host, "agent")
+	writesBefore := len(host.PrintCalls)
 	id := startAgentAndWake(t, engine, host)
-	if countPaneWrites(host, "agent") <= writesBefore {
-		t.Error("expected at least one pane write on turn start")
+	if len(host.PrintCalls) <= writesBefore {
+		t.Error("expected at least one echo on turn start")
 	}
 
-	writesBeforeTool := countPaneWrites(host, "agent")
+	writesBeforeTool := len(host.PrintCalls)
 	id = deliverToolUse(t, engine, host, id, "toolu_1", "send_command", map[string]string{"cmd": "look"})
-	if countPaneWrites(host, "agent") <= writesBeforeTool {
-		t.Error("expected at least one pane write on tool_call")
+	if len(host.PrintCalls) <= writesBeforeTool {
+		t.Error("expected at least one echo on tool_call")
 	}
 
-	writesBeforeEnd := countPaneWrites(host, "agent")
+	writesBeforeEnd := len(host.PrintCalls)
 	deliverEndTurn(engine, host, id, "done")
-	if countPaneWrites(host, "agent") <= writesBeforeEnd {
-		t.Error("expected at least one pane write on turn end")
+	if len(host.PrintCalls) <= writesBeforeEnd {
+		t.Error("expected at least one echo on turn end")
 	}
-}
-
-func countPaneWrites(host *MockHost, pane string) int {
-	n := 0
-	for _, call := range host.PaneCalls {
-		if call.Op == "write" && call.Name == pane {
-			n++
-		}
-	}
-	return n
 }
 
 func TestAgentUILogSilentWhenNoLogActive(t *testing.T) {

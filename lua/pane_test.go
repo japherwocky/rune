@@ -18,9 +18,9 @@ func TestPaneShowHideReachHostWithVisibility(t *testing.T) {
 		t.Fatalf("script failed: %v", err)
 	}
 
-	// Core boot also creates its own panes (e.g. 96_agent_ui.lua's
-	// "agent" pane) - filter to "chat" so this test only pins the
-	// show/hide/toggle wrapper mapping it actually cares about.
+	// Filter to "chat" so this test only pins the show/hide/toggle
+	// wrapper mapping it actually cares about, independent of whatever
+	// other panes core boot may create in the future.
 	var got []struct{ Op, Name, Data string }
 	for _, call := range host.PaneCalls {
 		if call.Name == "chat" {

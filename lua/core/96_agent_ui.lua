@@ -1,29 +1,29 @@
 -- Agent Observability (live mode) + start/stop control
 -- Watches the agent core (87_agent.lua) through its agent_* hooks and
--- renders what it sees: a reasoning pane, a status-bar segment, and
--- per-turn rune.log entries (PLAN.md T7). The hook handlers below are
--- pure observers - never call back into rune.agent, never affect the
--- turn loop, so a broken render here can't derail a think (and
--- per-hook quarantine means a failing renderer just stops updating
--- instead of spamming errors). The "/agent start|stop" command is the
--- one deliberate exception - a direct, user-initiated call into
--- rune.agent, not a hook reacting to agent activity.
+-- renders what it sees: reasoning, tool calls, and turn markers
+-- echoed straight into the main scrollback (a separate reasoning pane
+-- was tried first - see PLAN.md T7 - but that put reasoning and the
+-- MUD output it was reacting to on two disconnected tracks, hard to
+-- read in full and hard to correlate; moved inline instead), a
+-- status-bar segment, and per-turn rune.log entries (PLAN.md T7). The
+-- hook handlers below are pure observers - never call back into
+-- rune.agent, never affect the turn loop, so a broken render here
+-- can't derail a think (and per-hook quarantine means a failing
+-- renderer just stops updating instead of spamming errors). The
+-- "/agent start|stop" command is the one deliberate exception - a
+-- direct, user-initiated call into rune.agent, not a hook reacting to
+-- agent activity.
 --
 -- Registered unconditionally, like the core status bar in 95_ui.lua:
--- the "agent" pane/bar exist but are invisible to a plain human
--- session unless placed into rune.ui.layout (pane) or already are
--- (the status bar registry pattern - see 35_bars.lua), and every
--- handler here is driven entirely by hooks that T5 only ever fires
--- from inside a turn, which never runs unless something calls
--- rune.agent.start(). Nothing to opt into.
+-- the "agent_status" bar exists but is invisible to a plain human
+-- session unless placed into rune.ui.layout (the status bar registry
+-- pattern - see 35_bars.lua), and every handler here is driven
+-- entirely by hooks that T5 only ever fires from inside a turn, which
+-- never runs unless something calls rune.agent.start(). Nothing to
+-- opt into.
 --
--- Add {name = "agent", height = N} to your rune.ui.layout to see the
--- reasoning pane; the bar shows up once "agent" is added to a layout
--- row the same way "status" is.
-
-local PANE = "agent"
-
-rune.pane.create(PANE)
+-- Add "agent_status" to your rune.ui.layout alongside "status" to see
+-- the state/tokens/goal summary bar.
 
 -- Optional cost estimate: set both fields to show a "$" figure next
 -- to the token counts. Left nil by default rather than guessing at
@@ -37,18 +37,13 @@ local total_input_tokens = 0
 local total_output_tokens = 0
 local last_action = "idle"
 
-local function pane_line(text)
-    rune.pane.write(PANE, text)
-end
-
 local function log_line(text)
     rune.log.write("[Agent] " .. text)
 end
 
 rune.hooks.on("agent_turn_start", function()
     last_action = "thinking..."
-    rune.pane.show(PANE)
-    pane_line(rune.style.dim("--- turn start ---"))
+    rune.echo(rune.style.dim("--- turn start ---"))
     log_line("turn start")
 end, { name = "agent-ui-turn-start" })
 
@@ -58,7 +53,7 @@ rune.hooks.on("agent_reply", function(reply)
         total_output_tokens = total_output_tokens + (reply.usage.output_tokens or 0)
     end
     if reply.text and reply.text ~= "" then
-        pane_line(reply.text)
+        rune.echo(rune.style.dim("[agent] ") .. reply.text)
         log_line("reply: " .. reply.text)
     end
 end, { name = "agent-ui-reply" })
@@ -68,23 +63,23 @@ rune.hooks.on("agent_tool_call", function(name, input, result, is_error)
     local line = "[tool] " .. name .. "(" .. encoded_input .. ") -> " .. tostring(result)
     if is_error then
         last_action = "tool " .. name .. " failed"
-        pane_line(rune.style.red(line))
+        rune.echo(rune.style.red(line))
     else
         last_action = "tool: " .. name
-        pane_line(rune.style.cyan(line))
+        rune.echo(rune.style.cyan(line))
     end
     log_line(line .. (is_error and " (error)" or ""))
 end, { name = "agent-ui-tool-call" })
 
 rune.hooks.on("agent_turn_end", function(reply)
     last_action = "idle"
-    pane_line(rune.style.dim("--- turn end (" .. tostring(reply.stop_reason) .. ") ---"))
+    rune.echo(rune.style.dim("--- turn end (" .. tostring(reply.stop_reason) .. ") ---"))
     log_line("turn end: " .. tostring(reply.stop_reason))
 end, { name = "agent-ui-turn-end" })
 
 rune.hooks.on("agent_error", function(err)
     last_action = "error"
-    pane_line(rune.style.red("[error] " .. err))
+    rune.echo(rune.style.red("[error] " .. err))
     log_line("error: " .. err)
 end, { name = "agent-ui-error" })
 
@@ -188,4 +183,4 @@ rune.command.add("agent", function(args)
     rune.echo("  tokens: " .. summary.input_tokens .. " in / " .. summary.output_tokens .. " out" ..
         (summary.cost and string.format("  (~$%.4f)", summary.cost) or ""))
     rune.echo("  last action: " .. summary.last_action)
-end, "Show/control the agent: /agent [start [model] | stop] (reasoning pane: add {name='agent'} to your layout)")
+end, "Show/control the agent: /agent [start [model] | stop] (reasoning streams inline as it plays)")
