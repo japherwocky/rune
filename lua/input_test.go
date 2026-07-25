@@ -6,6 +6,8 @@ package lua
 // UI would emit them.
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/mmcdole/rune/input"
@@ -237,6 +239,35 @@ func TestWordNavigationAndDelete(t *testing.T) {
 	assertCursor(t, host, 12)
 }
 
+func TestWordNavigationAndDeleteWithMultibyteInput(t *testing.T) {
+	engine, host, cleanup := setupTest(t)
+	defer cleanup()
+
+	host.SetInput("café brave world")
+
+	if err := engine.DoString("test", "rune.input.word_left()"); err != nil {
+		t.Fatal(err)
+	}
+	assertCursor(t, host, 12)
+
+	if err := engine.DoString("test", "rune.input.word_left()"); err != nil {
+		t.Fatal(err)
+	}
+	assertCursor(t, host, 6)
+
+	if err := engine.DoString("test", "rune.input.word_right()"); err != nil {
+		t.Fatal(err)
+	}
+	assertCursor(t, host, 12)
+
+	host.InputSetCursor(len("café brave world"))
+	if err := engine.DoString("test", "rune.input.delete_word()"); err != nil {
+		t.Fatal(err)
+	}
+	assertInput(t, host, "café brave ")
+	assertCursor(t, host, 12)
+}
+
 func TestClearInputBinds(t *testing.T) {
 	engine, host, cleanup := setupTest(t)
 	defer cleanup()
@@ -361,6 +392,46 @@ func TestTabCompletionIgnoresShortPrefixAndInput(t *testing.T) {
 	assertInput(t, host, "brandish ")
 }
 
+// The word cache caps at 5,000 entries (MAX_WORDS in 90_input.lua) and
+// evicts in insertion order: past the cap the oldest words stop
+// completing while newer ones still do. Pins the contract, not the
+// data structure.
+func TestTabCompletionCacheEvictsOldestBeyondCap(t *testing.T) {
+	engine, host, cleanup := setupTest(t)
+	defer cleanup()
+
+	// Ten distinct "old" words, then verify they complete.
+	var old strings.Builder
+	for i := 1; i <= 10; i++ {
+		fmt.Fprintf(&old, "oldword%02d ", i)
+	}
+	engine.OnOutput(text.NewLine(old.String()))
+
+	typeInput(engine, host, "oldwor")
+	engine.HandleKeyBind("tab")
+	assertInput(t, host, "oldword10 ") // most recent match first
+
+	// 5,000 distinct filler words: exactly enough to evict the ten
+	// oldest entries and nothing else.
+	for line := 0; line < 50; line++ {
+		var b strings.Builder
+		for j := 1; j <= 100; j++ {
+			fmt.Fprintf(&b, "fill%04d ", line*100+j)
+		}
+		engine.OnOutput(text.NewLine(b.String()))
+	}
+
+	// The old words are gone: Tab is a no-op.
+	typeInput(engine, host, "oldwor")
+	engine.HandleKeyBind("tab")
+	assertInput(t, host, "oldwor")
+
+	// Surviving filler words still complete, newest match first.
+	typeInput(engine, host, "fill49")
+	engine.HandleKeyBind("tab")
+	assertInput(t, host, "fill4999 ")
+}
+
 func TestCompletionMidLineInsertsWithoutTrailingSpace(t *testing.T) {
 	engine, host, cleanup := setupTest(t)
 	defer cleanup()
@@ -376,4 +447,19 @@ func TestCompletionMidLineInsertsWithoutTrailingSpace(t *testing.T) {
 	// Mid-line completions get no trailing space.
 	assertInput(t, host, "kill goblin now")
 	assertCursor(t, host, 11)
+}
+
+func TestCompletionMidLineWithMultibyteInput(t *testing.T) {
+	engine, host, cleanup := setupTest(t)
+	defer cleanup()
+
+	engine.OnOutput(text.NewLine("goblin"))
+
+	host.SetInput("café gob now")
+	host.InputSetCursor(len("café gob"))
+	engine.CallHook("input_changed", host.GetInput())
+
+	engine.HandleKeyBind("tab")
+	assertInput(t, host, "café goblin now")
+	assertCursor(t, host, len("café goblin"))
 }

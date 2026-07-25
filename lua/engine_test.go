@@ -2,6 +2,8 @@ package lua
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -100,6 +102,84 @@ func TestBrokenHooksDegradesGracefully(t *testing.T) {
 	}
 	if warnings != 1 {
 		t.Errorf("expected exactly one degraded-mode warning, got %d", warnings)
+	}
+}
+
+// TestDoFileSurvivesClobberedPackageAndRestoresPath verifies DoFile's
+// two package.path invariants: a script that clobbers the package
+// global cannot panic the process on the next file load, and a
+// successful load leaves package.path exactly as it found it.
+func TestDoFileSurvivesClobberedPackageAndRestoresPath(t *testing.T) {
+	engine, host, cleanup := setupTest(t)
+	defer cleanup()
+
+	script := filepath.Join(t.TempDir(), "loaded.lua")
+	if err := os.WriteFile(script, []byte(`rune.send_raw("file ran")`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Normal path: package.path is restored byte-identically.
+	if err := engine.DoString("snap", `path_before = package.path`); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.DoFile(script); err != nil {
+		t.Fatalf("DoFile: %v", err)
+	}
+	if err := engine.DoString("check", `assert(package.path == path_before, "package.path not restored")`); err != nil {
+		t.Error(err)
+	}
+
+	// Clobbered package global: the load still runs instead of panicking.
+	if err := engine.DoString("sabotage", `package = 5`); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.DoFile(script); err != nil {
+		t.Fatalf("DoFile with clobbered package: %v", err)
+	}
+	if sent := host.DrainNetworkCalls(); len(sent) != 2 {
+		t.Errorf("expected the file to run both times, sent %v", sent)
+	}
+}
+
+// TestClobberedStateTableDoesNotPanic verifies a user script that
+// overwrites rune._state cannot crash the client: UpdateState skips the
+// push instead of panicking the process on an unchecked type assertion.
+// State pushes ride connection, resize, and scroll events, so before
+// the checked lookup this was a delayed hard crash from one bad script
+// line.
+func TestClobberedStateTableDoesNotPanic(t *testing.T) {
+	engine, host, cleanup := setupTest(t)
+	defer cleanup()
+
+	for _, sabotage := range []string{
+		"rune._state = 5",
+		`rune._state = "text"`,
+		"rune._state = nil",
+	} {
+		if err := engine.DoString("sabotage", sabotage); err != nil {
+			t.Fatalf("%s: %v", sabotage, err)
+		}
+		engine.UpdateState(ClientState{Connected: true, Address: "mud.example.com:4000", Width: 80, Height: 24})
+	}
+
+	// The VM survives and everything else keeps working.
+	if err := engine.DoString("after", `rune.send_raw("still alive")`); err != nil {
+		t.Fatalf("VM unusable after clobbered-state update: %v", err)
+	}
+	if sent := host.DrainNetworkCalls(); len(sent) != 1 || sent[0] != "still alive" {
+		t.Errorf("expected send after clobbered-state update, got %v", sent)
+	}
+
+	// Re-init (what /reload does) rebuilds the mirror and pushes land again.
+	if err := engine.Init(); err != nil {
+		t.Fatal(err)
+	}
+	engine.UpdateState(ClientState{Connected: true, Address: "mud.example.com:4000"})
+	if err := engine.DoString("check", `
+		assert(rune._state.connected == true, "state push lost after reload")
+		assert(rune._state.address == "mud.example.com:4000")
+	`); err != nil {
+		t.Error(err)
 	}
 }
 
@@ -672,5 +752,25 @@ func TestPickerShowPassesOptions(t *testing.T) {
 	}
 	if host.PickerCalls[1].DismissOnSpace {
 		t.Errorf("expected dismiss_on_space to default to false, got %+v", host.PickerCalls[1])
+	}
+}
+
+// TestRegistryGrowsForLargeConcat verifies the VM can serialize large
+// tables. gopher-lua's table.concat pushes every element onto the data
+// stack before joining, so a fixed-size registry fails on tables past a
+// few thousand entries (e.g. CBOR-encoding a mob database) even though
+// building or decoding the same table works fine.
+func TestRegistryGrowsForLargeConcat(t *testing.T) {
+	engine, _, cleanup := setupTest(t)
+	defer cleanup()
+
+	err := engine.DoString("bigconcat", `
+		local t = {}
+		for i = 1, 20000 do t[i] = "chunk_" .. i end
+		local blob = table.concat(t)
+		assert(#blob > 0)
+	`)
+	if err != nil {
+		t.Fatalf("large table.concat failed: %v", err)
 	}
 }

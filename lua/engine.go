@@ -116,7 +116,18 @@ func (e *Engine) Init() error {
 		e.L.Close()
 	}
 
-	e.L = glua.NewState()
+	// The registry (data stack) must be able to grow: table.concat
+	// pushes every element before joining, so serializing a large
+	// table needs slots proportional to its entry count. The ceiling
+	// bounds runaway scripts (~16 MB, allocated only on demand) and
+	// exhausting it raises the same catchable "registry overflow" a
+	// fixed-size registry would. Growth is linear, so a small step
+	// would mean thousands of realloc+copy cycles on a big concat.
+	e.L = glua.NewState(glua.Options{
+		RegistrySize:     1024 * 20,
+		RegistryMaxSize:  1024 * 1024,
+		RegistryGrowStep: 4096,
+	})
 
 	e.host.TimerCancelAll()
 
@@ -231,18 +242,17 @@ func (e *Engine) DoFile(path string) error {
 	if err != nil {
 		return err
 	}
-	dir := filepath.Dir(absPath)
+	// A user script can clobber the package global; skip the path
+	// prefix rather than panic (require is already broken then). The
+	// deferred restore keeps the prefix scoped to this load even if a
+	// panic escapes the guarded call.
+	if pkg, ok := e.L.GetGlobal("package").(*glua.LTable); ok {
+		oldPath := e.L.GetField(pkg, "path").String()
+		e.L.SetField(pkg, "path", glua.LString(filepath.Dir(absPath)+"/?.lua;"+oldPath))
+		defer e.L.SetField(pkg, "path", glua.LString(oldPath))
+	}
 
-	pkg := e.L.GetGlobal("package").(*glua.LTable)
-	oldPath := e.L.GetField(pkg, "path").String()
-	newPath := dir + "/?.lua;" + oldPath
-	e.L.SetField(pkg, "path", glua.LString(newPath))
-
-	err = e.guard(func() error { return e.L.DoFile(absPath) })
-
-	e.L.SetField(pkg, "path", glua.LString(oldPath))
-
-	return err
+	return e.guard(func() error { return e.L.DoFile(absPath) })
 }
 
 // OnInput handles traditional command input. It remains as a convenience for

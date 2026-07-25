@@ -24,13 +24,14 @@ type UI interface {
 
 	// Components
 	ShowPicker(opts ShowPickerMsg)
+	SetClipboard(text string)
 	CreatePane(name string)
 	WritePane(name, text string)
 	TogglePane(name string)
 	SetPaneVisible(name string, visible bool)
 	ClearPane(name string)
 
-	// Input primitives for Lua
+	// Input primitives. Cursor positions are zero-based rune offsets.
 	InputSetCursor(pos int)
 	OpenEditor(initial string) (string, bool)
 

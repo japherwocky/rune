@@ -7,7 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mmcdole/rune/event"
 	"github.com/mmcdole/rune/lua"
 )
 
@@ -157,9 +156,9 @@ func resolveLLMProvider(s *Session, model string) (llmProvider, error) {
 
 // LLMRequest implements lua.Host. Mirrors HTTPRequest's async shape
 // exactly (see lua_http.go): the request runs in its own goroutine and
-// the outcome comes back through the event loop as a single final
-// AsyncResult, so the Lua callback executes on the Session goroutine
-// under the watchdog like every other callback (see PLAN.md T8 - a
+// the outcome comes back through the async-result channel as a single
+// final continuation, so the Lua callback executes on the Session
+// goroutine under the watchdog like every other callback (see PLAN.md T8 - a
 // non-streaming start behind the same id-based delivery, streaming
 // left for later behind this same primitive).
 //
@@ -176,11 +175,8 @@ func (s *Session) LLMRequest(id int, req lua.LLMRequest) {
 		if err != nil {
 			errMsg = err.Error()
 		}
-		s.events <- event.Event{
-			Type: event.AsyncResult,
-			Payload: event.Callback(func() {
-				s.engine.OnLLMResult(id, resp, errMsg)
-			}),
+		s.asyncResults <- func() {
+			s.engine.OnLLMResult(id, resp, errMsg)
 		}
 	}()
 }
