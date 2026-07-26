@@ -122,6 +122,48 @@ func TestAgentUIEchoesDuringTurn(t *testing.T) {
 	}
 }
 
+// search_log/read_log results can run to hundreds of lines
+// (92_agent_log.lua) - the model needs the full match, but echoing it
+// verbatim would bury the actual turn-by-turn thread on screen. Only
+// the screen echo should be summarized; the model's own tool_result
+// and the durable log must both keep the full content.
+func TestAgentUIToolCallSummarizesLogReadbackOnScreenOnly(t *testing.T) {
+	engine, host, cleanup := setupTest(t)
+	defer cleanup()
+	withAPIKey(host)
+
+	// "rusted key" (the search pattern) deliberately also appears in the
+	// tool call's own arguments, which the screen echo still shows -
+	// only the matched line's content ("floorboards...") must not leak.
+	if err := engine.DoString("log", `
+		assert(rune.log.start("/tmp/ui-summarize.log"))
+		rune.log.write("a rusted key hidden beneath the floorboards")
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	id := startAgentAndWake(t, engine, host)
+	deliverToolUse(t, engine, host, id, "toolu_1", "search_log", map[string]interface{}{
+		"pattern": "rusted key",
+	})
+
+	content, isError := lastToolResult(t, host)
+	if isError {
+		t.Fatalf("search_log should not error, got %q", content)
+	}
+	if !strings.Contains(content, "floorboards") {
+		t.Fatalf("the model's own tool_result must keep the full match, got %q", content)
+	}
+
+	joined := strings.Join(host.PrintCalls, "\n")
+	if strings.Contains(joined, "floorboards") {
+		t.Errorf("screen echo must not contain the log's own matched content, got:\n%s", joined)
+	}
+	if !strings.Contains(joined, "1 line(s)") {
+		t.Errorf("expected a line-count summary on screen, got:\n%s", joined)
+	}
+}
+
 func TestAgentUILogSilentWhenNoLogActive(t *testing.T) {
 	engine, host, cleanup := setupTest(t)
 	defer cleanup()

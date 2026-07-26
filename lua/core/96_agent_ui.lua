@@ -58,17 +58,38 @@ rune.hooks.on("agent_reply", function(reply)
     end
 end, { name = "agent-ui-reply" })
 
+-- search_log/read_log can return up to 500 lines (92_agent_log.lua) -
+-- worth keeping in full in the durable log, but dumping all of it into
+-- the live scrollback defeats the readability the inline-echo move
+-- above was for: a screenful of the agent's own past history buries
+-- the actual turn-by-turn thread a human is trying to follow. Shown
+-- on screen as a count instead; the full result still reaches the log.
+local LOG_READBACK_TOOLS = { search_log = true, read_log = true }
+
+local function screen_result(name, result, is_error)
+    if is_error or not LOG_READBACK_TOOLS[name] then
+        return tostring(result)
+    end
+    local decoded = rune.json.decode(result)
+    if type(decoded) == "table" then
+        return #decoded .. " line(s) (see log)"
+    end
+    return "(results omitted, see log)"
+end
+
 rune.hooks.on("agent_tool_call", function(name, input, result, is_error)
     local encoded_input = rune.json.encode(input) or tostring(input)
-    local line = "[tool] " .. name .. "(" .. encoded_input .. ") -> " .. tostring(result)
+    local full_line = "[tool] " .. name .. "(" .. encoded_input .. ") -> " .. tostring(result)
+    local shown_line = "[tool] " .. name .. "(" .. encoded_input .. ") -> " ..
+        screen_result(name, result, is_error)
     if is_error then
         last_action = "tool " .. name .. " failed"
-        rune.echo(rune.style.red(line))
+        rune.echo(rune.style.red(shown_line))
     else
         last_action = "tool: " .. name
-        rune.echo(rune.style.cyan(line))
+        rune.echo(rune.style.cyan(shown_line))
     end
-    log_line(line .. (is_error and " (error)" or ""))
+    log_line(full_line .. (is_error and " (error)" or ""))
 end, { name = "agent-ui-tool-call" })
 
 rune.hooks.on("agent_turn_end", function(reply)
