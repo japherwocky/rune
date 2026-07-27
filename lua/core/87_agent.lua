@@ -34,15 +34,14 @@ local LOW_HP_RATIO = 0.3
 local GOAL_KEY = "agent_goal"
 
 local DEFAULT_SYSTEM = "You are an autonomous agent playing a MUD through the " ..
-    "Rune client. You perceive the world only through structured data fed by " ..
-    "the game's GMCP protocol (your own vitals/status, the current room, " ..
-    "channel chatter, and recent scrollback) - exactly what a skilled human " ..
-    "player would see, never more. Act by calling tools; never invent " ..
-    "information you have not been given. Your text response is your own " ..
-    "private plan - it is never shown to the game and nothing in it " ..
-    "happens. Never write dialogue, actions, or outcomes for other " ..
-    "characters or the world; only a tool result or the next turn's " ..
-    "Recent output tells you what actually happened."
+    "Rune client. Each turn you're given your current goal, some status " ..
+    "data (may be empty depending on the game), and the recent game text - " ..
+    "exactly what a human player would see, never more. Only that text and " ..
+    "a tool's result are real; act by calling tools. Nothing you write " ..
+    "yourself happens or reaches anyone else - never write a room name on " ..
+    "its own line, a \"Command:\" label, dialogue for another character, or " ..
+    "anything else that looks like game output. If you're not calling a " ..
+    "tool, write one short sentence of plan and stop there."
 
 -- name -> {name, description, input_schema, fn}
 local tools = {}

@@ -406,6 +406,23 @@ The two tasks that unblock everything and do **not** depend on botmud#20 are T1 
   `perception.transcript()` (T3) was confirmed unaffected - it only ever listens to the
   real "output" hook, never `rune.echo`, so this was never a contamination-via-echo
   issue.
+- **2026-07-25 simplification - dropped the GMCP framing, targeted a smaller model:**
+  the fabrication above kept recurring even after the fix, now shaped as a whole fake
+  session replay (invented `Command:` labels, the room name repeated after every line,
+  invented ambient weather/time messages) written in a single turn with zero tool
+  calls - `store.json` had no `perception_map` key anywhere in the session, confirming
+  `Room.Info` GMCP had never actually fired, so `DEFAULT_SYSTEM`'s claim of
+  "structured data fed by the game's GMCP protocol" was describing perception the
+  model was never actually given. Reworded to drop protocol-name jargon entirely (a
+  smaller model doesn't need to know GMCP exists) in favor of one honest, generic
+  phrase ("some status data, may be empty") true whether or not GMCP is negotiated,
+  replaced the abstract "never invent information you have not been given" with a
+  concrete ban on the exact formats that showed up (a room name alone on its own
+  line, a `Command:` label, another character's dialogue), and added an explicit
+  push toward brevity ("one short sentence of plan and stop there") on the theory
+  that less room to write is less room to fabricate in. GMCP negotiation itself was
+  left alone - a real capability, just not this session's problem, and not something
+  a smaller local model needs described to it in detail regardless.
 - **Done when:** the loop completes a full observe→think→act→observe cycle against a
   mock LLM without blocking the Session. ✓
 
