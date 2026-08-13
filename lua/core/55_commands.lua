@@ -33,6 +33,22 @@ rune.command = {}
 -- Add a slash command. opts: group (see 15_registry.lua).
 -- Returns a handle with :enable/:disable/:remove.
 function rune.command.add(name, handler, description, opts)
+    if type(name) ~= "string" then
+        error("rune.command.add: name must be a string", 2)
+    end
+    if name == "" or name:find("%s") then
+        error("rune.command.add: name must be a non-empty single word", 2)
+    end
+    if type(handler) ~= "function" then
+        error("rune.command.add: handler must be a function", 2)
+    end
+    if description ~= nil and type(description) ~= "string" then
+        error("rune.command.add: description must be a string", 2)
+    end
+    if opts ~= nil and type(opts) ~= "table" then
+        error("rune.command.add: opts must be a table", 2)
+    end
+
     return registry:add({
         command = name,
         handler = handler,
@@ -404,9 +420,15 @@ rune.command.add("echo", function(args)
     rune.echo(args)
 end, "Print text locally")
 
+-- /find [pattern] - Search the scrollback. With no pattern the overlay
+-- reopens with the previous query (find-next lives in the overlay).
+rune.command.add("find", function(args)
+    rune.ui.search({ query = args })
+end, "Search scrollback")
+
 -- /version - Client version
 rune.command.add("version", function(args)
-    rune.echo("Rune " .. rune.version)
+    rune.echo("Rune " .. rune.version .. " (lua: " .. rune.engine .. ")")
 end, "Show client version")
 
 -- /quit - Exit the client

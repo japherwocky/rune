@@ -1,7 +1,7 @@
 package lua
 
 import (
-	glua "github.com/yuin/gopher-lua"
+	"github.com/mmcdole/rune/script"
 )
 
 // registerLLMFuncs registers rune._llm.* primitives.
@@ -13,25 +13,24 @@ import (
 // id -> callback mapping, the same split of responsibilities as
 // rune._http/80_http.lua (api_http.go).
 func (e *Engine) registerLLMFuncs() {
-	llmTable := e.L.NewTable()
-	e.L.SetField(e.runeTable, "_llm", llmTable)
+	e.vm.RegisterModule("rune._llm", map[string]script.GoFunc{
+		// rune._llm.request(id, {body, model})
+		"request": func(c *script.Call) error {
+			id := c.Int(1)
+			opts := c.Table(2)
 
-	// rune._llm.request(id, {body, model})
-	e.L.SetField(llmTable, "request", e.L.NewFunction(func(L *glua.LState) int {
-		id := int(L.CheckNumber(1))
-		opts := L.CheckTable(2)
+			req := LLMRequest{
+				Body:  opts.Field("body").Str(),
+				Model: opts.Field("model").Str(),
+			}
+			if req.Body == "" {
+				return c.Errorf("rune._llm.request: body is required")
+			}
 
-		req := LLMRequest{
-			Body:  glua.LVAsString(opts.RawGetString("body")),
-			Model: glua.LVAsString(opts.RawGetString("model")),
-		}
-		if req.Body == "" {
-			L.RaiseError("rune._llm.request: body is required")
-		}
-
-		e.host.LLMRequest(id, req)
-		return 0
-	}))
+			e.host.LLMRequest(id, req)
+			return nil
+		},
+	}, nil)
 }
 
 // OnLLMResult delivers a completed LLM request into Lua
@@ -39,36 +38,27 @@ func (e *Engine) registerLLMFuncs() {
 // OnHTTPResult exactly, reusing HTTPResponse as the delivery shape
 // (see the doc comment on that type).
 func (e *Engine) OnLLMResult(id int, resp *HTTPResponse, errMsg string) {
-	if e.L == nil {
-		return
-	}
-	deliver, ok := e.getRuneFunc("llm", "_deliver")
-	if !ok {
-		return // llm module unavailable (core failed to load)
-	}
-
-	respVal := glua.LValue(glua.LNil)
-	errVal := glua.LValue(glua.LNil)
+	var respArg any
+	var errArg any
 	if errMsg != "" {
-		errVal = glua.LString(errMsg)
+		errArg = errMsg
 	} else if resp != nil {
-		t := e.L.NewTable()
-		t.RawSetString("status", glua.LNumber(resp.Status))
-		t.RawSetString("body", glua.LString(resp.Body))
-		headers := e.L.NewTable()
+		headers := make(map[string]any, len(resp.Headers))
 		for k, v := range resp.Headers {
-			headers.RawSetString(k, glua.LString(v))
+			headers[k] = v
 		}
-		t.RawSetString("headers", headers)
-		respVal = t
+		respArg = script.Tree{V: map[string]any{
+			"status":  float64(resp.Status),
+			"body":    resp.Body,
+			"headers": headers,
+		}}
 	}
 
 	if err := e.guard(func() error {
-		return e.L.CallByParam(glua.P{
-			Fn:      deliver,
-			NRet:    0,
-			Protect: true,
-		}, glua.LNumber(id), respVal, errVal)
+		// found=false means the llm module is unavailable (core failed
+		// to load); deliver silently becomes a no-op.
+		_, _, err := e.vm.CallModule("rune.llm", "_deliver", 0, id, respArg, errArg)
+		return err
 	}); err != nil {
 		e.reportError("llm callback", err)
 	}

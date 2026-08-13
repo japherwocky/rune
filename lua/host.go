@@ -34,6 +34,7 @@ type Host interface {
 	PaneSetVisible(name string, visible bool)
 	PaneClear(name string)
 	ShowPicker(opts ui.ShowPickerMsg)
+	ShowSearch(opts ui.ShowSearchMsg)
 	ClipboardSet(text string)
 	GetInput() string
 	SetInput(text string)
@@ -59,6 +60,8 @@ type Host interface {
 
 	// System
 	Quit()
+	// Reload requests a VM reload. The host must defer teardown and Init until
+	// control returns from the enclosing Engine call to the host event loop.
 	Reload()
 	RefreshBars() // Force immediate bar refresh
 
