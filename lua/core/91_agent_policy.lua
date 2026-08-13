@@ -234,8 +234,8 @@ end
 -- next on_reply's existing "not active" guard drops it - a firm
 -- backstop, not a laser-precise cutoff, and an accepted tradeoff rather
 -- than a reason to touch 87_agent.lua's already-shipped turn loop.
-rune.hooks.on("agent_reply", function(reply)
-    if not reply.usage then
+local function count_usage(reply)
+    if not reply or not reply.usage then
         return
     end
     total_input_tokens = total_input_tokens + (reply.usage.input_tokens or 0)
@@ -250,7 +250,17 @@ rune.hooks.on("agent_reply", function(reply)
             "budget cap reached ($%.4f >= $%.4f) - stopping the agent", cost, config.budget_usd))
         rune.agent.stop()
     end
-end, { name = "agent-policy-budget" })
+end
+
+rune.hooks.on("agent_reply", count_usage, { name = "agent-policy-budget" })
+
+-- Reflection (89_memory.lua) is a second, independent rune.llm.chat
+-- call outside the turn loop, so it never reaches agent_reply. Its
+-- tokens are real tokens: a budget that silently ignored them would be
+-- a budget the bot could exceed just by remembering a lot.
+rune.hooks.on("agent_reflection", function(_, reply)
+    count_usage(reply)
+end, { name = "agent-policy-budget-reflection" })
 
 -- A read-only snapshot for tests and /policy.
 function rune.agent_policy.status()

@@ -104,10 +104,12 @@ local function set_goal(text)
 end
 
 -- Builds the single user message a turn starts from: current goal +
--- a fresh perception snapshot + recent transcript. Deliberately not a
--- growing chat history across turns (that would blow out context
--- over a long session) - state.goal is the only thing that persists
--- turn to turn, in the model's own words.
+-- retrieved memories + a fresh perception snapshot + recent
+-- transcript. Deliberately not a growing chat history across turns
+-- (that would blow out context over a long session) - what persists is
+-- the goal, in the model's own words, and the memory stream
+-- (89_memory.lua), which is retrieved fresh and capped every turn
+-- rather than accumulated in the message list.
 --
 -- The heading spells out "your own words, not confirmed fact" rather
 -- than a bare "## Goal": reply.text is saved and replayed here
@@ -116,17 +118,41 @@ end
 -- turn looking like established ground truth - inviting the model to
 -- treat its own invention as something that already happened and
 -- continue it, rather than as its own prior, possibly-wrong words.
+--
+-- The memory section (T13) is the one part that *is* established fact
+-- rather than the model's own words: 89_memory.lua's records are built
+-- from GMCP, from tool results, and from conclusions the model drew
+-- deliberately, not from whatever it happened to narrate last turn.
+-- Capped hard at MEMORY_RECALL records - the whole point of building a
+-- fresh observation each turn is that context does not grow without
+-- bound, and an unbounded recall would give that back.
+local MEMORY_RECALL = 6
+
+local function memory_section()
+    local recs = rune.memory.recall({ limit = MEMORY_RECALL })
+    if #recs == 0 then
+        return nil
+    end
+    return "## What you've learned (your memory - these did happen)\n" ..
+        table.concat(rune.memory.format(recs), "\n")
+end
+
 local function build_observation()
     local snap = rune.perception.snapshot()
     local transcript = rune.perception.transcript()
-    return table.concat({
+    local sections = {
         "## Your goal (your own words from the end of your last turn - " ..
             "not confirmed fact)\n" .. (goal() or "(none yet - decide what to do)"),
-        "## Vitals\n" .. (rune.json.encode(snap.vitals) or "{}"),
-        "## Status\n" .. (rune.json.encode(snap.status) or "{}"),
-        "## Room\n" .. (rune.json.encode(snap.room) or "{}"),
-        "## Recent output\n" .. table.concat(transcript, "\n"),
-    }, "\n\n")
+    }
+    local memories = memory_section()
+    if memories then
+        table.insert(sections, memories)
+    end
+    table.insert(sections, "## Vitals\n" .. (rune.json.encode(snap.vitals) or "{}"))
+    table.insert(sections, "## Status\n" .. (rune.json.encode(snap.status) or "{}"))
+    table.insert(sections, "## Room\n" .. (rune.json.encode(snap.room) or "{}"))
+    table.insert(sections, "## Recent output\n" .. table.concat(transcript, "\n"))
+    return table.concat(sections, "\n\n")
 end
 
 local active = false
@@ -257,6 +283,7 @@ function rune.agent.start(opts)
     max_tokens = opts.max_tokens or DEFAULT_MAX_TOKENS
 
     rune.perception.enable()
+    rune.memory.enable()
 
     local was_fighting = false
 
@@ -313,6 +340,9 @@ function rune.agent.stop()
     end
     handles = {}
     rune.perception.disable()
+    -- Stops recording; the stream itself is durable and survives, so a
+    -- restarted agent still knows what it learned (rune.memory.disable).
+    rune.memory.disable()
 end
 
 function rune.agent.is_active()

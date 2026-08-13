@@ -48,6 +48,13 @@ local function register(name, description, input_schema, fn)
     end)
 end
 
+-- Exported so tools defined in later core files (89_memory.lua) get the
+-- same quarantine machinery instead of reaching past it to
+-- rune.agent.register_tool directly. Deliberately just this one
+-- function: the registry itself stays private, so nothing outside can
+-- enable/disable entries behind /tools' back.
+rune.agent_tools = { register = register }
+
 register("send_command", "Send a raw command to the MUD, exactly as a player would type it.", {
     type = "object",
     properties = {
