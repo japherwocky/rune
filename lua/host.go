@@ -108,7 +108,7 @@ type Host interface {
 	// bot's log would trip it. LogSearch keeps the *most recent*
 	// matches when it has to discard, since recent context is what a
 	// caller searching a live log actually wants.
-	LogRead(maxLines int) ([]string, error)                    // last N lines, oldest first
+	LogRead(maxLines int) ([]string, error)                     // last N lines, oldest first
 	LogSearch(pattern string, maxResults int) ([]string, error) // matching lines, oldest first
 
 	// HTTP: perform req off the session goroutine and deliver the
