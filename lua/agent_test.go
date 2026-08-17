@@ -441,7 +441,6 @@ func TestAgentStopUnwindsAndDropsInFlightResult(t *testing.T) {
 	}
 }
 
-
 func boolLua(b bool) string {
 	if b {
 		return "true"

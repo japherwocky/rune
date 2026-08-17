@@ -1,6 +1,6 @@
 package lua
 
-import glua "github.com/yuin/gopher-lua"
+import "github.com/mmcdole/rune/script"
 
 // envAllowlist is the complete set of environment variable names
 // scripts may read via rune.env. Everything else returns nil, exactly
@@ -29,24 +29,23 @@ var envAllowlist = map[string]bool{
 // through Host so tests can control them without touching real
 // process environment (see MockHost.EnvVars).
 func (e *Engine) registerEnvFuncs() {
-	envTable := e.L.NewTable()
-	e.L.SetField(e.runeTable, "_env", envTable)
+	e.vm.RegisterModule("rune._env", map[string]script.GoFunc{
+		// rune._env.get(name) -> string, or nil when unset or not
+		// allowlisted.
+		"get": func(c *script.Call) error {
+			name := c.Str(1)
 
-	// rune._env.get(name) -> string, or nil when unset or not
-	// allowlisted.
-	e.L.SetField(envTable, "get", e.L.NewFunction(func(L *glua.LState) int {
-		name := L.CheckString(1)
-
-		if !envAllowlist[name] {
-			L.Push(glua.LNil)
-			return 1
-		}
-		value, ok := e.host.Env(name)
-		if !ok {
-			L.Push(glua.LNil)
-			return 1
-		}
-		L.Push(glua.LString(value))
-		return 1
-	}))
+			if !envAllowlist[name] {
+				c.Return(nil)
+				return nil
+			}
+			value, ok := e.host.Env(name)
+			if !ok {
+				c.Return(nil)
+				return nil
+			}
+			c.Return(value)
+			return nil
+		},
+	}, nil)
 }

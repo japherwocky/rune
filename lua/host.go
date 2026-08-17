@@ -34,6 +34,7 @@ type Host interface {
 	PaneSetVisible(name string, visible bool)
 	PaneClear(name string)
 	ShowPicker(opts ui.ShowPickerMsg)
+	ShowSearch(opts ui.ShowSearchMsg)
 	ClipboardSet(text string)
 	GetInput() string
 	SetInput(text string)
@@ -59,6 +60,8 @@ type Host interface {
 
 	// System
 	Quit()
+	// Reload requests a VM reload. The host must defer teardown and Init until
+	// control returns from the enclosing Engine call to the host event loop.
 	Reload()
 	RefreshBars() // Force immediate bar refresh
 
@@ -105,7 +108,7 @@ type Host interface {
 	// bot's log would trip it. LogSearch keeps the *most recent*
 	// matches when it has to discard, since recent context is what a
 	// caller searching a live log actually wants.
-	LogRead(maxLines int) ([]string, error)                    // last N lines, oldest first
+	LogRead(maxLines int) ([]string, error)                     // last N lines, oldest first
 	LogSearch(pattern string, maxResults int) ([]string, error) // matching lines, oldest first
 
 	// HTTP: perform req off the session goroutine and deliver the

@@ -28,6 +28,7 @@ func newTestSession(t *testing.T) (*Session, *mockNetwork, *mockUI) {
 	}
 	uiMock.drainPrinted() // discard startup banner
 	t.Cleanup(func() {
+		s.LogStop()
 		s.timer.Stop()
 	})
 	return s, net, uiMock
@@ -262,6 +263,24 @@ func TestInputCursorConvertsAtUIBoundary(t *testing.T) {
 	s.InputSetCursor(len("café"))
 	if got, want := uiMock.inputCursor[len(uiMock.inputCursor)-1], 4; got != want {
 		t.Fatalf("widget cursor after multibyte text = %d, want %d", got, want)
+	}
+}
+
+func TestSearchStateIsIndependentFromScrollState(t *testing.T) {
+	s, _, _ := newTestSession(t)
+	s.clientState.ScrollMode = "live"
+
+	s.handleUIMessage(ui.SearchStateChangedMsg(true))
+	if !s.clientState.SearchActive {
+		t.Fatal("search-active UI event did not update client state")
+	}
+	if s.clientState.ScrollMode != "live" {
+		t.Fatalf("search changed scroll mode to %q", s.clientState.ScrollMode)
+	}
+
+	s.handleUIMessage(ui.SearchStateChangedMsg(false))
+	if s.clientState.SearchActive {
+		t.Fatal("search-close UI event left client state active")
 	}
 }
 

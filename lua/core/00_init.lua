@@ -67,15 +67,43 @@ function rune.caller_source(level)
     if not getinfo then
         return nil
     end
-    local info = getinfo(level + 2, "Sl") -- +2 skips this fn and its caller
-    if not info or not info.source then
-        return nil
+
+    local function format_source(info)
+        local src = info.source:gsub("^@", "")
+        if info.currentline and info.currentline > 0 then
+            return src .. ":" .. info.currentline
+        end
+        return src
     end
-    local src = info.source:gsub("^@", "")
-    if info.currentline and info.currentline > 0 then
-        return src .. ":" .. info.currentline
+
+    local function usable(info)
+        return info ~= nil and info.source ~= nil
+            and info.source ~= "=[C]" and info.source ~= "=(tail call)"
     end
-    return src
+
+    -- +2 skips this fn and its caller. Engines differ on tail calls:
+    -- under real 5.1 semantics a `return helper(...)` frame is
+    -- eliminated (or left as a "(tail call)" pseudo frame), shifting
+    -- levels. Probe upward past pseudo frames, then back down if the
+    -- requested level overshot a shortened stack, so attribution
+    -- lands on the nearest real script frame either way.
+    local base = level + 2
+    for l = base, base + 4 do
+        local info = getinfo(l, "Sl")
+        if not info then
+            break
+        end
+        if usable(info) then
+            return format_source(info)
+        end
+    end
+    for l = base - 1, 1, -1 do
+        local info = getinfo(l, "Sl")
+        if usable(info) then
+            return format_source(info)
+        end
+    end
+    return nil
 end
 
 -- Line objects
@@ -150,7 +178,7 @@ end
 -- Client state (read-only view)
 -- Go pushes updates into rune._state; rune.state is a read-only proxy
 -- so scripts cannot corrupt Go-owned state. Fields: connected,
--- address, scroll_mode, scroll_lines, width, height.
+-- address, scroll_mode, scroll_lines, search_active, width, height.
 rune.state = setmetatable({}, {
     __index = function(_, key)
         return rune._state[key]
@@ -247,7 +275,14 @@ function rune.ui.picker.show(opts)
     rune._ui.picker_show(opts)
 end
 
+-- Open the scrollback-search overlay (also bound to Ctrl+F and /find).
+-- opts = { query = "thief" }  -- optional; omitted or empty reopens
+--                             -- with the previous search's query
+function rune.ui.search(opts)
+    rune._ui.search_show(opts or {})
+end
+
 -- Startup
 
-rune.echo("Rune MUD Client " .. rune.version)
+rune.echo("Rune MUD Client " .. rune.version .. " (lua: " .. rune.engine .. ")")
 rune.echo("Type /help for commands")

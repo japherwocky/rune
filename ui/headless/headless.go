@@ -113,6 +113,7 @@ func (h *UI) UpdateBars(map[string]ui.BarContent)       {}
 func (h *UI) UpdateBinds(map[string]bool)               {}
 func (h *UI) UpdateLayout(top, bottom []ui.LayoutEntry) {}
 func (h *UI) ShowPicker(ui.ShowPickerMsg)               {}
+func (h *UI) ShowSearch(ui.ShowSearchMsg)               {}
 func (h *UI) SetClipboard(string)                       {}
 func (h *UI) CreatePane(string)                         {}
 func (h *UI) TogglePane(string)                         {}

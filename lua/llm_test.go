@@ -353,13 +353,13 @@ func TestLLMChatBadArgumentsRaise(t *testing.T) {
 	withAPIKey(host)
 
 	for _, code := range []string{
-		`rune.llm.chat("not a table", function() end)`,                                    // not a table
-		`rune.llm.chat({ messages = {}, max_tokens = 512 }, function() end)`,               // missing model
-		`rune.llm.chat({ model = "", messages = {}, max_tokens = 512 }, function() end)`,    // empty model
-		`rune.llm.chat({ model = "m", max_tokens = 512 }, function() end)`,                  // missing messages
-		`rune.llm.chat({ model = "m", messages = {} }, function() end)`,                     // missing max_tokens
+		`rune.llm.chat("not a table", function() end)`,                                       // not a table
+		`rune.llm.chat({ messages = {}, max_tokens = 512 }, function() end)`,                 // missing model
+		`rune.llm.chat({ model = "", messages = {}, max_tokens = 512 }, function() end)`,     // empty model
+		`rune.llm.chat({ model = "m", max_tokens = 512 }, function() end)`,                   // missing messages
+		`rune.llm.chat({ model = "m", messages = {} }, function() end)`,                      // missing max_tokens
 		`rune.llm.chat({ model = "m", messages = {}, max_tokens = "many" }, function() end)`, // wrong type
-		`rune.llm.chat({ model = "m", messages = {}, max_tokens = 512 })`,                   // missing callback
+		`rune.llm.chat({ model = "m", messages = {}, max_tokens = 512 })`,                    // missing callback
 	} {
 		if err := engine.DoString("test", code); err == nil {
 			t.Errorf("expected error for %q", code)
