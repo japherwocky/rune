@@ -1,6 +1,6 @@
 module github.com/mmcdole/rune
 
-go 1.26.5
+go 1.26.8
 
 require (
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1
