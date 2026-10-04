@@ -1,6 +1,7 @@
 package session
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -169,19 +170,34 @@ func resolveLLMProvider(s *Session, model string) (llmProvider, error) {
 // retried with backoff in-goroutine before delivery, rather than
 // surfacing a still-recoverable failure straight to the agent.
 func (s *Session) LLMRequest(id int, req lua.LLMRequest) {
-	go func() {
-		resp, err := doLLMRequestWithRetry(s, req)
+	luaGeneration := s.luaGeneration
+	backgroundCtx := s.backgroundCtx
+	s.backgroundWork.Go(func() {
+		resp, err := doLLMRequestWithRetry(backgroundCtx, s, req)
 		errMsg := ""
 		if err != nil {
 			errMsg = err.Error()
 		}
-		s.asyncResults <- func() {
-			s.engine.OnLLMResult(id, resp, errMsg)
-		}
-	}()
+		s.postInternalEvent(backgroundCtx, llmFinished{
+			luaGeneration: luaGeneration,
+			callbackID:    id,
+			response:      resp,
+			errorText:     errMsg,
+		})
+	})
 }
 
-func doLLMRequestWithRetry(s *Session, req lua.LLMRequest) (*lua.HTTPResponse, error) {
+// handleLLMFinished drops a result whose VM is gone: a /reload between
+// request and delivery means the callback that was waiting for this id
+// no longer exists, and the id could since have been reissued.
+func (s *Session) handleLLMFinished(event llmFinished) {
+	if event.luaGeneration != s.luaGeneration {
+		return
+	}
+	s.engine.OnLLMResult(event.callbackID, event.response, event.errorText)
+}
+
+func doLLMRequestWithRetry(ctx context.Context, s *Session, req lua.LLMRequest) (*lua.HTTPResponse, error) {
 	provider, err := resolveLLMProvider(s, req.Model)
 	if err != nil {
 		return nil, err
@@ -195,9 +211,15 @@ func doLLMRequestWithRetry(s *Session, req lua.LLMRequest) (*lua.HTTPResponse, e
 	var resp *lua.HTTPResponse
 	for attempt := 0; attempt < llmMaxAttempts; attempt++ {
 		if attempt > 0 {
-			time.Sleep(llmRetryBackoff(attempt))
+			// Abandon a pending retry when the session is going away,
+			// rather than holding backgroundWork open in a sleep.
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(llmRetryBackoff(attempt)):
+			}
 		}
-		resp, err = doLLMRequest(provider, key, req)
+		resp, err = doLLMRequest(ctx, provider, key, req)
 		if err != nil {
 			return nil, err
 		}
@@ -219,8 +241,8 @@ func llmRetryableStatus(status int) bool {
 	return status == 429 || status == 529
 }
 
-func doLLMRequest(provider llmProvider, key string, req lua.LLMRequest) (*lua.HTTPResponse, error) {
-	httpReq, err := http.NewRequest(http.MethodPost, provider.url, strings.NewReader(req.Body))
+func doLLMRequest(ctx context.Context, provider llmProvider, key string, req lua.LLMRequest) (*lua.HTTPResponse, error) {
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, provider.url, strings.NewReader(req.Body))
 	if err != nil {
 		return nil, err
 	}

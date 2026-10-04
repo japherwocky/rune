@@ -149,8 +149,7 @@ type mockUI struct {
 	echoed   []string
 	prompts  []string // every SetPrompt call, including clears
 	inputSet []string
-	input    chan input.Submission
-	outbound chan ui.UIEvent
+	events   chan ui.UIEvent
 	done     chan struct{}
 }
 
@@ -158,9 +157,8 @@ var _ ui.UI = (*mockUI)(nil)
 
 func newMockUI() *mockUI {
 	return &mockUI{
-		input:    make(chan input.Submission, 64),
-		outbound: make(chan ui.UIEvent, 64),
-		done:     make(chan struct{}),
+		events: make(chan ui.UIEvent, 64),
+		done:   make(chan struct{}),
 	}
 }
 
@@ -172,8 +170,7 @@ func (m *mockUI) Quit() {
 		close(m.done)
 	}
 }
-func (m *mockUI) Input() <-chan input.Submission { return m.input }
-func (m *mockUI) Outbound() <-chan ui.UIEvent    { return m.outbound }
+func (m *mockUI) Events() <-chan ui.UIEvent { return m.events }
 
 func (m *mockUI) Print(text string) {
 	m.mu.Lock()
@@ -193,6 +190,15 @@ func (m *mockUI) SetPrompt(text string) {
 	m.prompts = append(m.prompts, text)
 }
 
+func (m *mockUI) CommitPrompt(text string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if text != "" {
+		m.printed = append(m.printed, text)
+	}
+	m.prompts = append(m.prompts, "")
+}
+
 func (m *mockUI) SetInput(text string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -206,15 +212,15 @@ func (m *mockUI) SetInputSubmission(submission input.Submission) {
 }
 
 func (m *mockUI) UpdateBars(content map[string]ui.BarContent) {}
-func (m *mockUI) UpdateBinds(keys map[string]bool)            {}
-func (m *mockUI) UpdateLayout(top, bottom []ui.LayoutEntry)   {}
-func (m *mockUI) ShowPicker(opts ui.ShowPickerMsg)            {}
-func (m *mockUI) ShowSearch(opts ui.ShowSearchMsg)            {}
+func (m *mockUI) UpdateBinds(keys input.Bindings)             {}
+func (m *mockUI) UpdateLayout(layout ui.LayoutTree)           {}
+func (m *mockUI) UpdateConfig(cfg ui.Config)                  {}
+func (m *mockUI) ShowPicker(opts ui.PickerOptions)            {}
+func (m *mockUI) ShowSearch(opts ui.SearchOptions)            {}
 func (m *mockUI) SetClipboard(text string)                    {}
 func (m *mockUI) CreatePane(name string)                      {}
 func (m *mockUI) WritePane(name, text string)                 {}
-func (m *mockUI) TogglePane(name string)                      {}
-func (m *mockUI) SetPaneVisible(name string, visible bool)    {}
+func (m *mockUI) ReplacePane(name, text string)               {}
 func (m *mockUI) ClearPane(name string)                       {}
 func (m *mockUI) InputSetCursor(pos int)                      {}
 func (m *mockUI) OpenEditor(initial string) (string, bool)    { return "", false }
@@ -316,19 +322,53 @@ func newClient(t *testing.T, initLua string) *client {
 }
 
 // connect types /connect at the client and waits for the dial.
+//
+// Accepting the TCP connection is not enough to continue: the session
+// installs the socket and publishes the connection only once it handles
+// the dial result, and a step that submits input before that races the
+// install and loses its command. Wait for the client to say it is
+// connected, which is causally after both.
 func (c *client) connect() {
 	c.t.Helper()
-	c.ui.input <- input.Command("/connect " + c.mud.addr())
+	c.ui.events <- ui.InputSubmittedMsg{Submission: input.Command("/connect " + c.mud.addr())}
 	c.mud.accept()
+	c.waitFor("the client to report the connection", func() bool {
+		return c.ui.printedContains("Connected to")
+	})
 }
 
-// connectRefused closes the fake MUD's listener and then types
-// /connect at the now-dead address, so the dial is refused.
+// deadAddr returns a loopback address that refuses connections, proven
+// by dialing it rather than assumed.
+//
+// Closing a listener and reusing its address is not enough on its own:
+// the kernel can hand that ephemeral port to the next net.Listen in this
+// process, and the "refused" dial then reaches another scenario's server
+// and succeeds, so the client never reports an error and the step waits
+// out its whole deadline.
+func deadAddr(t *testing.T) string {
+	t.Helper()
+	for attempt := 0; attempt < 20; attempt++ {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		addr := ln.Addr().String()
+		ln.Close()
+
+		conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
+		if err != nil {
+			return addr // refused, which is what we want
+		}
+		conn.Close()
+	}
+	t.Fatal("could not find a loopback address that refuses connections")
+	return ""
+}
+
+// connectRefused types /connect at an address that refuses the dial.
 func (c *client) connectRefused() {
 	c.t.Helper()
-	addr := c.mud.addr()
-	c.mud.ln.Close()
-	c.ui.input <- input.Command("/connect " + addr)
+	c.ui.events <- ui.InputSubmittedMsg{Submission: input.Command("/connect " + deadAddr(c.t))}
 }
 
 // waitFor polls cond until it holds or the deadline passes.

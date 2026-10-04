@@ -3,42 +3,50 @@ package session
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
+	"testing"
 
 	"github.com/mmcdole/rune/input"
 	"github.com/mmcdole/rune/network"
 	"github.com/mmcdole/rune/ui"
 )
 
-// mockNetwork implements Network without sockets.
+// mockNetwork implements Network without sockets. Like TCPClient, it
+// validates the connection ID on every send, so ordering bugs between hook
+// dispatch and connection turnover fail here too.
 type mockNetwork struct {
-	mu          sync.Mutex
-	sent        []string
-	gmcpSent    []struct{ Package, Data string }
-	gmcpActive  bool
-	connected   bool
-	connectedTo []string // every Connect address, in order
-	connectErr  error
-	output      chan network.Output
-	localEcho   bool
-	windowW     int
-	windowH     int
+	mu              sync.Mutex
+	sent            []string
+	gmcpSent        []struct{ Package, Data string }
+	connected       bool
+	connectionID    uint64   // ID BeginConnect reserved; sends must carry it
+	connectedTo     []string // every Connect address, in order
+	inbound         chan network.Inbound
+	frames          [][]byte
+	disconnectCalls int
 }
 
 var _ Network = (*mockNetwork)(nil)
 
 func newMockNetwork() *mockNetwork {
 	return &mockNetwork{
-		output:    make(chan network.Output, 64),
-		localEcho: true,
+		inbound: make(chan network.Inbound, 64),
 	}
 }
 
-func (m *mockNetwork) Connect(ctx context.Context, address string) error {
+func (m *mockNetwork) BeginConnect(connectionID uint64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.connectErr != nil {
-		return m.connectErr
+	m.connectionID = connectionID
+	m.connected = false // the old socket is retired, like TCPClient
+}
+
+func (m *mockNetwork) Connect(ctx context.Context, address string, connectionID uint64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if connectionID != m.connectionID {
+		return context.Canceled // superseded dial
 	}
 	m.connected = true
 	m.connectedTo = append(m.connectedTo, address)
@@ -54,43 +62,36 @@ func (m *mockNetwork) dialed() []string {
 func (m *mockNetwork) Disconnect() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.disconnectCalls++
 	m.connected = false
 }
 
-func (m *mockNetwork) Send(data string) error {
+func (m *mockNetwork) SendLine(connectionID uint64, data string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if !m.connected {
+	if !m.connected || connectionID != m.connectionID {
 		return errors.New("not connected")
 	}
 	m.sent = append(m.sent, data)
 	return nil
 }
 
-func (m *mockNetwork) Output() <-chan network.Output { return m.output }
-func (m *mockNetwork) LocalEchoEnabled() bool        { return m.localEcho }
-
-func (m *mockNetwork) SendGMCP(pkg, data string) error {
+func (m *mockNetwork) SendFrame(connectionID uint64, frame []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if !m.connected {
+	if !m.connected || connectionID != m.connectionID {
 		return errors.New("not connected")
 	}
-	m.gmcpSent = append(m.gmcpSent, struct{ Package, Data string }{pkg, data})
+	m.frames = append(m.frames, append([]byte(nil), frame...))
+	if len(frame) >= 5 && frame[0] == network.CmdIAC && frame[1] == network.CmdSB && frame[2] == network.OptGMCP && frame[len(frame)-2] == network.CmdIAC && frame[len(frame)-1] == network.CmdSE {
+		payload := string(frame[3 : len(frame)-2])
+		pkg, data, _ := strings.Cut(payload, " ")
+		m.gmcpSent = append(m.gmcpSent, struct{ Package, Data string }{pkg, data})
+	}
 	return nil
 }
 
-func (m *mockNetwork) GMCPActive() bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.gmcpActive
-}
-
-func (m *mockNetwork) SetWindowSize(width, height int) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.windowW, m.windowH = width, height
-}
+func (m *mockNetwork) Inbound() <-chan network.Inbound { return m.inbound }
 
 func (m *mockNetwork) drainGMCPSent() []struct{ Package, Data string } {
 	m.mu.Lock()
@@ -98,6 +99,17 @@ func (m *mockNetwork) drainGMCPSent() []struct{ Package, Data string } {
 	sent := m.gmcpSent
 	m.gmcpSent = nil
 	return sent
+}
+
+func (m *mockNetwork) drainFrames() [][]byte {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	frames := make([][]byte, len(m.frames))
+	for i, frame := range m.frames {
+		frames[i] = append([]byte(nil), frame...)
+	}
+	m.frames = nil
+	return frames
 }
 
 func (m *mockNetwork) drainSent() []string {
@@ -110,27 +122,43 @@ func (m *mockNetwork) drainSent() []string {
 
 // mockUI implements ui.UI, capturing display calls.
 type mockUI struct {
-	mu          sync.Mutex
-	printed     []string
-	echoed      []string
-	prompts     []string // every SetPrompt call, including clears
-	inputSet    []string
-	inputModes  []input.Submission
-	inputCursor []int
-	bindsPushed map[string]bool // last UpdateBinds payload
-	input       chan input.Submission
-	outbound    chan ui.UIEvent
-	done        chan struct{}
+	mu            sync.Mutex
+	printed       []string
+	echoed        []string
+	displayEvents []string
+	prompts       []string // every SetPrompt call, including clears
+	submissions   []input.Submission
+	inputCursor   []int
+	bars          map[string]ui.BarContent // last UpdateBars payload
+	barPushes     int                      // UpdateBars call count
+	bindsPushed   input.Bindings           // last UpdateBinds payload
+	layoutPushes  int                      // UpdateLayout call count
+	layout        ui.LayoutTree            // last UpdateLayout payload
+	config        ui.Config                // last UpdateConfig payload
+	configPushes  []ui.Config              // every UpdateConfig payload
+	openEditorFn  func(string) (string, bool)
+	events        chan ui.UIEvent
+	done          chan struct{}
 }
 
 var _ ui.UI = (*mockUI)(nil)
 
 func newMockUI() *mockUI {
 	return &mockUI{
-		input:    make(chan input.Submission, 64),
-		outbound: make(chan ui.UIEvent, 64),
-		done:     make(chan struct{}),
+		events: make(chan ui.UIEvent, 64),
+		done:   make(chan struct{}),
 	}
+}
+
+func cleanupTestSession(t testing.TB, s *Session) {
+	t.Cleanup(func() {
+		s.cancelBackgroundWork()
+		s.net.Disconnect()
+		s.backgroundWork.Wait()
+		s.engine.Close()
+		s.timer.Stop()
+		s.LogStop()
+	})
 }
 
 func (m *mockUI) Run() error { <-m.done; return nil }
@@ -141,69 +169,134 @@ func (m *mockUI) Quit() {
 		close(m.done)
 	}
 }
-func (m *mockUI) Input() <-chan input.Submission { return m.input }
-func (m *mockUI) Outbound() <-chan ui.UIEvent    { return m.outbound }
+func (m *mockUI) Events() <-chan ui.UIEvent { return m.events }
 
 func (m *mockUI) Print(text string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.printed = append(m.printed, text)
+	m.displayEvents = append(m.displayEvents, "print:"+text)
 }
 
 func (m *mockUI) Echo(text string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.echoed = append(m.echoed, text)
+	m.displayEvents = append(m.displayEvents, "echo:"+text)
 }
 
 func (m *mockUI) SetPrompt(text string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.prompts = append(m.prompts, text)
+	m.displayEvents = append(m.displayEvents, "prompt:"+text)
+}
+
+func (m *mockUI) CommitPrompt(text string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if text != "" {
+		m.printed = append(m.printed, text)
+	}
+	m.prompts = append(m.prompts, "")
+	m.displayEvents = append(m.displayEvents, "commit:"+text)
 }
 
 func (m *mockUI) SetInput(text string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.inputSet = append(m.inputSet, text)
 }
 
 func (m *mockUI) SetInputSubmission(submission input.Submission) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.inputSet = append(m.inputSet, submission.Text)
-	m.inputModes = append(m.inputModes, submission)
+	m.submissions = append(m.submissions, submission)
 }
 
-func (m *mockUI) UpdateBars(content map[string]ui.BarContent) {}
-func (m *mockUI) UpdateBinds(keys map[string]bool) {
+func (m *mockUI) UpdateBars(content map[string]ui.BarContent) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.bars = content
+	m.barPushes++
+}
+func (m *mockUI) UpdateBinds(keys input.Bindings) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.bindsPushed = keys
 }
-func (m *mockUI) UpdateLayout(top, bottom []ui.LayoutEntry) {}
+func (m *mockUI) UpdateLayout(layout ui.LayoutTree) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.layout = layout
+	m.layoutPushes++
+}
 
-func (m *mockUI) pushedBinds() map[string]bool {
+func (m *mockUI) UpdateConfig(cfg ui.Config) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.config = cfg
+	m.configPushes = append(m.configPushes, cfg)
+}
+
+func (m *mockUI) pushedConfig() ui.Config {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.config
+}
+
+func (m *mockUI) drainConfigPushes() []ui.Config {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	pushes := append([]ui.Config(nil), m.configPushes...)
+	m.configPushes = nil
+	return pushes
+}
+
+func (m *mockUI) drainLayoutPushes() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := m.layoutPushes
+	m.layoutPushes = 0
+	return n
+}
+
+func (m *mockUI) drainBarPushes() (int, map[string]ui.BarContent) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	count, bars := m.barPushes, m.bars
+	m.barPushes = 0
+	return count, bars
+}
+
+func (m *mockUI) pushedLayout() ui.LayoutTree {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.layout
+}
+
+func (m *mockUI) pushedBinds() input.Bindings {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.bindsPushed
 }
 
-func (m *mockUI) ShowPicker(opts ui.ShowPickerMsg)         {}
-func (m *mockUI) ShowSearch(opts ui.ShowSearchMsg)         {}
-func (m *mockUI) SetClipboard(text string)                 {}
-func (m *mockUI) CreatePane(name string)                   {}
-func (m *mockUI) WritePane(name, text string)              {}
-func (m *mockUI) TogglePane(name string)                   {}
-func (m *mockUI) SetPaneVisible(name string, visible bool) {}
-func (m *mockUI) ClearPane(name string)                    {}
+func (m *mockUI) ShowPicker(opts ui.PickerOptions) {}
+func (m *mockUI) ShowSearch(opts ui.SearchOptions) {}
+func (m *mockUI) SetClipboard(text string)         {}
+func (m *mockUI) CreatePane(name string)           {}
+func (m *mockUI) WritePane(name, text string)      {}
+func (m *mockUI) ReplacePane(name, text string)    {}
+func (m *mockUI) ClearPane(name string)            {}
 
 func (m *mockUI) InputSetCursor(pos int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.inputCursor = append(m.inputCursor, pos)
 }
-func (m *mockUI) OpenEditor(initial string) (string, bool) { return "", false }
+func (m *mockUI) OpenEditor(initial string) (string, bool) {
+	if m.openEditorFn != nil {
+		return m.openEditorFn(initial)
+	}
+	return "", false
+}
 
 func (m *mockUI) PaneScrollUp(name string, lines int)   {}
 func (m *mockUI) PaneScrollDown(name string, lines int) {}
@@ -232,4 +325,12 @@ func (m *mockUI) drainPrompts() []string {
 	prompts := m.prompts
 	m.prompts = nil
 	return prompts
+}
+
+func (m *mockUI) drainDisplayEvents() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	events := m.displayEvents
+	m.displayEvents = nil
+	return events
 }

@@ -1,92 +1,145 @@
 package tui
 
-import tea "github.com/charmbracelet/bubbletea"
+import tea "charm.land/bubbletea/v2"
 
-// keyNames maps Bubble Tea key types to string names for Lua bindings.
-var keyNames = map[tea.KeyType]string{
-	tea.KeyCtrlA:      "ctrl+a",
-	tea.KeyCtrlB:      "ctrl+b",
-	tea.KeyCtrlC:      "ctrl+c",
-	tea.KeyCtrlD:      "ctrl+d",
-	tea.KeyCtrlE:      "ctrl+e",
-	tea.KeyCtrlF:      "ctrl+f",
-	tea.KeyCtrlG:      "ctrl+g",
-	tea.KeyCtrlH:      "ctrl+h",
-	tea.KeyCtrlI:      "tab", // Same as KeyTab
-	tea.KeyShiftTab:   "shift+tab",
-	tea.KeyCtrlJ:      "ctrl+j",
-	tea.KeyCtrlK:      "ctrl+k",
-	tea.KeyCtrlL:      "ctrl+l",
-	tea.KeyCtrlM:      "ctrl+m",
-	tea.KeyCtrlN:      "ctrl+n",
-	tea.KeyCtrlO:      "ctrl+o",
-	tea.KeyCtrlP:      "ctrl+p",
-	tea.KeyCtrlQ:      "ctrl+q",
-	tea.KeyCtrlR:      "ctrl+r",
-	tea.KeyCtrlS:      "ctrl+s",
-	tea.KeyCtrlT:      "ctrl+t",
-	tea.KeyCtrlU:      "ctrl+u",
-	tea.KeyCtrlV:      "ctrl+v",
-	tea.KeyCtrlW:      "ctrl+w",
-	tea.KeyCtrlX:      "ctrl+x",
-	tea.KeyCtrlY:      "ctrl+y",
-	tea.KeyCtrlZ:      "ctrl+z",
-	tea.KeyF1:         "f1",
-	tea.KeyF2:         "f2",
-	tea.KeyF3:         "f3",
-	tea.KeyF4:         "f4",
-	tea.KeyF5:         "f5",
-	tea.KeyF6:         "f6",
-	tea.KeyF7:         "f7",
-	tea.KeyF8:         "f8",
-	tea.KeyF9:         "f9",
-	tea.KeyF10:        "f10",
-	tea.KeyF11:        "f11",
-	tea.KeyF12:        "f12",
-	tea.KeyUp:         "up",
-	tea.KeyDown:       "down",
-	tea.KeyLeft:       "left",
-	tea.KeyRight:      "right",
-	tea.KeyCtrlUp:     "ctrl+up",
-	tea.KeyCtrlDown:   "ctrl+down",
-	tea.KeyCtrlLeft:   "ctrl+left",
-	tea.KeyCtrlRight:  "ctrl+right",
-	tea.KeyShiftUp:    "shift+up",
-	tea.KeyShiftDown:  "shift+down",
-	tea.KeyShiftLeft:  "shift+left",
-	tea.KeyShiftRight: "shift+right",
-	tea.KeyEsc:        "escape",
-	tea.KeyBackspace:  "backspace",
-	tea.KeyDelete:     "delete",
-	tea.KeyInsert:     "insert",
-	tea.KeyPgUp:       "pageup",
-	tea.KeyPgDown:     "pagedown",
-	tea.KeyCtrlPgUp:   "ctrl+pageup",
-	tea.KeyCtrlPgDown: "ctrl+pagedown",
-	tea.KeyHome:       "home",
-	tea.KeyEnd:        "end",
-	tea.KeyCtrlHome:   "ctrl+home",
-	tea.KeyCtrlEnd:    "ctrl+end",
-	tea.KeyShiftHome:  "shift+home",
-	tea.KeyShiftEnd:   "shift+end",
+const keyModifiers = tea.ModShift | tea.ModAlt | tea.ModCtrl |
+	tea.ModMeta | tea.ModHyper | tea.ModSuper
+
+// matchesKey compares the physical key and actionable modifiers while
+// ignoring lock state such as Caps Lock and Num Lock.
+func matchesKey(msg tea.KeyPressMsg, code rune, modifiers tea.KeyMod) bool {
+	return msg.Code == code && msg.Mod&keyModifiers == modifiers
 }
 
-// keyToString converts a key press to the name Lua binds use. The alt
-// modifier arrives as a flag on the base key (bubbletea reports alt+left
-// as KeyLeft with Alt set), so it is prefixed here; ctrl- and shift-
-// modified keys are distinct KeyTypes and come from the table.
-func keyToString(msg tea.KeyMsg) string {
-	var base string
-	if msg.Type == tea.KeyRunes && len(msg.Runes) > 0 {
-		base = string(msg.Runes)
-	} else {
-		base = keyNames[msg.Type]
+func isEnterKey(msg tea.KeyPressMsg) bool {
+	return msg.Code == tea.KeyEnter || msg.Code == tea.KeyKpEnter
+}
+
+func matchesEnterKey(msg tea.KeyPressMsg, modifiers tea.KeyMod) bool {
+	return isEnterKey(msg) && msg.Mod&keyModifiers == modifiers
+}
+
+// numpadKeyInfo describes one physical numpad key. text is the character the
+// key types in numeric mode; nav is its semantic fallback when the terminal
+// reports the NumLock-off form.
+type numpadKeyInfo struct {
+	name string
+	text string
+	nav  rune
+}
+
+// numpadCode returns Rune's description of a physical numpad key code.
+// Enter has no printable fallback; equal and comma have no public bind name
+// but still type normally.
+func numpadCode(code rune) (numpadKeyInfo, bool) {
+	if code >= tea.KeyKp0 && code <= tea.KeyKp9 {
+		digit := string(rune('0') + code - tea.KeyKp0)
+		return numpadKeyInfo{name: "numpad" + digit, text: digit}, true
 	}
-	if base == "" {
-		return ""
+	switch code {
+	case tea.KeyKpEnter:
+		return numpadKeyInfo{name: "numpad_enter"}, true
+	case tea.KeyKpPlus:
+		return numpadKeyInfo{name: "numpad_plus", text: "+"}, true
+	case tea.KeyKpMinus:
+		return numpadKeyInfo{name: "numpad_minus", text: "-"}, true
+	case tea.KeyKpMultiply:
+		return numpadKeyInfo{name: "numpad_star", text: "*"}, true
+	case tea.KeyKpDivide:
+		return numpadKeyInfo{name: "numpad_slash", text: "/"}, true
+	case tea.KeyKpDecimal:
+		return numpadKeyInfo{name: "numpad_dot", text: "."}, true
+	case tea.KeyKpEqual:
+		return numpadKeyInfo{text: "="}, true
+	case tea.KeyKpComma, tea.KeyKpSep:
+		return numpadKeyInfo{text: ","}, true
+	case tea.KeyKpInsert:
+		return numpadKeyInfo{name: "numpad0", nav: tea.KeyInsert}, true
+	case tea.KeyKpEnd:
+		return numpadKeyInfo{name: "numpad1", nav: tea.KeyEnd}, true
+	case tea.KeyKpDown:
+		return numpadKeyInfo{name: "numpad2", nav: tea.KeyDown}, true
+	case tea.KeyKpPgDown:
+		return numpadKeyInfo{name: "numpad3", nav: tea.KeyPgDown}, true
+	case tea.KeyKpLeft:
+		return numpadKeyInfo{name: "numpad4", nav: tea.KeyLeft}, true
+	case tea.KeyKpBegin:
+		return numpadKeyInfo{name: "numpad5", nav: tea.KeyBegin}, true
+	case tea.KeyKpRight:
+		return numpadKeyInfo{name: "numpad6", nav: tea.KeyRight}, true
+	case tea.KeyKpHome:
+		return numpadKeyInfo{name: "numpad7", nav: tea.KeyHome}, true
+	case tea.KeyKpUp:
+		return numpadKeyInfo{name: "numpad8", nav: tea.KeyUp}, true
+	case tea.KeyKpPgUp:
+		return numpadKeyInfo{name: "numpad9", nav: tea.KeyPgUp}, true
+	case tea.KeyKpDelete:
+		return numpadKeyInfo{name: "numpad_dot", nav: tea.KeyDelete}, true
+	default:
+		return numpadKeyInfo{}, false
 	}
-	if msg.Alt {
-		return "alt+" + base
+}
+
+// numpadKey recognizes both the direct KeyKp* form used by SS3/kitty input
+// and the BaseCode form used by win32 input.
+func numpadKey(msg tea.KeyPressMsg) (numpadKeyInfo, bool) {
+	if info, ok := numpadCode(msg.BaseCode); ok {
+		return info, true
 	}
-	return base
+	return numpadCode(msg.Code)
+}
+
+// numpadNavigation recognizes the actual NumLock-off code carried by an
+// event. Binding identity is BaseCode-first, but semantic fallback follows
+// Code so an alternate keyboard-layout code cannot change the key's action.
+func numpadNavigation(msg tea.KeyPressMsg) (numpadKeyInfo, bool) {
+	info, ok := numpadCode(msg.Code)
+	return info, ok && info.nav != 0
+}
+
+// navigationFallback converts a NumLock-off physical keypad event into the
+// ordinary navigation event engraved on that key. It is deliberately pure:
+// input modes decide when this fallback takes precedence over Lua binds.
+func (info numpadKeyInfo) navigationFallback(msg tea.KeyPressMsg) tea.KeyPressMsg {
+	if info.nav == 0 {
+		return msg
+	}
+	msg.Code = info.nav
+	msg.BaseCode = 0
+	return msg
+}
+
+func normalizeNumpadText(msg tea.KeyPressMsg) tea.KeyPressMsg {
+	info, ok := numpadKey(msg)
+	if !ok || info.text == "" || info.nav != 0 {
+		return msg
+	}
+	if msg.Mod&(keyModifiers&^tea.ModShift) != 0 {
+		// Win32 input supplies the ordinary keypad character even for
+		// modified chords. Remove that synthetic text so the same chord
+		// routes like SS3 and kitty input, while preserving real AltGr text.
+		if msg.Text == info.text {
+			msg.Text = ""
+		}
+		return msg
+	}
+	if msg.Text == "" {
+		msg.Text = info.text
+	}
+	return msg
+}
+
+// keyToString returns Rune's canonical name at the Go/Lua bind boundary.
+func keyToString(msg tea.KeyPressMsg) string {
+	if info, ok := numpadKey(msg); ok {
+		if info.name == "" {
+			return ""
+		}
+		// Reuse Bubble Tea's modifier spelling and ordering while replacing its
+		// deliberately collapsed keypad name with Rune's physical-key name.
+		msg.Code = tea.KeyExtended
+		msg.BaseCode = 0
+		msg.Text = info.name
+	}
+	return msg.Keystroke()
 }

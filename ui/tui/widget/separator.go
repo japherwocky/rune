@@ -1,50 +1,39 @@
 package widget
 
 import (
+	"image"
+	"strings"
+
+	"charm.land/lipgloss/v2"
 	"github.com/mattn/go-runewidth"
-
-	"github.com/mmcdole/rune/ui/tui/style"
-)
-
-// Compile-time checks that Separator implements Widget and Configurable
-var (
-	_ Widget       = (*Separator)(nil)
-	_ Configurable = (*Separator)(nil)
 )
 
 // Separator renders a horizontal line.
 type Separator struct {
-	width int
-	char  string
+	width       int
+	char        string
+	borderStyle lipgloss.Style
 }
 
-// NewSeparator creates a new separator widget.
-func NewSeparator() *Separator {
-	return &Separator{}
-}
-
-// SetOptions implements Configurable. "char" sets the rule character;
-// anything but a single-cell value is dropped so the rule can never
-// break the width math.
-func (s *Separator) SetOptions(opts map[string]string) {
-	char := opts["char"]
+// NewSeparator creates a separator with a fixed character and border style.
+// Anything but a single-cell value falls back to the default rule.
+func NewSeparator(char string, borderStyle lipgloss.Style) *Separator {
 	if runewidth.StringWidth(char) != 1 {
-		char = ""
+		char = "─"
 	}
-	s.char = char
+	return &Separator{char: char, borderStyle: borderStyle}
 }
 
-// View implements Widget.
+// View renders the separator at its allocated width.
 func (s *Separator) View() string {
-	return style.RenderBorder(s.width, s.char)
+	return s.borderStyle.Render(strings.Repeat(s.char, s.width))
 }
 
-// SetSize implements Widget.
+// SetSize applies the allocated content size.
 func (s *Separator) SetSize(width, height int) {
 	s.width = width
 }
 
-// PreferredHeight implements Widget.
-func (s *Separator) PreferredHeight() int {
-	return 1
-}
+func (s *Separator) MeasureHeight(width, limit int) int { return min(1, limit) }
+
+func (s *Separator) MinimumSize() image.Point { return image.Point{} }

@@ -1,6 +1,84 @@
 package tui
 
-import "testing"
+import (
+	"bytes"
+	"io"
+	"testing"
+
+	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/x/ansi"
+
+	"github.com/mmcdole/rune/ui"
+)
+
+func TestQuitBeforeRunDoesNotStartProgram(t *testing.T) {
+	b := NewBubbleTeaUI()
+	b.output = io.Discard
+	b.Print("queued during boot")
+	b.Quit()
+
+	if err := b.Run(); err != nil {
+		t.Fatalf("Run after Quit: %v", err)
+	}
+	if b.program != nil {
+		t.Fatal("Run started a program after Quit")
+	}
+}
+
+func TestKeypadModeSequence(t *testing.T) {
+	if got := keypadModeSequence(true); got != ansi.KeypadApplicationMode {
+		t.Fatalf("enabled keypad sequence = %q, want %q", got, ansi.KeypadApplicationMode)
+	}
+	if got := keypadModeSequence(false); got != ansi.KeypadNumericMode {
+		t.Fatalf("disabled keypad sequence = %q, want %q", got, ansi.KeypadNumericMode)
+	}
+}
+
+func TestUpdateConfigQueuesKeypadModeOnlyWhenItChanges(t *testing.T) {
+	b := NewBubbleTeaUI()
+
+	b.UpdateConfig(ui.Config{Numpad: false})
+	if msg := <-b.msgQueue; msg != (updateConfigMsg{Numpad: false}) {
+		t.Fatalf("first queued message = %#v, want disabled config", msg)
+	}
+	if msg := <-b.msgQueue; msg != (tea.RawMsg{Msg: ansi.KeypadNumericMode}) {
+		t.Fatalf("second queued message = %#v, want numeric keypad mode", msg)
+	}
+
+	b.UpdateConfig(ui.Config{KeepInput: true, Numpad: false})
+	if msg := <-b.msgQueue; msg != (updateConfigMsg{KeepInput: true, Numpad: false}) {
+		t.Fatalf("unchanged keypad config message = %#v", msg)
+	}
+	if got := len(b.msgQueue); got != 0 {
+		t.Fatalf("unchanged keypad mode queued %d extra messages", got)
+	}
+
+	b.UpdateConfig(ui.Config{KeepInput: true, Numpad: true})
+	if msg := <-b.msgQueue; msg != (updateConfigMsg{KeepInput: true, Numpad: true}) {
+		t.Fatalf("enabled keypad config message = %#v", msg)
+	}
+	if msg := <-b.msgQueue; msg != (tea.RawMsg{Msg: ansi.KeypadApplicationMode}) {
+		t.Fatalf("enabled keypad raw message = %#v, want application mode", msg)
+	}
+}
+
+func TestWriteKeypadModeUsesProgramOutput(t *testing.T) {
+	b := NewBubbleTeaUI()
+	var output bytes.Buffer
+	b.output = &output
+
+	if err := b.writeKeypadMode(true); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.writeKeypadMode(false); err != nil {
+		t.Fatal(err)
+	}
+
+	want := ansi.KeypadApplicationMode + ansi.KeypadNumericMode
+	if got := output.String(); got != want {
+		t.Fatalf("keypad lifecycle output = %q, want %q", got, want)
+	}
+}
 
 func TestNormalizeEditorTextPreservesWhitespace(t *testing.T) {
 	tests := []struct {
@@ -21,5 +99,19 @@ func TestNormalizeEditorTextPreservesWhitespace(t *testing.T) {
 				t.Fatalf("normalizeEditorText(%q) = %q, want %q", tt.in, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestReplacePaneQueuesOneMessage is the structural guarantee behind
+// rune.pane.replace: the clear and the write cannot be split by a frame
+// because they travel as one message.
+func TestReplacePaneQueuesOneMessage(t *testing.T) {
+	b := NewBubbleTeaUI()
+	b.ReplacePane("status", "HP 10\nMP 5")
+	if msg := <-b.msgQueue; msg != (paneReplaceMsg{Name: "status", Text: "HP 10\nMP 5"}) {
+		t.Fatalf("queued %#v, want one PaneReplaceMsg", msg)
+	}
+	if got := len(b.msgQueue); got != 0 {
+		t.Fatalf("ReplacePane queued %d extra messages", got+1)
 	}
 }

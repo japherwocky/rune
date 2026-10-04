@@ -611,7 +611,7 @@ func TestMemoryToolsAreRegisteredAndQuarantinable(t *testing.T) {
 	defer cleanup()
 	startAgent(t, engine, host)
 
-	engine.OnPrompt(text.NewLine("<100hp> "))
+	engine.OnPrompt(text.NewLine("<100hp> "), true)
 
 	var body struct {
 		Tools []struct {
@@ -637,7 +637,7 @@ func TestMemoryRememberToolStores(t *testing.T) {
 	defer cleanup()
 	startAgent(t, engine, host)
 
-	engine.OnPrompt(text.NewLine("<100hp> "))
+	engine.OnPrompt(text.NewLine("<100hp> "), true)
 	deliverToolUse(t, engine, host, host.LLMCalls[0].ID, "tu-1", "remember", map[string]interface{}{
 		"text":       "the cityguard one-shots me",
 		"importance": 9,
@@ -674,7 +674,7 @@ func TestMemoryRecallToolReturnsFormattedMemories(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	engine.OnPrompt(text.NewLine("<100hp> "))
+	engine.OnPrompt(text.NewLine("<100hp> "), true)
 	deliverToolUse(t, engine, host, host.LLMCalls[0].ID, "tu-1", "recall", map[string]interface{}{
 		"query": "smithy",
 	})
@@ -693,7 +693,7 @@ func TestMemoryRecallToolOnEmptyStream(t *testing.T) {
 	defer cleanup()
 	startAgent(t, engine, host)
 
-	engine.OnPrompt(text.NewLine("<100hp> "))
+	engine.OnPrompt(text.NewLine("<100hp> "), true)
 	deliverToolUse(t, engine, host, host.LLMCalls[0].ID, "tu-1", "recall", map[string]interface{}{})
 
 	content, isError := lastToolResult(t, host)
@@ -718,7 +718,7 @@ func TestMemorySectionAppearsInObservation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	engine.OnPrompt(text.NewLine("<100hp> "))
+	engine.OnPrompt(text.NewLine("<100hp> "), true)
 
 	var body struct {
 		Messages []struct {
@@ -746,7 +746,7 @@ func TestMemorySectionOmittedWhenEmpty(t *testing.T) {
 	defer cleanup()
 	startAgent(t, engine, host)
 
-	engine.OnPrompt(text.NewLine("<100hp> "))
+	engine.OnPrompt(text.NewLine("<100hp> "), true)
 
 	if strings.Contains(host.LLMCalls[0].Req.Body, "What you've learned") {
 		t.Error("empty memory stream should contribute no section at all")

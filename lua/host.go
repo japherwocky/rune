@@ -30,11 +30,10 @@ type Host interface {
 	Print(text string)
 	PaneCreate(name string)
 	PaneWrite(name, text string)
-	PaneToggle(name string)
-	PaneSetVisible(name string, visible bool)
+	PaneReplace(name, text string)
 	PaneClear(name string)
-	ShowPicker(opts ui.ShowPickerMsg)
-	ShowSearch(opts ui.ShowSearchMsg)
+	ShowPicker(opts ui.PickerOptions)
+	ShowSearch(opts ui.SearchOptions)
 	ClipboardSet(text string)
 	GetInput() string
 	SetInput(text string)
@@ -55,6 +54,7 @@ type Host interface {
 	// Timers
 	TimerAfter(d time.Duration) int
 	TimerEvery(d time.Duration) int
+	TimerRemaining(id int) time.Duration
 	TimerCancel(id int)
 	TimerCancelAll()
 
@@ -72,7 +72,6 @@ type Host interface {
 	Env(name string) (string, bool)
 
 	// History
-	GetHistory() []string
 	GetHistoryEntries() []input.Submission
 	AddToHistory(cmd string)
 
@@ -128,7 +127,14 @@ type Host interface {
 	LLMRequest(id int, req LLMRequest)
 
 	// State
-	OnConfigChange()
+	// OnConfigChange applies one complete, validated configuration
+	// generation. It is separate from presentation invalidation so changing a
+	// setting cannot trigger Lua re-entry to rebuild binds, layout, and bars.
+	OnConfigChange(Config)
+	// OnPresentationChange notes that binds, layout, or placement visibility
+	// changed. The host may defer the resulting push until the current event
+	// finishes, so several changes from one callback publish one snapshot.
+	OnPresentationChange()
 }
 
 // HTTPRequest describes one request handed to Host.HTTPRequest.

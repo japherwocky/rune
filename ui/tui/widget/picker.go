@@ -3,6 +3,8 @@ package widget
 import (
 	"strings"
 
+	"github.com/charmbracelet/x/ansi"
+
 	"github.com/mmcdole/rune/text"
 	"github.com/mmcdole/rune/ui"
 	"github.com/mmcdole/rune/ui/tui/style"
@@ -26,7 +28,6 @@ type Picker struct {
 	scrollOff int
 	config    PickerConfig
 	styles    style.Styles
-	width     int
 }
 
 // NewPicker creates a new picker.
@@ -47,11 +48,6 @@ func NewPicker(config PickerConfig, styles style.Styles) *Picker {
 func (p *Picker) SetItems(items []ui.PickerItem) {
 	p.items = items
 	p.Reset()
-}
-
-// SetWidth updates the picker width.
-func (p *Picker) SetWidth(w int) {
-	p.width = w
 }
 
 // SetHeader updates the header text.
@@ -146,68 +142,44 @@ func (p *Picker) Selected() (ui.PickerItem, bool) {
 	return p.filtered[p.selected], true
 }
 
-// PreferredHeight returns the rendered height including border.
-func (p *Picker) PreferredHeight() int {
-	h := len(p.filtered)
-	if h > p.config.MaxVisible {
-		h = p.config.MaxVisible
-	}
-	if h == 0 {
-		h = 1 // "No matches" placeholder
-	}
-
-	if p.config.Header != "" {
-		h++
-	}
-
-	h += 2 // border
-	return h
+// resultHeight excludes the query and decoration owned by the input widget.
+func (p *Picker) resultHeight() int {
+	return max(1, min(len(p.filtered), p.config.MaxVisible))
 }
 
-// View renders the picker overlay.
-func (p *Picker) View() string {
-	var lines []string
-	overlay := p.styles.OverlayBorder
-	// Lipgloss Width includes padding but excludes the border. Derive both
-	// reservations from the style so later theme changes cannot introduce an
-	// uncounted soft-wrapped row.
-	frameWidth := max(1, p.width-overlay.GetHorizontalBorderSize())
-	contentWidth := max(1, frameWidth-overlay.GetHorizontalPadding())
-
-	if p.config.Header != "" {
-		header := p.styles.Muted.Render(text.VisualizeTerminalControls(p.config.Header, false)) +
-			text.VisualizeTerminalControls(p.query, false) + "█"
-		lines = append(lines, clipRow(header, contentWidth))
+func (p *Picker) resultRows(width, height int) []string {
+	if height <= 0 {
+		return nil
 	}
-
+	rows := make([]string, height)
 	if len(p.filtered) == 0 {
-		empty := "  " + text.VisualizeTerminalControls(p.config.EmptyText, false)
-		lines = append(lines, clipRow(p.styles.Muted.Render(empty), contentWidth))
-		content := strings.Join(lines, "\n")
-		return overlay.Width(frameWidth).Render(content)
+		rows[0] = util.ClipRow(p.styles.Muted.Render("  "+text.VisualizeTerminalControls(p.config.EmptyText, false)), width)
+		return rows
 	}
-
-	start := p.scrollOff
-	end := start + p.config.MaxVisible
-	if end > len(p.filtered) {
-		end = len(p.filtered)
-	}
-
-	for i := start; i < end; i++ {
-		item := p.filtered[i]
-		selected := i == p.selected
-
+	visible := min(height, len(p.filtered))
+	start := min(p.scrollOff, p.selected)
+	start = max(start, p.selected-visible+1)
+	start = max(0, min(start, len(p.filtered)-visible))
+	for n := 0; n < visible; n++ {
+		index := start + n
 		var positions []int
-		if i < len(p.matches) {
-			positions = p.matches[i].Positions
+		if index < len(p.matches) {
+			positions = p.matches[index].Positions
 		}
-
-		line := p.renderItem(item, contentWidth, selected, positions)
-		lines = append(lines, line)
+		rows[n] = p.renderItem(p.filtered[index], width, index == p.selected, positions)
 	}
+	return rows
+}
 
-	content := strings.Join(lines, "\n")
-	return overlay.Width(frameWidth).Render(content)
+func (p *Picker) queryLine(width int) string {
+	header := text.VisualizeTerminalControls(p.config.Header, false)
+	if ansi.StringWidth(header)+1 >= width {
+		header = ""
+	}
+	query := text.VisualizeTerminalControls(p.query, false)
+	available := max(0, width-ansi.StringWidth(header)-1)
+	query = ansi.TruncateLeft(query, max(0, ansi.StringWidth(query)-available), "")
+	return p.styles.Muted.Render(header) + query + "█"
 }
 
 func (p *Picker) renderItem(item ui.PickerItem, width int, selected bool, matches []int) string {
@@ -278,5 +250,5 @@ func (p *Picker) renderItem(item ui.PickerItem, width int, selected bool, matche
 	if width < 1 {
 		width = 1
 	}
-	return clipRow(prefixStyled+result.String(), width)
+	return util.ClipRow(prefixStyled+result.String(), width)
 }

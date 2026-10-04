@@ -53,7 +53,7 @@ func TestPerceptionDisabledByDefault(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	engine.CallHook("gmcp_enabled")
+	engine.NotifyGMCPEnabled()
 	for _, send := range host.GMCPSends {
 		if send.Package == "Core.Supports.Set" {
 			t.Fatalf("perception subscribed to GMCP before enable(): %v", send)
@@ -83,7 +83,7 @@ func TestPerceptionEnableDisableToggle(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	engine.CallHook("gmcp_enabled")
+	engine.NotifyGMCPEnabled()
 	found := false
 	for _, send := range host.GMCPSends {
 		if send.Package == "Core.Supports.Set" {
@@ -272,7 +272,7 @@ func TestPerceptionDisconnectResetsModel(t *testing.T) {
 // inferred from exits, never attributed across an unrelated
 // (non-movement) input.
 func TestPerceptionMapRecordsEdgeOnlyAfterMove(t *testing.T) {
-	engine, _, cleanup := setupTest(t)
+	engine, host, cleanup := setupTest(t)
 	defer cleanup()
 	enablePerception(t, engine)
 
@@ -287,7 +287,7 @@ func TestPerceptionMapRecordsEdgeOnlyAfterMove(t *testing.T) {
 	}
 
 	// A real move: north from 3001 lands in 3002.
-	engine.OnInput("north")
+	commitAndDispatchTestCommand(t, engine, host, "north")
 	engine.OnGMCP("Room.Info", `{"num":3002,"name":"Temple","area":"Midgaard","exits":["south"]}`)
 	if err := engine.DoString("check-edge", `
 		local m = rune.perception.map()
@@ -299,7 +299,7 @@ func TestPerceptionMapRecordsEdgeOnlyAfterMove(t *testing.T) {
 
 	// A non-movement command, then an unrelated room change (e.g. a
 	// teleport): must NOT be recorded as a "south" edge from 3002.
-	engine.OnInput("look")
+	commitAndDispatchTestCommand(t, engine, host, "look")
 	engine.OnGMCP("Room.Info", `{"num":3099,"name":"Elsewhere","area":"Midgaard","exits":["south"]}`)
 	if err := engine.DoString("check-no-bogus-edge", `
 		local m = rune.perception.map()

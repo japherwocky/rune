@@ -1,30 +1,17 @@
 package style
 
-import (
-	"strings"
-
-	"github.com/charmbracelet/lipgloss"
-)
-
-// RenderBorder returns a horizontal border line with dim styling.
-// An empty char draws the default rule.
-func RenderBorder(width int, char string) string {
-	if char == "" {
-		char = "─"
-	}
-	return "\x1b[90m" + strings.Repeat(char, width) + "\x1b[0m"
-}
+import "charm.land/lipgloss/v2"
 
 // Styles holds the lipgloss styles the widgets render with. Server
 // output and bar/status text arrive pre-styled from Lua (rune.style);
-// only chrome the TUI draws itself is styled here.
+// text, borders, and labels drawn by the TUI are styled here.
 type Styles struct {
 	// Input
-	InputText   lipgloss.Style
-	InputCursor lipgloss.Style
+	InputText     lipgloss.Style
+	InputCursor   lipgloss.Style
+	InputSelected lipgloss.Style // whole-line keep-input selection
 
 	// Picker overlay
-	OverlayBorder        lipgloss.Style
 	OverlaySelected      lipgloss.Style
 	OverlayNormal        lipgloss.Style
 	OverlayMatch         lipgloss.Style
@@ -47,12 +34,9 @@ func DefaultStyles() Styles {
 		InputCursor: lipgloss.NewStyle().
 			Background(lipgloss.Color("255")).
 			Foreground(lipgloss.Color("0")),
+		InputSelected: lipgloss.NewStyle().Reverse(true),
 
 		// Picker overlay (slash picker, fuzzy search)
-		OverlayBorder: lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color("62")).
-			Padding(0, 1),
 		OverlaySelected: lipgloss.NewStyle().
 			Background(lipgloss.Color("62")).
 			Foreground(lipgloss.Color("230")),

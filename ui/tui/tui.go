@@ -1,46 +1,79 @@
 package tui
 
 import (
+	"io"
 	"os"
 	"os/exec"
 	"runtime"
 	"strings"
 	"sync"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/mmcdole/rune/input"
 	"github.com/mmcdole/rune/ui"
 )
 
-// BubbleTeaUI implements interfaces.UI using Bubble Tea.
-// It bridges the existing channel-based architecture with Bubble Tea's
-// model/update/view event loop.
+// BubbleTeaUI implements ui.UI with Bubble Tea.
 type BubbleTeaUI struct {
-	program   *tea.Program
-	inputChan chan input.Submission
+	program      *tea.Program // Published by closing programReady; never changed afterward.
+	programReady chan struct{}
+	output       io.Writer
 
 	// Message queue - buffered channel drained by a single goroutine.
 	// This decouples callers from tea.Program.Send() which can block.
 	msgQueue chan tea.Msg
 
-	// Outbound messages from UI to Session (e.g., ExecuteBindMsg, WindowSizeChangedMsg)
-	// Session reads from this channel in its event loop.
-	outbound chan ui.UIEvent
+	// Events from UI to Session. One bounded queue preserves the order of
+	// draft changes, submissions, binds, picker results, and window changes.
+	events chan ui.UIEvent
 
 	// Shutdown coordination
 	done     chan struct{}
 	doneOnce sync.Once
+
+	keypadMu         sync.Mutex
+	keypadConfigured bool
+	keypadEnabled    bool
 }
 
 // NewBubbleTeaUI creates a new Bubble Tea-based UI.
 func NewBubbleTeaUI() *BubbleTeaUI {
 	return &BubbleTeaUI{
-		inputChan: make(chan input.Submission, 2048),
-		msgQueue:  make(chan tea.Msg, 4096),
-		outbound:  make(chan ui.UIEvent, 256),
-		done:      make(chan struct{}),
+		msgQueue:     make(chan tea.Msg, 4096),
+		events:       make(chan ui.UIEvent, 2048),
+		programReady: make(chan struct{}),
+		done:         make(chan struct{}),
+		output:       os.Stdout,
 	}
+}
+
+func keypadModeSequence(enabled bool) string {
+	if enabled {
+		return ansi.KeypadApplicationMode
+	}
+	return ansi.KeypadNumericMode
+}
+
+func (b *BubbleTeaUI) writeKeypadMode(enabled bool) error {
+	_, err := io.WriteString(b.output, keypadModeSequence(enabled))
+	return err
+}
+
+func (b *BubbleTeaUI) updateKeypadMode(enabled bool) bool {
+	b.keypadMu.Lock()
+	defer b.keypadMu.Unlock()
+	changed := !b.keypadConfigured || b.keypadEnabled != enabled
+	b.keypadConfigured = true
+	b.keypadEnabled = enabled
+	return changed
+}
+
+func (b *BubbleTeaUI) keypadMode() bool {
+	b.keypadMu.Lock()
+	defer b.keypadMu.Unlock()
+	return b.keypadEnabled
 }
 
 // send queues a message for delivery to the Bubble Tea program.
@@ -54,77 +87,80 @@ func (b *BubbleTeaUI) send(msg tea.Msg) {
 	}
 }
 
-// Print appends text to the main scrollback buffer.
-// All output (server lines, Lua prints) goes through this single method.
+// Print appends server lines and Lua output to scrollback.
 func (b *BubbleTeaUI) Print(text string) {
-	b.send(ui.PrintLineMsg(text))
+	b.send(printLineMsg(text))
 }
 
-// Echo appends an already-styled local echo to scrollback. Styling is
-// Lua policy (the "echo" hook); this method is transport only.
+// Echo appends an already-styled local echo to scrollback. Styling is Lua
+// policy (the "echo" hook); this adapter only delivers it for presentation.
 func (b *BubbleTeaUI) Echo(line string) {
-	b.send(ui.EchoLineMsg(line))
+	b.send(echoLineMsg(line))
 }
 
-// SetPrompt updates the active server prompt (overlay at bottom).
+// SetPrompt replaces the prompt overlay.
 func (b *BubbleTeaUI) SetPrompt(text string) {
-	b.send(ui.PromptMsg(text))
+	b.send(setPromptMsg(text))
 }
 
-// Input returns channel for user input.
-func (b *BubbleTeaUI) Input() <-chan input.Submission {
-	return b.inputChan
+// CommitPrompt moves the prompt overlay to scrollback in one update.
+func (b *BubbleTeaUI) CommitPrompt(text string) {
+	b.send(commitPromptMsg(text))
 }
 
 // Run starts the TUI and blocks until exit.
-func (b *BubbleTeaUI) Run() error {
-	model := NewModel(b.inputChan, b.outbound)
-
-	opts := []tea.ProgramOption{
-		tea.WithAltScreen(),
-		tea.WithMouseCellMotion(),
+func (b *BubbleTeaUI) Run() (err error) {
+	select {
+	case <-b.done:
+		return nil // Quit during boot; do not open the TUI.
+	default:
 	}
-	// On Windows, resize events only arrive through the console input
-	// reader, which bubbletea engages only when the input is os.Stdin
-	// itself. WithInputTTY opens CONIN$ as a separate handle, so bubbletea
-	// silently falls back to its ANSI reader and window resizes (and
-	// native mouse events) are never delivered.
-	if runtime.GOOS != "windows" {
-		opts = append(opts, tea.WithInputTTY())
-	}
-	b.program = tea.NewProgram(model, opts...)
 
-	// Single goroutine drains message queue to Bubble Tea.
-	// This can block on Send() without affecting producers.
+	model := NewModel(b.events)
+	model.renderInterval = defaultRenderInterval
+	program := tea.NewProgram(model, tea.WithOutput(b.output))
+	b.program = program
+	close(b.programReady)
+
+	defer func() {
+		if resetErr := b.writeKeypadMode(false); err == nil {
+			err = resetErr
+		}
+		// The queue is deliberately never closed: send races the done signal
+		// in a select, and closing it would make a late Print panic.
+		b.doneOnce.Do(func() {
+			close(b.done)
+		})
+	}()
+
+	// One goroutine owns delivery to Bubble Tea, including shutdown. Send
+	// waits for Run to start, so a Quit during setup is delivered then.
 	go func() {
 		for {
+			// Prefer shutdown even when the queue is full.
 			select {
 			case <-b.done:
+				program.Quit()
+				return
+			default:
+			}
+			select {
+			case <-b.done:
+				program.Quit()
 				return
 			case msg := <-b.msgQueue:
-				b.program.Send(msg)
+				program.Send(msg)
 			}
 		}
 	}()
 
 	// Run blocks until quit
-	_, err := b.program.Run()
-
-	// Signal shutdown. The queue is deliberately never closed: send()
-	// races the done signal in a select, and closing the channel would
-	// turn a late Print from the session into a send-on-closed panic.
-	b.doneOnce.Do(func() {
-		close(b.done)
-	})
-
+	_, err = program.Run()
 	return err
 }
 
 // Quit signals the TUI to exit.
 func (b *BubbleTeaUI) Quit() {
-	if b.program != nil {
-		b.program.Quit()
-	}
 	b.doneOnce.Do(func() {
 		close(b.done)
 	})
@@ -132,85 +168,92 @@ func (b *BubbleTeaUI) Quit() {
 
 // CreatePane creates a new named pane.
 func (b *BubbleTeaUI) CreatePane(name string) {
-	b.send(ui.PaneCreateMsg{Name: name})
+	b.send(paneCreateMsg{Name: name})
 }
 
 // WritePane writes a line to a named pane.
 func (b *BubbleTeaUI) WritePane(name, text string) {
-	b.send(ui.PaneWriteMsg{Name: name, Text: text})
+	b.send(paneWriteMsg{Name: name, Text: text})
 }
 
-// TogglePane toggles visibility of a named pane.
-func (b *BubbleTeaUI) TogglePane(name string) {
-	b.send(ui.PaneToggleMsg{Name: name})
-}
-
-// SetPaneVisible shows or hides a named pane.
-func (b *BubbleTeaUI) SetPaneVisible(name string, visible bool) {
-	b.send(ui.PaneSetVisibleMsg{Name: name, Visible: visible})
+// ReplacePane empties a named pane and writes text as one update.
+func (b *BubbleTeaUI) ReplacePane(name, text string) {
+	b.send(paneReplaceMsg{Name: name, Text: text})
 }
 
 // ClearPane clears the contents of a named pane.
 func (b *BubbleTeaUI) ClearPane(name string) {
-	b.send(ui.PaneClearMsg{Name: name})
+	b.send(paneClearMsg{Name: name})
 }
 
 // --- Push-based messages from Session to UI ---
 
 // UpdateBars sends rendered bar content from Session to UI.
 func (b *BubbleTeaUI) UpdateBars(content map[string]ui.BarContent) {
-	b.send(ui.UpdateBarsMsg(content))
+	b.send(updateBarsMsg(content))
 }
 
 // UpdateBinds sends the current set of bound keys from Session to UI.
-func (b *BubbleTeaUI) UpdateBinds(keys map[string]bool) {
-	b.send(ui.UpdateBindsMsg(keys))
+func (b *BubbleTeaUI) UpdateBinds(keys input.Bindings) {
+	b.send(updateBindsMsg(keys))
 }
 
-// UpdateLayout sends layout configuration from Session to UI.
-func (b *BubbleTeaUI) UpdateLayout(top, bottom []ui.LayoutEntry) {
-	b.send(ui.UpdateLayoutMsg{Top: top, Bottom: bottom})
+// UpdateLayout sends the canonical layout tree from Session to UI.
+func (b *BubbleTeaUI) UpdateLayout(layout ui.LayoutTree) {
+	b.send(updateLayoutMsg(layout))
+}
+
+// UpdateConfig sends UI-facing configuration from Session to UI.
+func (b *BubbleTeaUI) UpdateConfig(cfg ui.Config) {
+	keypadChanged := b.updateKeypadMode(cfg.Numpad)
+	b.send(updateConfigMsg(cfg))
+	if keypadChanged {
+		b.send(tea.RawMsg{Msg: keypadModeSequence(cfg.Numpad)})
+	}
 }
 
 // ShowPicker displays a picker overlay with items.
-func (b *BubbleTeaUI) ShowPicker(opts ui.ShowPickerMsg) {
-	b.send(opts)
+func (b *BubbleTeaUI) ShowPicker(opts ui.PickerOptions) {
+	b.send(showPickerMsg{options: opts})
 }
 
 // ShowSearch opens the scrollback-search overlay.
-func (b *BubbleTeaUI) ShowSearch(opts ui.ShowSearchMsg) {
-	b.send(opts)
+func (b *BubbleTeaUI) ShowSearch(opts ui.SearchOptions) {
+	b.send(showSearchMsg{options: opts})
 }
 
 // SetClipboard asks the terminal to set the system clipboard.
 func (b *BubbleTeaUI) SetClipboard(text string) {
-	b.send(ui.SetClipboardMsg(text))
+	b.send(setClipboardMsg(text))
 }
 
 // SetInput sets the input line content.
 func (b *BubbleTeaUI) SetInput(text string) {
-	b.send(ui.SetInputMsg(text))
+	b.send(setInputMsg(text))
 }
 
 // SetInputSubmission restores input text with an explicit interpretation.
 func (b *BubbleTeaUI) SetInputSubmission(submission input.Submission) {
-	b.send(ui.SetInputSubmissionMsg(submission))
+	b.send(setInputSubmissionMsg(submission))
 }
 
 // --- Input Primitives for Lua ---
 
 // InputSetCursor sets the widget cursor to a zero-based rune offset.
 func (b *BubbleTeaUI) InputSetCursor(pos int) {
-	b.send(ui.InputSetCursorMsg(pos))
+	b.send(inputSetCursorMsg(pos))
 }
 
 // OpenEditor opens $EDITOR with the given initial text.
 // Returns the edited content and whether the edit was successful.
 func (b *BubbleTeaUI) OpenEditor(initial string) (string, bool) {
 	// This is synchronous - we need to suspend the TUI
-	if b.program == nil {
+	select {
+	case <-b.programReady:
+	default:
 		return "", false
 	}
+	program := b.program
 
 	// Create temp file
 	f, err := os.CreateTemp("", "rune-input-*.txt")
@@ -228,9 +271,11 @@ func (b *BubbleTeaUI) OpenEditor(initial string) (string, bool) {
 	}
 
 	// Suspend TUI
-	if err := b.program.ReleaseTerminal(); err != nil {
+	if err := program.ReleaseTerminal(); err != nil {
+		_ = b.writeKeypadMode(false)
 		return "", false
 	}
+	_ = b.writeKeypadMode(false)
 
 	// Run editor. The fallback must exist on the platform: vi ships
 	// with effectively every Unix, notepad with every Windows.
@@ -247,17 +292,11 @@ func (b *BubbleTeaUI) OpenEditor(initial string) (string, bool) {
 	err = cmd.Run()
 
 	// Resume TUI
-	restoreErr := b.program.RestoreTerminal()
+	restoreErr := program.RestoreTerminal()
 	if restoreErr == nil {
-		// Bubble Tea disables mouse reporting in ReleaseTerminal but does
-		// not restore it in RestoreTerminal.
-		b.program.Send(tea.EnableMouseCellMotion())
+		_ = b.writeKeypadMode(b.keypadMode())
 	}
-	if err == nil && restoreErr != nil {
-		err = restoreErr
-	}
-
-	if err != nil {
+	if err != nil || restoreErr != nil {
 		return "", false
 	}
 
@@ -282,28 +321,25 @@ func normalizeEditorText(content string) string {
 
 // PaneScrollUp scrolls a pane up by N lines.
 func (b *BubbleTeaUI) PaneScrollUp(name string, lines int) {
-	b.send(ui.PaneScrollUpMsg{Name: name, Lines: lines})
+	b.send(paneScrollUpMsg{Name: name, Lines: lines})
 }
 
 // PaneScrollDown scrolls a pane down by N lines.
 func (b *BubbleTeaUI) PaneScrollDown(name string, lines int) {
-	b.send(ui.PaneScrollDownMsg{Name: name, Lines: lines})
+	b.send(paneScrollDownMsg{Name: name, Lines: lines})
 }
 
 // PaneScrollToTop scrolls a pane to the top.
 func (b *BubbleTeaUI) PaneScrollToTop(name string) {
-	b.send(ui.PaneScrollToTopMsg{Name: name})
+	b.send(paneScrollToTopMsg{Name: name})
 }
 
 // PaneScrollToBottom scrolls a pane to the bottom.
 func (b *BubbleTeaUI) PaneScrollToBottom(name string) {
-	b.send(ui.PaneScrollToBottomMsg{Name: name})
+	b.send(paneScrollToBottomMsg{Name: name})
 }
 
-// --- Outbound messages from UI to Session ---
-
-// Outbound returns a channel of messages from UI to Session.
-// Session should read from this channel in its event loop.
-func (b *BubbleTeaUI) Outbound() <-chan ui.UIEvent {
-	return b.outbound
+// Events returns the ordered stream of user actions and UI state changes.
+func (b *BubbleTeaUI) Events() <-chan ui.UIEvent {
+	return b.events
 }

@@ -76,7 +76,7 @@ func TestAgentPromptWakesAndSendsRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	engine.OnPrompt(text.NewLine("<100hp 100mv> "))
+	engine.OnPrompt(text.NewLine("<100hp 100mv> "), true)
 
 	if len(host.LLMCalls) != 1 {
 		t.Fatalf("expected 1 LLM call after a prompt, got %d", len(host.LLMCalls))
@@ -127,14 +127,14 @@ func TestAgentSingleFlightThenCoalescedRewake(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	engine.OnPrompt(text.NewLine("prompt 1"))
+	engine.OnPrompt(text.NewLine("prompt 1"), true)
 	if len(host.LLMCalls) != 1 {
 		t.Fatalf("expected 1 LLM call, got %d", len(host.LLMCalls))
 	}
 
 	// A second wake while the first think is in flight must not launch
 	// a second call (single-flight).
-	engine.OnPrompt(text.NewLine("prompt 2"))
+	engine.OnPrompt(text.NewLine("prompt 2"), true)
 	if len(host.LLMCalls) != 1 {
 		t.Fatalf("single-flight violated: expected still 1 LLM call, got %d", len(host.LLMCalls))
 	}
@@ -171,7 +171,7 @@ func TestAgentToolUseDispatchAndContinuesTurn(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	engine.OnPrompt(text.NewLine("prompt"))
+	engine.OnPrompt(text.NewLine("prompt"), true)
 	if len(host.LLMCalls) != 1 {
 		t.Fatalf("expected 1 LLM call, got %d", len(host.LLMCalls))
 	}
@@ -262,7 +262,7 @@ func TestAgentUnknownToolReportsErrorInToolResult(t *testing.T) {
 	if err := engine.DoString("start", `rune.agent.start({ model = "claude-haiku-4-5" })`); err != nil {
 		t.Fatal(err)
 	}
-	engine.OnPrompt(text.NewLine("prompt"))
+	engine.OnPrompt(text.NewLine("prompt"), true)
 
 	engine.OnLLMResult(host.LLMCalls[0].ID, &HTTPResponse{
 		Status: 200,
@@ -399,7 +399,7 @@ func TestAgentStopUnwindsAndDropsInFlightResult(t *testing.T) {
 	if err := engine.DoString("start", `rune.agent.start({ model = "claude-haiku-4-5" })`); err != nil {
 		t.Fatal(err)
 	}
-	engine.OnPrompt(text.NewLine("prompt"))
+	engine.OnPrompt(text.NewLine("prompt"), true)
 	if len(host.LLMCalls) != 1 {
 		t.Fatalf("expected 1 LLM call in flight, got %d", len(host.LLMCalls))
 	}
@@ -435,7 +435,7 @@ func TestAgentStopUnwindsAndDropsInFlightResult(t *testing.T) {
 	// The prompt hook itself must be gone, not just internally
 	// disabled - firing a prompt post-stop should not even set the
 	// wake flag.
-	engine.OnPrompt(text.NewLine("prompt after stop"))
+	engine.OnPrompt(text.NewLine("prompt after stop"), true)
 	if err := engine.DoString("check-hook-removed", `assert(rune.agent.status().wake_pending == false)`); err != nil {
 		t.Fatal(err)
 	}

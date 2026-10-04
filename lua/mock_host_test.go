@@ -1,15 +1,17 @@
 package lua
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
-	"strconv"
 	"sync"
 	"time"
 
 	"github.com/mmcdole/rune/input"
 	"github.com/mmcdole/rune/ui"
 )
+
+var errNotConnected = errors.New("not connected")
 
 // Compile-time check that MockHost implements Host
 var _ Host = (*MockHost)(nil)
@@ -19,17 +21,19 @@ type MockHost struct {
 	mu sync.Mutex
 
 	// Captured calls
-	SendCalls       []string
-	PrintCalls      []string
-	QuitCalled      bool
-	ConnectCalls    []string
-	DisconnectCalls int
-	ReloadCalls     int
-	PaneCalls       []struct{ Op, Name, Data string }
-	PickerCalls     []ui.ShowPickerMsg
-	SearchCalls     []ui.ShowSearchMsg
-	ClipboardCalls  []string
-	ScheduledTimers []struct {
+	SendCalls           []string
+	PrintCalls          []string
+	QuitCalled          bool
+	ConnectCalls        []string
+	DisconnectCalls     int
+	ReloadCalls         int
+	PaneCalls           []struct{ Op, Name, Data string }
+	PickerCalls         []ui.PickerOptions
+	SearchCalls         []ui.SearchOptions
+	ClipboardCalls      []string
+	ConfigChanges       []Config
+	PresentationChanges int
+	ScheduledTimers     []struct {
 		ID       int
 		Duration time.Duration
 		Repeat   bool
@@ -37,6 +41,8 @@ type MockHost struct {
 
 	// Timer ID generation
 	nextTimerID int
+	// Explicit snapshots supplied by tests; the mock does not run a clock.
+	TimerRemainingByID map[int]time.Duration
 
 	// When set, Send fails with this error instead of recording the call
 	SendErr error
@@ -79,8 +85,7 @@ type MockHost struct {
 	InputCursor int
 	InputMode   input.SubmissionMode
 
-	// Command history returned by GetHistory, oldest first
-	History        []string
+	// Command history, oldest first.
 	HistoryEntries []input.Submission
 }
 
@@ -172,16 +177,10 @@ func (m *MockHost) PaneWrite(name, text string) {
 	m.PaneCalls = append(m.PaneCalls, struct{ Op, Name, Data string }{"write", name, text})
 }
 
-func (m *MockHost) PaneToggle(name string) {
+func (m *MockHost) PaneReplace(name, text string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.PaneCalls = append(m.PaneCalls, struct{ Op, Name, Data string }{"toggle", name, ""})
-}
-
-func (m *MockHost) PaneSetVisible(name string, visible bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.PaneCalls = append(m.PaneCalls, struct{ Op, Name, Data string }{"set_visible", name, strconv.FormatBool(visible)})
+	m.PaneCalls = append(m.PaneCalls, struct{ Op, Name, Data string }{"replace", name, text})
 }
 
 func (m *MockHost) PaneClear(name string) {
@@ -190,17 +189,41 @@ func (m *MockHost) PaneClear(name string) {
 	m.PaneCalls = append(m.PaneCalls, struct{ Op, Name, Data string }{"clear", name, ""})
 }
 
-func (m *MockHost) OnConfigChange() {
-	// No-op for tests - config change notifications not tracked
+func (m *MockHost) OnPresentationChange() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.PresentationChanges++
 }
 
-func (m *MockHost) ShowPicker(opts ui.ShowPickerMsg) {
+func (m *MockHost) OnConfigChange(config Config) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ConfigChanges = append(m.ConfigChanges, config)
+}
+
+func (m *MockHost) DrainConfigChanges() []Config {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	changes := append([]Config(nil), m.ConfigChanges...)
+	m.ConfigChanges = nil
+	return changes
+}
+
+func (m *MockHost) DrainPresentationChanges() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	changes := m.PresentationChanges
+	m.PresentationChanges = 0
+	return changes
+}
+
+func (m *MockHost) ShowPicker(opts ui.PickerOptions) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.PickerCalls = append(m.PickerCalls, opts)
 }
 
-func (m *MockHost) ShowSearch(opts ui.ShowSearchMsg) {
+func (m *MockHost) ShowSearch(opts ui.SearchOptions) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.SearchCalls = append(m.SearchCalls, opts)
@@ -212,30 +235,10 @@ func (m *MockHost) ClipboardSet(text string) {
 	m.ClipboardCalls = append(m.ClipboardCalls, text)
 }
 
-func (m *MockHost) GetHistory() []string {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.HistoryEntries != nil {
-		result := make([]string, len(m.HistoryEntries))
-		for i, entry := range m.HistoryEntries {
-			result[i] = entry.Text
-		}
-		return result
-	}
-	return append([]string(nil), m.History...)
-}
-
 func (m *MockHost) GetHistoryEntries() []input.Submission {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.HistoryEntries != nil {
-		return append([]input.Submission(nil), m.HistoryEntries...)
-	}
-	result := make([]input.Submission, len(m.History))
-	for i, text := range m.History {
-		result[i] = input.Command(text)
-	}
-	return result
+	return append([]input.Submission(nil), m.HistoryEntries...)
 }
 
 func (m *MockHost) SessionSet(key, value string) {
@@ -294,10 +297,13 @@ func (m *MockHost) Env(name string) (string, bool) {
 func (m *MockHost) AddToHistory(cmd string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.History = append(m.History, cmd)
-	if m.HistoryEntries != nil {
-		m.HistoryEntries = append(m.HistoryEntries, input.Command(cmd))
+	// Mirror the session's contract: skip empty and adjacent-duplicate
+	// entries, so Lua-layer tests observe real history semantics.
+	entry := input.Command(cmd)
+	if cmd == "" || (len(m.HistoryEntries) > 0 && m.HistoryEntries[len(m.HistoryEntries)-1] == entry) {
+		return
 	}
+	m.HistoryEntries = append(m.HistoryEntries, entry)
 }
 
 func (m *MockHost) LogStart(path string) (string, error) {
@@ -402,7 +408,7 @@ func (m *MockHost) SetInput(text string) {
 	switch {
 	case text == "":
 		m.InputMode = input.ModeCommand
-	case m.InputMode == input.ModeVerbatim || input.RequiresVerbatim(text):
+	case m.InputMode == input.ModeVerbatim || input.RequiresStructuredEditor(text):
 		m.InputMode = input.ModeVerbatim
 	default:
 		m.InputMode = input.ModeCommand
@@ -476,6 +482,12 @@ func (m *MockHost) TimerEvery(d time.Duration) int {
 		Repeat   bool
 	}{id, d, true})
 	return id
+}
+
+func (m *MockHost) TimerRemaining(id int) time.Duration {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.TimerRemainingByID[id]
 }
 
 func (m *MockHost) TimerCancel(id int) {

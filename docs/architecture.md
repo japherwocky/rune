@@ -1,13 +1,15 @@
 # Rune Architecture
 
-Rune is a modern, highly scriptable MUD client written in Go. Its architecture is defined by a strict separation between **Mechanism** (Go) and **Policy** (Lua).
+Rune is a terminal MUD client written in Go with Lua scripting. Go runs the
+network connection, event loops, and terminal renderer. Lua scripts configure
+the layout and define commands, aliases, triggers, key bindings, and bars.
 
-The core design philosophy aligns with tools like Neovim or WezTerm: the binary provides a high-performance, concurrent runtime and rendering engine, while the user experience, layout, and game logic are defined in Lua scripts.
+## 1. Go and Lua responsibilities
 
-## 1. Core Philosophy: Mechanism vs. Policy
-
-- **Mechanism (Go):** Handles concurrency, TCP/Telnet protocol parsing, TUI rendering, timer scheduling, and file I/O. It knows *how* to draw a list of items or establish a socket connection, but it doesn't determine *when* to do so.
-- **Policy (Lua):** Handles keybindings, layout configuration, aliases, triggers, and UI logic. It decides *what* to draw and *how* to react to user input.
+- **Go:** Concurrency, TCP/Telnet parsing, terminal rendering, editing,
+  timer scheduling, and file I/O.
+- **Lua:** Key bindings, layout declarations, aliases, triggers, commands,
+  and bar renderers.
 
 ### Example
 
@@ -26,6 +28,8 @@ graph TD
 
     subgraph "Core Domain (Session Loop)"
         Session[Session Orchestrator]
+        PartialLine[Partial Server Line]
+        Protocol[network.Protocol<br/>Session-confined]
         Lua[Lua VM]
         Timer[Timer Service]
     end
@@ -37,45 +41,75 @@ graph TD
     end
 
     %% Data Flow
-    Input -->|Msg: Key/Intents| Session
-    NetRead -->|Msg: Server Line| Session
+    Input -->|Ordered UIEvent: input/actions/state| Session
+    NetRead --> Parser
+    Parser -->|Inbound: Session-facing EventBatch| Session
     Timer -->|Msg: Tick| Session
 
-    Session -->|Update: Layout/Content| Model
-    Session -->|Write Data| NetWrite
+    Session -->|Process batch| Protocol
+    Protocol -->|Ordered effects| Session
+    Session --> PartialLine
+    Session -->|Update: LayoutTree/Bars/Content| Model
+    Session -->|Connection-scoped write| NetWrite
     Session -->|Exec| Lua
 ```
 
 ## 2.1 The Session (The Orchestrator)
 
-The `Session` struct is the heart of the application. It owns the main event loop.
+The `Session` struct runs the main application event loop.
 
-- **Responsibility:** It serializes all logic. Network events, user input, and timers are all channeled into the Session loop.
-- **Thread Safety:** Because all logic (including Lua execution) happens sequentially in this loop, Lua scripts do not need locks.
-- **State:** Owns the Lua Engine, Network Client, and Timer Service.
+- **Responsibility:** It serializes application-state changes and Lua calls.
+  Network events, UI events, and timers all enter through the Session loop.
+- **Thread Safety:** Because Session and Lua mutations happen sequentially in
+  this loop, Lua scripts do not need locks. Network I/O and UI rendering keep
+  their own goroutines without sharing that mutable state.
+- **State:** Owns the Lua Engine, Network Client, Timer Service, and the one
+  mutable partial server line.
 
 ### The Inner Loop
 
-`Session.processEvents` (`session/session.go`) is the single dispatch point. Its `select` is the complete inventory of what can happen in the client - each channel is a typed lane with one handler:
+`Session.processEvents` (`session/session.go`) is the single dispatch point. Its `select` is the complete inventory of application work in the client - each channel is a typed lane with one handler, plus context cancellation for shutdown:
 
 | Lane | Carries | Handler |
 |---|---|---|
-| `ui.Outbound()` | UI intents (keys, resize, picker, input edits) | `handleUIMessage` |
-| `ui.Input()` | Submitted input (`input.Submission`, command or verbatim) | `handleSubmission` |
-| `net.Output()` | Server lines, prompts, GMCP, disconnect (`network.Output`) | `handleNetworkOutput` |
+| `ui.Events()` | One ordered stream of `ui.UIEvent`: draft changes, `InputSubmittedMsg`, binds, picker results, and view state | `handleUIEvent` |
+| `net.Inbound()` | One owned `network.EventBatch` or disconnect, tagged with its connection ID (`network.Inbound`) | `handleInbound` |
 | `timerEvents` | Due Lua timers | `engine.OnTimer` |
-| `barTicker` | 250ms bar repaint tick | `pushBarUpdates` |
-| `asyncResults` | Continuations of Session's own async work (dial, HTTP, deferred reload), as `func()` | run the closure |
+| `barTicker` | 250ms bar update tick | `pushBarUpdates` |
+| `internalEvents` | Typed results and deferred work owned by Session (`connectFinished`, `httpFinished`, `reloadRequested`) | `handleInternalEvent` |
 
-Lanes carrying cross-domain data are typed; `asyncResults` is deliberately not - it carries the second half of Session methods that had to leave the goroutine for a blocking step, and only the `session` package may send on it. Each lane is FIFO; ordering across lanes is undefined. To answer "what can this client react to?", read the `select`.
+Session-owned background work publishes inert data through `internalEvents`; it
+never sends closures that hide later state mutations. Session applies those
+results on its event loop like every other event. Each lane is FIFO; ordering
+across lanes is undefined. The single UI lane also preserves order among all
+accepted UI events: for example, a draft change cannot be observed after the
+submission made from that draft. To answer "what can this client react to?",
+read the `select`.
 
-## 2.2 The UI (The Dumb Terminal)
+## 2.2 The UI (Presentation and Input Mechanics)
 
-The UI layer (built with Bubble Tea) is deliberately "dumb."
+The UI layer (built with Bubble Tea) owns terminal interaction mechanics, not
+application policy.
 
-- **No Logic:** It does not know what "Slash Mode" or "History Search" is.
+- **Interaction mechanics:** It owns editing, draft editor mode, picker and search
+  modes, output scrolling, wrapping, and render throttling.
+- **Application policy:** Lua decides which binds, bars, layouts, triggers, and
+  commands exist. The UI never calls Lua directly.
 - **Push Architecture:** It renders based entirely on state snapshots pushed to it by the Session.
-- **Outbound:** It sends generic intents (for example `ExecuteBindMsg`, `SetInputMsg`) back to the Session via a buffered channel.
+- **Ordered events:** It sends typed actions and state changes (for example
+  `ExecuteBindMsg`, `InputChangedMsg`, `PickerSelectMsg`, and `InputSubmittedMsg`)
+  through one bounded `Events()` channel.
+
+Bubble Tea's update/render goroutine never blocks waiting for Session to drain
+that channel; every event is offered with the same non-blocking send. An
+`InputSubmittedMsg` atomically carries both the immutable authored submission
+and the editable draft that should follow it. Once Session accepts the event,
+the UI applies that same post-submit state locally; Session mirrors it and
+finishes the partial prompt, then calls `input_changed` when the draft text
+changed, before processing the submitted lines. If the queue is full,
+the UI leaves a submission in the draft editor and shows a warning. Other rejected
+events are dropped with a warning. This keeps the UI responsive without
+silently losing typed input.
 
 ## 2.3 The Lua Engine
 
@@ -84,6 +118,8 @@ implements by default and the LuaJIT backend implements under `-tags luajit`.
 
 - **Single Host interface:** The Engine depends on one `lua.Host` interface (`lua/host.go`). Session implements it, with the methods grouped by service area across `session/lua_*.go` (network, ui, timers, system, history, session, store, log, state). Tests substitute a mock Host.
 - **Reactivity:** The Engine updates a global `rune.state` table whenever system state changes (connection, scroll position), allowing scripts to reactively render UI elements.
+- **Submitted lines:** Session owns `submit` in `session/submission.go`. Its loop calls `Engine.ProcessSubmittedLine`, echoes the surviving text, then calls `Engine.ExecuteInputLine`. Lua expands history and runs input hooks in the first call, and executes local commands or game sends in the second. The pause between them lets Go echo the actual text before execution produces effects. See the submission flow below.
+- **Staged config publication:** Go owns the typed config schema and defaults. Core scripts, user scripts, and ready hooks evaluate `rune.config.set` against a staged candidate during startup or reload; after they finish, Engine publishes one complete snapshot to Session. Later runtime updates publish immediately through a dedicated callback that does not re-enter Lua.
 
 ## 3. UI Architecture: The "Push" Model
 
@@ -91,35 +127,101 @@ To solve thread-safety issues between the UI rendering loop and the Lua executio
 
 ### 3.1 Layout and Bars
 
-User scripts define layouts and status bars using Lua functions.
+Lua core declares the normal layout; Go provides a minimal output/input recovery
+tree. The Lua parser checks table types and the exactly-one-input invariant.
+`ui.NormalizeLayoutTree` validates structure and copies the declaration with
+axis-aware size defaults. `ui.LayoutTree` is the shared, immutable snapshot:
+containers divide space, leaves select widgets, and `hidden` is local
+placement state. Pane names and region IDs address the same copy-on-write
+visibility operation.
 
-- **Definition:** `rune.ui.bar("status", function(width) ... end)`
-- **Trigger:** A ticker in the Session runs every 250ms (or on state change).
-- **Execution:** The Session executes the Lua function to generate the bar content string.
-- **Push:** The Session sends an `UpdateBarsMsg` map to the UI.
-- **Render:** The UI reads from this map during its `View()` cycle.
+Session serializes Lua work. Presentation changes mark it dirty, and each event
+handler publishes its final snapshots on return. Layout, bars, and binds remain
+separate messages; the TUI never calls Lua during measurement or rendering.
 
-This ensures the UI never calls into Lua directly, preventing race conditions.
+The TUI prunes inactive nodes, measures widgets without resizing them, and uses
+its private axis allocator to assign rectangles. It retains that layout until
+geometry can change: terminal size, layout declarations, draft edits, overlay geometry, bar
+visibility, or text in a pane whose size, or ancestor size, is auto. The layout records those
+pane names; writes to other panes reuse the geometry. Geometry changes are applied
+before subsequent messages wrap output or move the search selection. Cursor
+movement updates the input window without rebuilding layout; ordinary single-line
+edits and bar text changes repaint using the existing rectangles. Input compares
+overlay/result geometry and draft text revisions without copying or reshaping
+the draft. Draft edits remain conservative because layout may measure them at
+several widths.
+
+Rendering builds the screen from that layout. `Model` renders the first change
+after idle immediately, then coalesces changes inside a 16ms window. Its timer
+stops when nothing changes. Bubble Tea has a separate terminal flush clock.
+`View` returns the last rendered screen. Scroll state is reported with the screen
+that shows it, retrying if Session's queue is full. Identical prompt and bar
+snapshots do not schedule a render. Input's minimum remains protected on both
+axes when constraints cannot fit.
+
+Rendering terminology distinguishes borders (widget boundaries), edges (sides
+of a rectangle), and rules (positioned lines). A frame is a complete screen
+update. The draft editor edits input inside Rune; an external editor runs in
+`$EDITOR`. Picker and search query fields are separate from the draft editor.
+
+All widgets measure and render content without outside borders. Layout reserves
+and draws pane and input borders with the same inset rule. Input supplies only
+its internal picker/search separator and labels for the surrounding borders.
+Borders, dividers, and separators feed one border grid. Container boundaries are
+resolved once and reused by measurement and allocation; a constrained allocation drops their seam decisions. A layout's first
+render resolves junctions into positioned cells; later renders reuse those cells
+with current labels. Widget content is clipped to its rectangle.
+Each widget draw clears that rectangle; a full canvas clear is needed only
+on the first render after layout changes. Titles cannot overwrite junctions.
+
+All leaves implement the layout-owned `layoutWidget` interface: minimum size,
+bounded height measurement, size application, and `View`. Named panes also expose
+text and scroll operations.
+The model owns their map and creates missing panes on first write or placement.
+The reserved `output` entry is the same `widget.Output` used for main output,
+not a controller wrapping another widget. Output owns its prompt, scrolling,
+wrapping, and `Scrollback`, the bounded ring of retained terminal rows. Search
+reads that ring using eviction-stable sequence numbers. Output wraps on arrival;
+ordinary panes retain logical lines and re-wrap when their width changes.
+
+The `draftEditor` keeps one layout of wrapped rows and insertion positions until
+text or width changes. Cursor movement locates an existing insertion point;
+height measurement stops at eight rows and preserves the editing layout.
+Incoming output does not rebuild an unchanged draft.
+
+Bar callbacks run on Session's 250ms ticker with the terminal width. The TUI
+aligns/clips their snapshots to the assigned slot. No layout-to-Lua width
+feedback is needed.
+
+Pane buffers and scrolling survive layout replacement and Lua reload. Hidden
+values reset from each declaration; `is_hidden` reads local state, not ancestors.
+Bar registrations survive layout replacement but are rebuilt on reload.
 
 ### 3.2 Key Bindings
 
 - **Registration:** Lua registers a bind: `rune.bind("ctrl+r", fn)`.
-- **Sync:** The Session pushes a `map[string]bool` of bound keys to the UI (`UpdateBindsMsg`).
+- **Sync:** Session pushes an `input.Bindings` snapshot to the UI (`UpdateBindsMsg`).
 - **Detection:** When a key is pressed, the UI checks this map.
-  - **If Bound:** The UI suppresses default behavior and sends an `ExecuteBindMsg` to the Session.
+  - **If Bound:** Within the current context, the UI executes named input actions locally or sends callbacks as an `ExecuteBindMsg` to Session. Disabled bindings are consumed.
   - **If Unbound:** The UI handles it normally (for example, typing text).
 
 ### 3.3 The Generic Picker
 
-Rune avoids hardcoded UI modals. Instead, it exposes a single, configurable Picker component.
+Input owns result placement, input placement, height measurement, and
+separator rules. Picker and Search supply result rows and query state.
+The renderer joins Input's separators to surrounding layout dividers.
 
-- **Modal Mode:** Used for History/Aliases. The Picker traps focus and keys.
-- **Linked Mode:** Used for Slash Commands. The Picker sits passively above the input line, filtering based on what the user types.
+- **Modal mode:** History and alias pickers show results above their filter
+  field. The command draft is hidden and preserved while the picker is open.
+- **Inline mode:** Slash-command suggestions appear above the active command
+  field and filter from its text.
+- **Search:** Find shows matching scrollback rows and navigation help above
+  its query field. The selected match controls the output window position.
 
 **Flow:**
 
-1. Lua calls `rune.ui.picker.show({ items=..., filter_prefix="/" })`.
-2. Session generates a callback ID and pushes a `ShowPickerMsg` to the UI.
+1. Lua calls `rune.ui.picker.show({ items=..., mode="inline" })`.
+2. Session passes `ui.PickerOptions`, including a callback ID, to `UI.ShowPicker`. The TUI wraps those options in a private message for its model.
 3. UI renders the picker.
 4. User selects an item.
 5. UI sends `PickerSelectMsg` (with the ID) back to Session.
@@ -127,11 +229,113 @@ Rune avoids hardcoded UI modals. Instead, it exposes a single, configurable Pick
 
 ## 4. Networking & Telnet
 
-Rune implements a bespoke Telnet parser (`network/telnet.go`) ported from `libmudtelnet`.
+Rune implements a bespoke Telnet parser (`network/telnet.go`) ported from
+`libmudtelnet`. Networking has two explicit ownership domains:
 
-- **State Machine:** Handles negotiation (WILL/WONT/DO/DONT) and subnegotiation.
-- **Compatibility Table:** Tracks the state of every Telnet option to prevent negotiation loops.
-- **Output Buffer:** A smart buffer that handles incoming byte streams, detecting lines, and managing prompts (terminated vs. unterminated) based on GA/EOR signals.
+- **Transport:** `TCPClient` owns TCP/TLS, the read and write goroutines, Telnet
+  framing, and MCCP read-source changes. It consumes transport-local MCCP
+  activation events, then publishes any remaining Session-facing events from
+  one `Parser.Receive` result as one `EventBatch` of owned copies; an
+  MCCP-only result publishes no batch. Events are never expanded into
+  independently scheduled channel messages. An `Inbound` value attaches a
+  batch, or a disconnect, to the connection that produced it. The batch also
+  carries the transport's TLS status for identity negotiation.
+- **Protocol:** Session creates one `network.Protocol` per connection and is
+  the only goroutine that calls it. It owns application-visible Telnet state
+  such as local echo, GMCP, identity negotiation, and NAWS. Its `Process`
+  method walks a complete batch synchronously in wire order and emits effects
+  back while Session is handling that batch.
+
+MCCP activation remains a transport concern because decompression must begin
+before the next socket read. The transport consumes the activation marker and
+preserves every other event in its original batch order. All socket writes go
+through the connection's one writer. Session supplies the expected connection
+ID to `SendLine` or `SendFrame`, so checking the active connection and queuing
+the write is one operation.
+
+### 4.1 Server text lifecycle
+
+TCP read boundaries do not delimit lines or confirm prompts. `Username:` may be
+a complete login prompt or the first part of a longer line. A batch boundary
+only gives Rune a safe point to display the partial line as it stands; Rune
+does not use a timer or prompt pattern to guess the final classification.
+
+The parser records ordered Telnet facts: application data, commands,
+negotiation transitions, subnegotiations, and required reply frames. It does
+not assemble lines or classify prompts. `network.Protocol` translates those
+facts into ordered effects such as server data, GA, EOR, GMCP messages, and
+outbound Telnet frames. Session consumes each effect before `Process` advances
+to the next one, so protocol state changes, Lua callbacks, and writes all see
+one coherent wire order.
+
+Session owns `partialLine`, a `partialLineBuffer`: the sole assembler of
+server lines. Its event-loop goroutine joins data across batches and recognizes
+CRLF, LFCR, LF, and bare CR. CR terminates the line immediately, including at
+the end of an event or batch; an optional following LF is swallowed even when
+it arrives in a later event or batch. Because the buffer and Protocol are
+confined to Session, neither needs a mutex.
+
+Session turns those facts into Rune events:
+
+| Observation | Session behavior |
+|---|---|
+| A batch delivers server data and ends with a non-empty partial line | Replace the prompt overlay and call `prompt(line, false)`. This cumulative observation may repeat across batches. |
+| A line delimiter arrives | Consume the completed line through `output` exactly once. Output and multi-line triggers see it. |
+| A GA/EOR prompt boundary follows server data in the same batch | Consume the non-empty partial line through `prompt(line, true)` without first exposing it as `confirmed = false`. |
+| A prompt boundary arrives in a later batch | Consume the previously observed partial line through `prompt(line, true)`. Empty boundaries do nothing. |
+| The user submits anything | Apply the atomic post-submit draft and finish the partial line; then run input hooks before local echo, history, aliases, or slash commands. |
+| A programmatic game send is accepted | Queue the write immediately. Finish the partial line after the active `network.EventBatch` has installed its final rewrite or gag. |
+
+Each trigger selects one stream: text may first reach prompt triggers while
+partial and later reach output triggers if CR/LF completes it. A partial
+observation never runs output triggers or changes span state. A GA/EOR-confirmed prompt closes
+open spans before prompt hooks run. Finishing a partial line on submission or
+an accepted game send commits its already processed overlay and closes spans;
+it does not run the prompt hook again. A send with no partial line leaves open
+spans alone.
+
+Every submission closes any active partial-line display, regardless of whether
+an input hook consumes it, whether it is a slash command, connection state, or
+a later send failure. Session processes each physical line through input hooks,
+echo, and dispatch. A `false` result suppresses that line's history, echo, and
+dispatch; later lines still run. Session records the surviving lines together
+after processing. History expansion reads current history, including explicit script additions.
+Separately, Lua actions
+from aliases, triggers, timers, and other callbacks finish the partial line
+only when the connection accepts their game send. Deferring that finish to the
+end of the active batch keeps the wire write immediate while letting the
+callback that sent it rewrite or gag the visible line before it is committed.
+During inbound processing, `activeBatch` points to the `eventBatchState` for
+one `network.EventBatch`; it records whether server data arrived since the
+last prompt boundary and whether an accepted send owes a partial-line finish.
+Only after the complete batch has run
+does Session publish any remaining partial observation and perform the owed
+finish; multiple accepted sends still finish the line once. A failed game send
+and protocol traffic such as GMCP, NAWS, and Telnet negotiation do not finish
+server text.
+
+If the partial text was really the beginning of a fragmented ordinary line,
+submitting input or accepting a game send commits that visible prefix; later
+server text begins a new line. This is the explicit trade-off for immediate
+partial-line display without a timer or per-MUD prompt pattern. Connect and
+disconnect discard the partial line and open spans without firing them.
+
+### 4.2 Ordered negotiation and GMCP
+
+Protocol effects are handled as they are produced; Session does not prequeue
+all replies or collapse a batch to its final negotiation state. For example,
+if one batch contains `WILL GMCP`, a GMCP payload, and `WONT GMCP`, Rune queues
+`DO GMCP`, marks GMCP active, runs `gmcp_enabled` (whose Lua policy queues
+`Core.Hello`, plus `Core.Supports.Set` when the configured support set is
+non-empty), dispatches the payload and any handler
+writes, then queues `DONT GMCP` and marks GMCP inactive. Splitting those bytes
+across arbitrary TCP reads has the same ordered result.
+
+`network.Protocol` is the authoritative source for whether GMCP and local
+echo are active. Session asks it to build an outbound GMCP frame and rejects
+the request when that connection has not negotiated GMCP. Parser compatibility
+state remains private framing bookkeeping; application code does not query it
+as protocol state.
 
 ## 5. Design Patterns Used
 
@@ -143,17 +347,17 @@ The `ui/tui/tui.go` file acts as an adapter, converting the Bubble Tea `Update`/
 
 The `rune.state` table in Lua serves as an observable state store. Go pushes updates to it; Lua reads from it during render cycles.
 
-### 5.3 The Command Pattern
+### 5.3 Typed Message Passing
 
-Interaction between UI and Session is message-passing (commands), not function calls. This allows the Session to process UI requests asynchronously and safely.
+Work entering Session is data, not a callback into hidden code. The UI publishes
+`UIEvent` values and Session-owned workers publish `internalEvent` completion
+values. The Session loop interprets both and serializes every application-state
+or Lua mutation. Dial and HTTP work share the Session's Run context, so stopping
+the Session also stops producers waiting to publish a result. HTTP completions
+carry the Lua generation that created their callback; a result from before
+`/reload` cannot claim a reused callback ID in the rebuilt VM.
 
-## 6. Future Extensibility
-
-- New UI widgets can be added to `ui/tui/widget` and exposed via `Show...Msg` without changing the engine core.
-- A headless mode can be implemented by providing an alternate `ui.UI` interface implementation.
-- Multiple concurrent sessions (tabs) are supported since no global state is shared.
-
-## 7. Directory Structure
+## 6. Directory Structure
 
 - `cmd/rune/`: Entry point
 - `config/`: Config dir resolution (XDG/APPDATA)
@@ -166,5 +370,88 @@ Interaction between UI and Session is message-passing (commands), not function c
 - `version/`: Version number, single-sourced for `/version` and TTYPE/MNES
 - `ui/`: UI interface and messages
   - `tui/`: Bubble Tea implementation
-  - `tui/widget/`: Reusable widgets (Input, Picker, Viewport, Pane, Bar)
+  - `tui/widget/`: Reusable widgets (Input, Output, Pane, Picker, Search, Bar)
 
+### Drafts, submissions, and lines
+
+A **draft** is the editable text, cursor, and Command/Verbatim mode owned by the
+UI. A **submission** is the immutable block the user asked Rune to execute.
+A **line** is one physical line selected from that block. Session mirrors draft
+text and cursor so Lua can inspect them without calling the UI goroutine.
+
+`Session.submit` is the complete accepted-submission sequence:
+
+1. Mirror the draft left after Enter, then finish the displayed partial prompt.
+2. Notify `input_changed` observers if the draft text changed.
+3. Select physical lines with `Submission.Lines`: multiline Command input skips
+   blank lines; Verbatim preserves them; an empty single-line Enter still runs.
+4. For each line, call `ProcessSubmittedLine`: Lua's `_process_submitted_line`
+   expands history in Command mode, then runs the input hooks in either mode.
+   A string replaces the text; `false` consumes that line. Record surviving
+   text for history, echo it, then call `ExecuteInputLine`.
+5. Save the surviving lines as one history entry with the submission's mode.
+
+`ExecuteInputLine` calls Lua's `_execute_input_line`: Verbatim sends literally,
+a leading slash command runs locally, and other text goes through `rune.send`.
+`rune.send` executes separators, repeats, and aliases. `rune.send_raw` splits
+literal physical lines and stops at the first send failure. Neither public
+send API runs interactive history expansion, input hooks, input echo, or
+history recording.
+
+The whole draft notification and line loop share one watchdog budget through
+`Engine.BeginExecution`. Preparation errors are separate from consumed lines:
+line-local errors are reported and later lines continue; deadline exhaustion
+stops the submission. Ordinary command errors are isolated in Lua. An internal
+execution failure stops the remaining lines and is never retried, since it may
+already have sent commands. Missing Lua entry points retain the small recovery
+fallback. `/quit` stops subsequent lines; `/reload` waits until submission ends.
+History is saved after execution, even if a send failed. Hooks do not see the
+current entry; expansion and public reads do see explicit script additions.
+
+Draft callbacks and state acknowledgments have separate purposes:
+
+- User edits travel UI → Session; Session mirrors the text/cursor and notifies
+  `input_changed` observers.
+- Script edits update Session's mirror and queue a UI update. The Lua primitive
+  then notifies observers synchronously if the text changed. The UI acknowledges
+  applied text and cursor with `DraftAppliedMsg`, which only updates the mirror.
+  This reconciles older typing already queued behind the script callback;
+  it never invokes observers again.
+- External-editor results use the same update and acknowledgment, with notification
+  explicit in the Session event handler. Submission carries its following draft
+  atomically, so it needs no separate UI change event.
+
+Script draft edits normalize CRLF and CR to LF using the same rule as the
+rune-based draft editor. Observers can edit the draft again; nested callbacks execute
+synchronously under the enclosing watchdog. The `input_changed` event name and
+public `rune.input` APIs remain unchanged.
+
+The draft editor preserves draft structure independently of its submission mode.
+Structured text initially selects Verbatim; an explicit mode choice persists
+for the draft. `rune.bind` registers callbacks and named input actions in one
+registry. The controller resolves the input action once per key from the same
+binding snapshot used for callback membership and hints. Modal overlays capture
+keys; the draft editor retains its editing mechanics. Missing core bindings use Go
+recovery defaults; a successful empty snapshot means no bindings.
+
+The UI validates Command text before queueing so rejected submissions retain
+their draft. Session also validates admission, and the Engine checks hook
+results at the scripting boundary. `input.Line` carries one physical line and
+its unchanged mode. Physical newlines in hook replacements are rejected before
+later handlers run; final Command replacements must be valid command text.
+
+### JSON conversion
+
+`lua/json_codec.go` converts JSON text and Go value trees for `rune.json`,
+GMCP, and durable storage. The public JSON API uses strict validation and
+bounded conversion; GMCP and storage select their existing compatibility
+policy. GMCP still owns raw-control-byte repair and its protocol-specific
+nesting check.
+
+`lua/core/10_json.lua` owns the public null value and private weak table-kind
+marks. Its Go boundary uses tagged container trees so the existing script
+backend interface can carry nulls and empty arrays without losing their
+identity. Lua scalars cross directly. `lua/api_json.go` adapts those trees to
+the shared codec. Both VM backends use the same implementation; generic
+`script.Tree` conversion and existing GMCP callback values stay unchanged.
+HTTP carries strings and does not infer a JSON body or response.

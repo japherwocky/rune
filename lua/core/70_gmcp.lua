@@ -27,7 +27,7 @@ local function send_supports()
     end
 end
 
--- Per-package dispatch index (mirrors 20_hooks.lua's by_event)
+-- Per-package dispatch index (mirrors 25_hooks.lua's by_event)
 local by_package = {} -- lowercase package -> sorted array of data
 
 local function sort_handlers(handlers)
@@ -41,6 +41,7 @@ end
 
 local registry = rune.registry.new{
     kind = "gmcp",
+    action_field = "handler",
     on_add = function(data)
         local handlers = by_package[data.package]
         if not handlers then
@@ -68,7 +69,7 @@ local registry = rune.registry.new{
 -- handler receives (data, package): data is the decoded JSON value
 -- (table/string/number/boolean, or nil when the message had no body),
 -- package is the name as the server sent it.
--- opts: name, group, priority (see 15_registry.lua).
+-- opts: name, group, priority (see 20_registry.lua).
 -- Returns a handle with :enable/:disable/:remove.
 function rune.gmcp.on(package, handler, opts)
     return registry:add({
@@ -80,6 +81,10 @@ end
 
 function rune.gmcp.remove(name)
     return registry:remove(name)
+end
+
+function rune.gmcp.get(name)
+    return registry:get(name)
 end
 
 function rune.gmcp.enable(name)

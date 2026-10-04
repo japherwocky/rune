@@ -4,6 +4,7 @@ import (
 	"sort"
 	"testing"
 
+	"github.com/mmcdole/rune/input"
 	"github.com/mmcdole/rune/text"
 )
 
@@ -19,6 +20,18 @@ func setupTest(t *testing.T) (*Engine, *MockHost, func()) {
 		t.Fatal("Failed to initialize engine:", err)
 	}
 
+	loadTestCoreScripts(t, engine)
+
+	cleanup := func() {
+		engine.Close()
+	}
+
+	return engine, host, cleanup
+}
+
+// loadTestCoreScripts loads the embedded core in production boot order.
+func loadTestCoreScripts(t *testing.T, engine *Engine) {
+	t.Helper()
 	// Load core scripts (mimicking Session.boot())
 	entries, err := CoreScripts.ReadDir("core")
 	if err != nil {
@@ -44,11 +57,6 @@ func setupTest(t *testing.T) (*Engine, *MockHost, func()) {
 		}
 	}
 
-	cleanup := func() {
-		engine.Close()
-	}
-
-	return engine, host, cleanup
 }
 
 // featureCase is one semantic variant: register something in Lua,
@@ -76,7 +84,7 @@ func runFeatureCases(t *testing.T, cases []featureCase) {
 				}
 			}
 			if tc.input != "" {
-				engine.OnInput(tc.input)
+				dispatchTestCommand(engine, tc.input)
 			}
 			if tc.output != "" {
 				engine.OnOutput(text.NewLine(tc.output))
@@ -103,4 +111,30 @@ func assertCommands(t *testing.T, host *MockHost, expected []string) {
 			t.Errorf("command %d: expected %q, got %q", i, exp, actualCommands[i])
 		}
 	}
+}
+
+// dispatchTestLine exercises the Engine's one-line preparation and dispatch boundary.
+// Submission iteration, budgets, echo, and history are tested through Session.
+func dispatchTestLine(engine *Engine, line input.Line) bool {
+	effective, proceed := processTestLine(engine, line)
+	if !proceed {
+		return false
+	}
+	if err := engine.ExecuteInputLine(effective); err != nil {
+		engine.reportError("input", err)
+		return false
+	}
+	return true
+}
+
+func dispatchTestCommand(engine *Engine, text string) bool {
+	return dispatchTestLine(engine, input.Line{Text: text, Mode: input.ModeCommand})
+}
+
+func processTestLine(engine *Engine, line input.Line) (input.Line, bool) {
+	result, keep, err := engine.ProcessSubmittedLine(line)
+	if err != nil {
+		engine.reportError("submitted line", err)
+	}
+	return result, keep
 }
