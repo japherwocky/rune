@@ -29,8 +29,7 @@ type UI struct {
 	w   io.Writer
 	mu  sync.Mutex // serializes writes to w
 
-	inputChan chan input.Submission
-	outbound  chan ui.UIEvent
+	events chan ui.UIEvent
 
 	done     chan struct{}
 	doneOnce sync.Once
@@ -43,11 +42,10 @@ var _ ui.UI = (*UI)(nil)
 // whichever comes first.
 func New(ctx context.Context, w io.Writer) *UI {
 	return &UI{
-		ctx:       ctx,
-		w:         w,
-		inputChan: make(chan input.Submission, 64),
-		outbound:  make(chan ui.UIEvent, 64),
-		done:      make(chan struct{}),
+		ctx:    ctx,
+		w:      w,
+		events: make(chan ui.UIEvent, 64),
+		done:   make(chan struct{}),
 	}
 }
 
@@ -67,11 +65,11 @@ func (h *UI) Quit() {
 }
 
 // Input has nothing feeding it until a control surface exists (T11).
-func (h *UI) Input() <-chan input.Submission { return h.inputChan }
-
-// Outbound has nothing feeding it - there is no keyboard/mouse to turn
-// into WindowSizeChangedMsg, PickerSelectMsg, etc.
-func (h *UI) Outbound() <-chan ui.UIEvent { return h.outbound }
+// Events is the single UI -> Session channel. Nothing drives it
+// headlessly - there is no keyboard to submit input, open an editor,
+// or fire a key binding - so it stays empty for the life of the
+// session (PLAN.md T11's control surface would be what fills it).
+func (h *UI) Events() <-chan ui.UIEvent { return h.events }
 
 func (h *UI) println(line string) {
 	h.mu.Lock()
@@ -97,6 +95,16 @@ func (h *UI) SetPrompt(text string) {
 	h.println("[prompt] " + text)
 }
 
+// CommitPrompt logs a prompt the session has moved into scrollback.
+// SetPrompt tags its text as provisional; by the time it is committed
+// it is ordinary transcript content, so it is logged untagged.
+func (h *UI) CommitPrompt(text string) {
+	if text == "" {
+		return
+	}
+	h.println(text)
+}
+
 // WritePane logs a named pane's content (e.g. the agent reasoning
 // pane, lua/core/96_agent_ui.lua) tagged with its pane name - this is
 // how the agent stays observable with no pane to look at.
@@ -104,24 +112,30 @@ func (h *UI) WritePane(name, text string) {
 	h.println("[pane:" + name + "] " + text)
 }
 
+// ReplacePane logs a pane's replacement content. The clear half has
+// nothing to undo in a linear transcript, so only the new text is
+// logged - tagged to distinguish it from an append.
+func (h *UI) ReplacePane(name, text string) {
+	h.println("[pane:" + name + ":replace] " + text)
+}
+
 // The rest of the interface is visual-only - bars, layout, pickers, and
 // an input line to move a cursor in or suspend for $EDITOR - and has
 // nothing to do without a terminal.
-func (h *UI) SetInput(string)                           {}
-func (h *UI) SetInputSubmission(input.Submission)       {}
-func (h *UI) UpdateBars(map[string]ui.BarContent)       {}
-func (h *UI) UpdateBinds(map[string]bool)               {}
-func (h *UI) UpdateLayout(top, bottom []ui.LayoutEntry) {}
-func (h *UI) ShowPicker(ui.ShowPickerMsg)               {}
-func (h *UI) ShowSearch(ui.ShowSearchMsg)               {}
-func (h *UI) SetClipboard(string)                       {}
-func (h *UI) CreatePane(string)                         {}
-func (h *UI) TogglePane(string)                         {}
-func (h *UI) SetPaneVisible(string, bool)               {}
-func (h *UI) ClearPane(string)                          {}
-func (h *UI) InputSetCursor(int)                        {}
-func (h *UI) OpenEditor(string) (string, bool)          { return "", false }
-func (h *UI) PaneScrollUp(string, int)                  {}
-func (h *UI) PaneScrollDown(string, int)                {}
-func (h *UI) PaneScrollToTop(string)                    {}
-func (h *UI) PaneScrollToBottom(string)                 {}
+func (h *UI) SetInput(string)                     {}
+func (h *UI) SetInputSubmission(input.Submission) {}
+func (h *UI) UpdateBars(map[string]ui.BarContent) {}
+func (h *UI) UpdateBinds(input.Bindings)          {}
+func (h *UI) UpdateLayout(ui.LayoutTree)          {}
+func (h *UI) UpdateConfig(ui.Config)              {}
+func (h *UI) ShowPicker(ui.PickerOptions)         {}
+func (h *UI) ShowSearch(ui.SearchOptions)         {}
+func (h *UI) SetClipboard(string)                 {}
+func (h *UI) CreatePane(string)                   {}
+func (h *UI) ClearPane(string)                    {}
+func (h *UI) InputSetCursor(int)                  {}
+func (h *UI) OpenEditor(string) (string, bool)    { return "", false }
+func (h *UI) PaneScrollUp(string, int)            {}
+func (h *UI) PaneScrollDown(string, int)          {}
+func (h *UI) PaneScrollToTop(string)              {}
+func (h *UI) PaneScrollToBottom(string)           {}

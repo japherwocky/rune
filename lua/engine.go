@@ -2,12 +2,11 @@ package lua
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
-	"github.com/mmcdole/rune/input"
 	"github.com/mmcdole/rune/script"
 	"github.com/mmcdole/rune/text"
 	"github.com/mmcdole/rune/ui"
@@ -31,8 +30,14 @@ type Engine struct {
 	pickerCallbacks map[string]script.FuncRef
 	pickerNextID    int
 
-	// Layout config, marshaled from rune.ui.layout calls
-	barLayout ui.LayoutConfig
+	// Layout tree, normalized to the canonical representation by
+	// rune._ui.layout before it is published to the UI.
+	layout ui.LayoutTree
+
+	// Application configuration, owned and validated by Go. Init starts a
+	// fresh candidate at the defaults; Session commits it after scripts load.
+	config        Config
+	configStaging bool
 
 	// Re-applied after every Init so reloads keep it visible.
 	configDir string
@@ -42,9 +47,9 @@ type Engine struct {
 	inLua       bool               // True while inside a guarded Lua call (re-entrancy)
 	guardCancel context.CancelFunc // Cancels the active watchdog context
 
-	// True once the user has been warned that rune.hooks.call is
-	// missing and the client is degraded to raw pass-through.
-	hooksBrokenReported bool
+	// True once the user has been warned that the core Lua pipeline is missing
+	// or violated a result contract. Reset for each VM generation.
+	coreBrokenReported bool
 
 	// True while dispatching the "error" event, so failures inside
 	// error handlers print directly instead of recursing.
@@ -59,7 +64,9 @@ func NewEngine(host Host) *Engine {
 		host:            host,
 		vm:              newScriptEngine(),
 		pickerCallbacks: make(map[string]script.FuncRef),
-		barLayout:       ui.DefaultLayoutConfig(),
+		layout:          ui.DefaultLayoutTree(),
+		config:          defaultConfig(),
+		configStaging:   true,
 		CallTimeout:     DefaultCallTimeout,
 	}
 	e.registerAPIs()
@@ -70,32 +77,51 @@ func NewEngine(host Host) *Engine {
 // with: "lunar" (default) or "luajit" (-tags luajit).
 func (e *Engine) EngineBackend() string { return e.vm.Backend() }
 
-// guard runs fn under the watchdog: a deadline context is attached to
-// the VM so runaway scripts are interrupted instead of hanging the
-// event loop. Nested entries (Go APIs called from Lua that re-enter
-// the engine, e.g. rune._load) run under the outermost deadline.
-func (e *Engine) guard(fn func() error) error {
-	if e.inLua {
-		return fn()
+// BeginExecution shares one watchdog deadline across a caller-owned sequence of
+// Lua calls. Call the returned function exactly once (normally in a defer) to
+// report deadline exhaustion and release the scope. Nested scopes reuse the
+// current deadline. Only the Session goroutine may use an execution scope.
+func (e *Engine) BeginExecution() func(error) error {
+	owner := !e.inLua
+	if owner {
+		e.inLua = true
+		ctx, cancel := context.WithTimeout(context.Background(), e.CallTimeout)
+		e.guardCancel = cancel
+		e.vm.SetContext(ctx)
 	}
-	e.inLua = true
-	ctx, cancel := context.WithTimeout(context.Background(), e.CallTimeout)
-	e.guardCancel = cancel
-	e.vm.SetContext(ctx)
-	defer func() {
-		e.vm.RemoveContext()
-		e.guardCancel()
-		e.guardCancel = nil
-		e.inLua = false
-	}()
+	return func(err error) error {
+		if owner {
+			defer func() {
+				e.vm.RemoveContext()
+				e.guardCancel()
+				e.guardCancel = nil
+				e.inLua = false
+			}()
+		}
+		// An editor call can replace the context; always inspect the active one.
+		// pcall must not hide exhaustion of the shared deadline.
+		if ctx := e.vm.Context(); ctx != nil && ctx.Err() != nil {
+			// Preserve deadline identity for callers deciding whether to stop.
+			// Only the outer scope adds the user-facing interruption message.
+			if !errors.Is(err, ctx.Err()) {
+				err = errors.Join(err, ctx.Err())
+			}
+			if owner {
+				return fmt.Errorf("script interrupted after %v (runaway loop?): %w", e.CallTimeout, err)
+			}
+		}
+		return err
+	}
+}
 
-	err := fn()
-	// The active context may have been replaced by pauseWatchdog, so
-	// consult the VM's current context rather than the original.
-	if lctx := e.vm.Context(); err != nil && lctx != nil && lctx.Err() != nil {
-		return fmt.Errorf("script interrupted after %v (runaway loop?): %w", e.CallTimeout, err)
+// guard bounds a single Lua entry, reusing an enclosing execution scope.
+func (e *Engine) guard(fn func() error) (err error) {
+	finish := e.BeginExecution()
+	defer func() { err = finish(err) }()
+	if ctx := e.vm.Context(); ctx != nil && ctx.Err() != nil {
+		return ctx.Err()
 	}
-	return err
+	return fn()
 }
 
 // pauseWatchdog runs fn with the watchdog deadline detached, then arms
@@ -132,8 +158,10 @@ func (e *Engine) Init() error {
 	e.pickerCallbacks = make(map[string]script.FuncRef)
 	e.pickerNextID = 0
 
-	e.barLayout = ui.DefaultLayoutConfig()
-	e.hooksBrokenReported = false
+	e.layout = ui.DefaultLayoutTree()
+	e.config = defaultConfig()
+	e.configStaging = true
+	e.coreBrokenReported = false
 
 	if e.configDir != "" {
 		e.vm.SetModuleField("rune", "config_dir", e.configDir)
@@ -223,12 +251,6 @@ func (e *Engine) DoFile(path string) error {
 	return e.guard(func() error { return e.vm.DoFile(path) })
 }
 
-// OnInput handles traditional command input. It remains as a convenience for
-// callers that do not need to construct an explicit submission.
-func (e *Engine) OnInput(text string) {
-	e.OnSubmission(input.Command(text))
-}
-
 // callHooks dispatches through rune.hooks.call; found=false means the
 // hook system is unavailable (core failed to load or was clobbered).
 func (e *Engine) callHooks(nret int, args ...any) ([]script.Result, bool, error) {
@@ -242,53 +264,8 @@ func (e *Engine) callHooks(nret int, args ...any) ([]script.Result, bool, error)
 	return results, found, err
 }
 
-// OnSubmission dispatches one immutable input snapshot through Lua. Every
-// input hook receives the same context shape; mode is always either "command"
-// or "verbatim". Verbatim submissions still traverse user input hooks, but
-// the core sender bypasses slash commands, aliases, repeats, and delimiters.
-func (e *Engine) OnSubmission(submission input.Submission) {
-	ctx := script.Tree{V: map[string]any{"mode": submission.Mode.String()}}
-
-	// The consumed/pass-through result is dispatch routing state that
-	// lives in Lua; nothing on the Go side acts on it.
-	_, found, err := e.callHooks(1, "input", submission.Text, ctx)
-	if !found {
-		e.reportHooksBroken()
-		if submission.Mode == input.ModeVerbatim {
-			e.sendVerbatimFallback(submission.Text)
-			return
-		}
-
-		// Degraded command mode keeps the escape hatches working and passes
-		// everything else to the server as a plain telnet client.
-		switch submission.Text {
-		case "/quit":
-			e.host.Quit()
-		case "/reload":
-			e.host.Reload()
-		default:
-			_ = e.host.Send(submission.Text)
-		}
-		return
-	}
-	if err != nil {
-		e.reportError("input dispatch", err)
-	}
-}
-
-// sendVerbatimFallback is the no-Lua escape hatch. strings.Split preserves
-// leading, adjacent, and trailing empty lines and treats only LF as a boundary.
-func (e *Engine) sendVerbatimFallback(input string) {
-	for _, line := range strings.Split(input, "\n") {
-		_ = e.host.Send(line)
-	}
-}
-
-// OnEcho styles the local echo of typed input by dispatching the
-// "echo" hook: presentation belongs to Lua, so the "> " prefix and
-// color live in the core echo handler, and user handlers may rewrite
-// or hide the echo. Degraded mode falls back to Go-side styling so
-// input stays visible.
+// OnEcho runs the echo hook. The core adds styling; user hooks may rewrite or
+// hide the result.
 func (e *Engine) OnEcho(in string) (string, bool) {
 	// Echo is a presentation boundary. Preserve canonical submission bytes
 	// elsewhere, but never let pasted terminal controls reach either Lua
@@ -298,7 +275,7 @@ func (e *Engine) OnEcho(in string) (string, bool) {
 
 	results, found, err := e.callHooks(2, "echo", in)
 	if !found {
-		e.reportHooksBroken()
+		e.reportCoreBroken()
 		return fallback, true
 	}
 	if err != nil {
@@ -317,7 +294,7 @@ func (e *Engine) OnEcho(in string) (string, bool) {
 func (e *Engine) OnOutput(line text.Line) (string, bool) {
 	results, found, err := e.callHooks(2, "output", script.Obj{Type: "line", Payload: &line})
 	if !found {
-		e.reportHooksBroken()
+		e.reportCoreBroken()
 		return line.Raw, true
 	}
 	if err != nil {
@@ -332,11 +309,14 @@ func (e *Engine) OnOutput(line text.Line) (string, bool) {
 	return modified.String(), true
 }
 
-// OnPrompt handles server prompts.
-func (e *Engine) OnPrompt(line text.Line) string {
-	results, found, err := e.callHooks(2, "prompt", script.Obj{Type: "line", Payload: &line})
+// OnPrompt dispatches a prompt observation of the partial line through the
+// "prompt" hook chain and returns the display text: the final rewrite, or ""
+// when a handler gagged it. Dispatch failures fall back to the raw line.
+func (e *Engine) OnPrompt(line text.Line, confirmed bool) string {
+	results, found, err := e.callHooks(2, "prompt",
+		script.Obj{Type: "line", Payload: &line}, confirmed)
 	if !found {
-		e.reportHooksBroken()
+		e.reportCoreBroken()
 		return line.Raw
 	}
 	if err != nil {
@@ -351,6 +331,27 @@ func (e *Engine) OnPrompt(line text.Line) string {
 	return modified.String()
 }
 
+// FlushSpans fires and closes every open multi-line trigger span; the
+// triggers themselves survive.
+func (e *Engine) FlushSpans() {
+	if err := e.guard(func() error {
+		_, _, err := e.vm.CallModule("rune.trigger", "_flush_spans", 0)
+		return err
+	}); err != nil {
+		e.reportError("span flush", err)
+	}
+}
+
+// DiscardSpans drops every open multi-line trigger span without firing it.
+func (e *Engine) DiscardSpans() {
+	if err := e.guard(func() error {
+		_, _, err := e.vm.CallModule("rune.trigger", "_discard_spans", 0)
+		return err
+	}); err != nil {
+		e.reportError("span discard", err)
+	}
+}
+
 // OnGMCP dispatches a GMCP message to Lua: the raw JSON is decoded
 // into a Go tree so handlers receive a real Lua value, plus the
 // original raw text for anyone who wants it. Malformed JSON is
@@ -359,15 +360,9 @@ func (e *Engine) OnPrompt(line text.Line) string {
 func (e *Engine) OnGMCP(pkg, raw string) {
 	var value any
 	if raw != "" {
-		var decoded any
-		if err := json.Unmarshal([]byte(escapeRawJSONControlsInStrings(raw)), &decoded); err != nil {
+		decoded, err := decodeJSON(escapeRawJSONControlsInStrings(raw), gmcpJSON)
+		if err != nil {
 			e.reportError("gmcp "+pkg, fmt.Errorf("malformed JSON: %w", err))
-			return
-		}
-		// Server-controlled nesting is bounded before it is pushed into
-		// the VM, mirroring maxStoreDepth on the script->Go direction.
-		if treeTooDeep(decoded, maxStoreDepth) {
-			e.reportError("gmcp "+pkg, fmt.Errorf("message nested deeper than %d levels", maxStoreDepth))
 			return
 		}
 		value = decoded
@@ -379,29 +374,6 @@ func (e *Engine) OnGMCP(pkg, raw string) {
 	}); err != nil {
 		e.reportError("gmcp dispatch", err)
 	}
-}
-
-// treeTooDeep reports whether a decoded JSON tree nests beyond limit
-// levels of containers.
-func treeTooDeep(v any, limit int) bool {
-	if limit < 0 {
-		return true
-	}
-	switch val := v.(type) {
-	case []any:
-		for _, item := range val {
-			if treeTooDeep(item, limit-1) {
-				return true
-			}
-		}
-	case map[string]any:
-		for _, item := range val {
-			if treeTooDeep(item, limit-1) {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 // escapeRawJSONControlsInStrings tolerates servers which put terminal control
@@ -454,20 +426,22 @@ func escapeRawJSONControlsInStrings(raw string) string {
 	return repaired.String()
 }
 
-// CallHook calls a hook event with string arguments.
-func (e *Engine) CallHook(event string, args ...string) {
+// notify dispatches a fire-and-forget event through the Lua hook registry.
+func (e *Engine) notify(event string, args ...any) {
 	callArgs := make([]any, len(args)+1)
 	callArgs[0] = event
-	for i, arg := range args {
-		callArgs[i+1] = arg
-	}
+	copy(callArgs[1:], args)
 
 	_, found, err := e.callHooks(0, callArgs...)
 	if !found {
-		e.reportHooksBroken()
+		e.reportCoreBroken()
 		// Errors must never disappear, even with hooks broken.
 		if event == "error" {
-			e.host.Print(text.Red("[Error] " + strings.Join(args, " ")))
+			parts := make([]string, len(args))
+			for i, arg := range args {
+				parts[i] = fmt.Sprint(arg)
+			}
+			e.host.Print(text.Red("[Error] " + strings.Join(parts, " ")))
 		}
 		return
 	}
@@ -489,8 +463,11 @@ func (e *Engine) registerAPIs() {
 	e.registerCoreFuncs()
 	e.registerTimerFuncs()
 	e.registerRegexFuncs()
+	e.registerJSONFuncs()
 	e.registerUIFuncs()
 	e.registerStateFuncs()
+	e.registerConfigFuncs()
+	e.registerLayoutFuncs()
 	e.registerBarFuncs()
 	e.registerPickerFuncs()
 	e.registerHistoryFuncs()
@@ -516,17 +493,16 @@ func (e *Engine) reportError(source string, err error) {
 	}
 	e.reportingError = true
 	defer func() { e.reportingError = false }()
-	e.CallHook("error", msg)
+	e.NotifyError(msg)
 }
 
-// reportHooksBroken warns the user, once per VM generation, that the
-// hook system is unavailable and the client is running degraded.
-func (e *Engine) reportHooksBroken() {
-	if e.hooksBrokenReported {
+// reportCoreBroken warns once per VM generation that a required internal Lua
+// entry point is unavailable. Callers retain their own safe fallback policy.
+func (e *Engine) reportCoreBroken() {
+	if e.coreBrokenReported {
 		return
 	}
-	e.hooksBrokenReported = true
-	e.host.Print(text.Red("[System] rune.hooks.call is unavailable - scripting disabled. " +
-		"Input and output pass through raw; /reload and /quit still work. " +
-		"Fix your scripts and /reload."))
+	e.coreBrokenReported = true
+	e.host.Print(text.Red("[System] Rune's core Lua pipeline is incomplete; some scripting is disabled. " +
+		"Fix your scripts, then reload or restart Rune."))
 }

@@ -1,0 +1,366 @@
+-- Shared Registry Factory
+-- Hooks, timers, aliases, and triggers are all the same shape: a
+-- registry of callbacks with handles, upsert-by-name, group
+-- membership, priority ordering, and two-level enable/disable. This
+-- factory implements that machinery exactly once, so every module has
+-- identical semantics and a fix here fixes all of them.
+--
+-- Usage:
+--   local reg = rune.registry.new{
+--       kind = "trigger",               -- label for messages
+--       action_field = "action",        -- data field holding the callback
+--       on_add = function(data) end,    -- optional, after insertion
+--       on_remove = function(data) end, -- optional, after removal
+--   }
+--   local handle = reg:add(data, opts)
+--
+-- The module owns `data` (pattern, action, ...); the factory
+-- standardizes these fields on it:
+--   id       -- insertion order (tiebreak for equal priorities)
+--   enabled  -- individual switch (see reg:active)
+--   priority -- opts.priority or 50, lower runs first
+--   name     -- opts.name, unique: adding a duplicate replaces the old
+--   group    -- opts.group, master-switch membership (rune.group)
+--   once     -- opts.once, module removes the item after first fire
+--   _handle  -- back-reference to the handle
+--
+-- Name is the ONLY identity. Registries whose entries have a natural
+-- key (a bind's key, a bar's layout name, a command's name, an exact
+-- alias's phrase) pass that key as the name via rune.registry.keyed_opts,
+-- so `reg:get(key)` and the management suite address the same thing the
+-- user typed. Those registries must not also upsert by their own index:
+-- the name upsert below already replaces the old entry, firing on_remove
+-- for it before on_add for the new one.
+--
+-- Handle API: :enable() :disable() :remove() :name() :group() :action()
+
+rune.registry = {}
+
+local Handle = {}
+Handle.__index = Handle
+
+function Handle:enable()
+    self._data.enabled = true
+    rune._ui.presentation_changed()
+    return self
+end
+
+function Handle:disable()
+    self._data.enabled = false
+    rune._ui.presentation_changed()
+    return self
+end
+
+function Handle:remove()
+    self._registry:_remove_data(self._data)
+    return self
+end
+
+function Handle:name()
+    return self._data.name
+end
+
+function Handle:group()
+    return self._data.group
+end
+
+-- The registered action: a function, or the command string for the
+-- string-action forms. Calling it directly bypasses the enabled/group
+-- checks and the failure quarantine, so this is for capturing and
+-- wrapping an existing entry, not for dispatch.
+function Handle:action()
+    return self._data[self._registry.action_field]
+end
+
+local Registry = {}
+Registry.__index = Registry
+
+-- Build the opts table for a registry whose entries have a natural key,
+-- making that key the name.
+--
+-- A name used to be a second identity for the same entry, which is the
+-- bug this avoids. It is now dropped with a notice rather than raised:
+-- raising aborts the rest of the user's script, so one stale option in
+-- an old init.lua would cost every registration below it. The notice
+-- names the key to use instead.
+function rune.registry.keyed_opts(key, opts, label)
+    if opts ~= nil and type(opts) ~= "table" then
+        error(label .. ": opts must be a table", 3)
+    end
+    local merged = {}
+    if opts then
+        for k, v in pairs(opts) do
+            merged[k] = v
+        end
+    end
+    if merged.name ~= nil and merged.name ~= key then
+        local source = rune.caller_source(2)
+        rune.echo(rune.style.yellow("[Deprecated]") .. " " .. label ..
+            ": name '" .. tostring(merged.name) .. "' ignored, manage it as '" ..
+            key .. "'" .. (source and (" @" .. source) or ""))
+    end
+    merged.name = key
+    return merged
+end
+
+function rune.registry.new(opts)
+    opts = opts or {}
+    return setmetatable({
+        kind = opts.kind or "item",
+        action_field = opts.action_field or "action",
+        on_add = opts.on_add,
+        on_remove = opts.on_remove,
+        list = {},     -- all items, sorted by (priority, id)
+        by_name = {},  -- name -> handle
+        by_group = {}, -- group -> {handle -> true}
+        next_id = 1,
+    }, Registry)
+end
+
+local function sort_list(list)
+    table.sort(list, function(a, b)
+        if a.priority ~= b.priority then
+            return a.priority < b.priority
+        end
+        return a.id < b.id
+    end)
+end
+
+-- Register an item. opts: name, group, priority, once.
+-- The caller sets module-specific fields (including `source`, since
+-- only the caller knows its stack depth for rune.caller_source).
+function Registry:add(data, opts)
+    opts = opts or {}
+
+    data.id = self.next_id
+    self.next_id = self.next_id + 1
+    data.enabled = true
+    data.priority = opts.priority or 50
+    data.name = opts.name
+    data.group = opts.group
+    data.once = opts.once or false
+
+    local handle = setmetatable({
+        _data = data,
+        _registry = self,
+    }, Handle)
+    data._handle = handle
+
+    -- Upsert: a new item with an existing name replaces the old one
+    if data.name and self.by_name[data.name] then
+        self.by_name[data.name]:remove()
+    end
+
+    table.insert(self.list, data)
+    sort_list(self.list)
+
+    if data.name then
+        self.by_name[data.name] = handle
+    end
+    if data.group then
+        local grp = self.by_group[data.group]
+        if not grp then
+            grp = {}
+            self.by_group[data.group] = grp
+        end
+        grp[handle] = true
+    end
+
+    if self.on_add then
+        self.on_add(data)
+    end
+
+    return handle
+end
+
+function Registry:_remove_data(data)
+    data.removed = true -- tombstone: skipped by active() in snapshots
+    for i, item in ipairs(self.list) do
+        if item == data then
+            table.remove(self.list, i)
+            break
+        end
+    end
+    if data.name and self.by_name[data.name] == data._handle then
+        self.by_name[data.name] = nil
+    end
+    if data.group and self.by_group[data.group] then
+        self.by_group[data.group][data._handle] = nil
+    end
+    if self.on_remove then
+        self.on_remove(data)
+    end
+end
+
+function Registry:get(name)
+    return self.by_name[name]
+end
+
+function Registry:enable(name)
+    local handle = self.by_name[name]
+    if handle then
+        handle:enable()
+        return true
+    end
+    return false
+end
+
+function Registry:disable(name)
+    local handle = self.by_name[name]
+    if handle then
+        handle:disable()
+        return true
+    end
+    return false
+end
+
+function Registry:toggle(name)
+    local handle = self.by_name[name]
+    if handle then
+        handle._data.enabled = not handle._data.enabled
+        return true
+    end
+    return false
+end
+
+function Registry:remove(name)
+    local handle = self.by_name[name]
+    if handle then
+        handle:remove()
+        return true
+    end
+    return false
+end
+
+-- The sorted item list, for dispatch iteration. Do not mutate;
+-- removal during iteration must go through handles after the loop.
+function Registry:items()
+    return self.list
+end
+
+-- A shallow copy of the sorted item list. Dispatch loops that run
+-- user callbacks iterate over this: a callback that adds or removes
+-- items mutates the live list, and iterating it directly would skip
+-- or double-run neighbors. Additions during dispatch take effect on
+-- the next dispatch; removals are honored via the active() check.
+function Registry:snapshot()
+    local copy = {}
+    for i, data in ipairs(self.list) do
+        copy[i] = data
+    end
+    return copy
+end
+
+function Registry:count()
+    return #self.list
+end
+
+-- Remove every item (on_remove fires for each).
+function Registry:clear()
+    local handles = {}
+    for _, data in ipairs(self.list) do
+        handles[#handles + 1] = data._handle
+    end
+    for _, handle in ipairs(handles) do
+        handle:remove()
+    end
+end
+
+-- Remove all items in a group; returns how many were removed.
+function Registry:remove_group(group_name)
+    if not group_name or not self.by_group[group_name] then
+        return 0
+    end
+    local handles = {}
+    for handle in pairs(self.by_group[group_name]) do
+        handles[#handles + 1] = handle
+    end
+    for _, handle in ipairs(handles) do
+        handle:remove()
+    end
+    return #handles
+end
+
+-- Group System (Control Only)
+-- Manages the master enable/disable state for groups.
+-- Item deletion is handled by each module (alias, trigger, timer, hooks).
+--
+-- Two-level enable/disable:
+--   - Group level: master switch (rune.group.disable/enable)
+--   - Item level: individual state (handle:disable/enable)
+--
+-- An item fires only if BOTH are enabled.
+-- Group disable doesn't mutate individual states - they're preserved for re-enable.
+
+rune.group = {}
+
+-- Master switch state: group_name -> bool (nil = enabled)
+local group_states = {}
+
+-- Check if a group is enabled (used by alias/trigger/timer modules)
+function rune.group.is_enabled(group_name)
+    if not group_name then return true end
+    if group_states[group_name] == false then
+        return false
+    end
+    return true
+end
+
+-- Disable a group (master switch off)
+function rune.group.disable(group_name)
+    if not group_name then return end
+    group_states[group_name] = false
+    rune._ui.presentation_changed()
+end
+
+-- Enable a group (master switch on)
+function rune.group.enable(group_name)
+    if not group_name then return end
+    group_states[group_name] = true
+    rune._ui.presentation_changed()
+end
+
+-- List all known groups (aggregated from every registry that honors
+-- group switches: aliases, triggers, timers, hooks, binds, bars,
+-- commands). Returns array of {name, enabled}.
+function rune.group.list()
+    local seen = {}
+
+    local modules = {
+        rune.alias, rune.trigger, rune.timer, rune.hooks,
+        rune.binds, rune.bars, rune.command,
+    }
+    for _, mod in ipairs(modules) do
+        if mod and mod.list then
+            for _, item in ipairs(mod.list()) do
+                if item.group then
+                    seen[item.group] = true
+                end
+            end
+        end
+    end
+
+    -- Also include any explicitly toggled groups (even if empty)
+    for group_name in pairs(group_states) do
+        seen[group_name] = true
+    end
+
+    local result = {}
+    for group_name in pairs(seen) do
+        table.insert(result, {
+            name = group_name,
+            enabled = rune.group.is_enabled(group_name),
+        })
+    end
+    table.sort(result, function(a, b) return a.name < b.name end)
+    return result
+end
+
+-- An item fires only if it has not been removed, is individually
+-- enabled, and its group's master switch is on.
+function Registry:active(data)
+    if data.removed or not data.enabled then
+        return false
+    end
+    return rune.group.is_enabled(data.group)
+end

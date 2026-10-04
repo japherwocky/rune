@@ -24,14 +24,9 @@ func (s *Session) PaneWrite(name, msg string) {
 	s.ui.WritePane(name, text.SanitizeDisplay(msg))
 }
 
-// PaneToggle implements lua.Host.
-func (s *Session) PaneToggle(name string) {
-	s.ui.TogglePane(name)
-}
-
-// PaneSetVisible implements lua.Host.
-func (s *Session) PaneSetVisible(name string, visible bool) {
-	s.ui.SetPaneVisible(name, visible)
+// PaneReplace implements lua.Host.
+func (s *Session) PaneReplace(name, msg string) {
+	s.ui.ReplacePane(name, text.SanitizeDisplay(msg))
 }
 
 // PaneClear implements lua.Host.
@@ -45,12 +40,12 @@ func (s *Session) ClipboardSet(text string) {
 }
 
 // ShowPicker implements lua.Host.
-func (s *Session) ShowPicker(opts ui.ShowPickerMsg) {
+func (s *Session) ShowPicker(opts ui.PickerOptions) {
 	s.ui.ShowPicker(opts)
 }
 
 // ShowSearch implements lua.Host.
-func (s *Session) ShowSearch(opts ui.ShowSearchMsg) {
+func (s *Session) ShowSearch(opts ui.SearchOptions) {
 	s.ui.ShowSearch(opts)
 }
 
@@ -61,6 +56,7 @@ func (s *Session) GetInput() string {
 
 // SetInput implements lua.Host.
 func (s *Session) SetInput(text string) {
+	text = input.NormalizeDraftText(text)
 	s.ui.SetInput(text)
 	s.currentInput = text
 	s.currentCursor = len(text)
@@ -70,6 +66,7 @@ func (s *Session) SetInput(text string) {
 // interpretation as well as text, including one-line verbatim drafts that
 // would otherwise look like ordinary command input.
 func (s *Session) SetInputSubmission(submission input.Submission) {
+	submission.Text = input.NormalizeDraftText(submission.Text)
 	s.ui.SetInputSubmission(submission)
 	s.currentInput = submission.Text
 	s.currentCursor = len(submission.Text)

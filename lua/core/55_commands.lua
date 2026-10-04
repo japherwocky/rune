@@ -1,24 +1,22 @@
 -- Slash Command System
--- Built on rune.registry (15_registry.lua), so commands get the same
+-- Built on rune.registry (20_registry.lua), so commands get the same
 -- upsert-by-name, source attribution, and failure quarantine as every
 -- other callback registry. A command that keeps throwing is disabled
--- individually - it can never take the core input hook down with it.
+-- individually - it can never take the terminal input dispatcher down with it.
 
 -- Styling shorthands (see 05_style.lua)
 local green, red, yellow, cyan, dim =
     rune.style.green, rune.style.red, rune.style.yellow,
     rune.style.cyan, rune.style.gray
 
-local by_cmd = {} -- command name -> data
+local by_cmd = {} -- command name -> data, the dispatch index
 
 local registry = rune.registry.new{
     kind = "command",
+    action_field = "handler",
     on_add = function(data)
-        -- Upsert by command name: re-adding replaces the old handler
-        local old = by_cmd[data.command]
-        if old and old ~= data then
-            old._handle:remove()
-        end
+        -- The command name is the registry name, so re-adding one has
+        -- already removed the old entry through the name upsert.
         by_cmd[data.command] = data
     end,
     on_remove = function(data)
@@ -30,7 +28,7 @@ local registry = rune.registry.new{
 
 rune.command = {}
 
--- Add a slash command. opts: group (see 15_registry.lua).
+-- Add a slash command. opts: group (see 20_registry.lua).
 -- Returns a handle with :enable/:disable/:remove.
 function rune.command.add(name, handler, description, opts)
     if type(name) ~= "string" then
@@ -45,16 +43,12 @@ function rune.command.add(name, handler, description, opts)
     if description ~= nil and type(description) ~= "string" then
         error("rune.command.add: description must be a string", 2)
     end
-    if opts ~= nil and type(opts) ~= "table" then
-        error("rune.command.add: opts must be a table", 2)
-    end
-
     return registry:add({
         command = name,
         handler = handler,
         description = description or "",
         source = rune.caller_source(1),
-    }, { name = name, group = opts and opts.group })
+    }, rune.registry.keyed_opts(name, opts, "rune.command.add"))
 end
 
 -- Remove a slash command by name. Returns true if one existed.
@@ -62,13 +56,13 @@ function rune.command.remove(name)
     return registry:remove(name)
 end
 
--- Get a slash command handler (unwrapped, no quarantine)
+-- The command's handle, or nil. Its :action() is the raw handler,
+-- which is how you wrap a built-in command.
 function rune.command.get(name)
-    local data = by_cmd[name]
-    return data and data.handler or nil
+    return registry:get(name)
 end
 
--- INTERNAL: run a command protected (called by the core input hook).
+-- INTERNAL: run a command protected (called by the input dispatcher).
 -- Returns true if the name was a known command, even when it is
 -- disabled or its handler failed - the input is consumed either way.
 function rune.command.dispatch(name, args)
@@ -246,7 +240,9 @@ rune.command.add("aliases", function(args)
         local group_str = a.group and ("  " .. cyan("<" .. a.group .. ">")) or ""
         local flags = {}
         if a.once then flags[#flags + 1] = "once" end
-        local name_str = a.name and (" " .. dim("name:") .. a.name) or ""
+        -- An exact alias is named for its phrase, already in the match column.
+        local name_str = (a.name and a.name ~= a.match)
+            and (" " .. dim("name:") .. a.name) or ""
         local flags_str = #flags > 0 and ("  " .. dim("(" .. table.concat(flags, ", ") .. ")")) or ""
         local src_str = a.source and ("  " .. dim("@" .. a.source)) or ""
         rune.echo(string.format("  %s %-8s %s %s %s %s%s%s%s",
@@ -270,6 +266,7 @@ rune.command.add("triggers", function(args)
         if t.once then flags[#flags + 1] = "once" end
         if t.raw then flags[#flags + 1] = "raw" end
         if t.span then flags[#flags + 1] = "span" end
+        if t.on == "prompt" then flags[#flags + 1] = "on:prompt" end
         local name_str = t.name and (" " .. dim("name:") .. t.name) or ""
         local flags_str = #flags > 0 and ("  " .. dim("(" .. table.concat(flags, ", ") .. ")")) or ""
         local src_str = t.source and ("  " .. dim("@" .. t.source)) or ""
@@ -287,7 +284,7 @@ rune.command.add("test", function(args)
 
     rune.echo("[Test Input] " .. args)
 
-    local modified, show = rune.trigger.process(rune.line.new(args))
+    local modified, show = rune.trigger._process_output(rune.line.new(args))
     if show and modified ~= "" then
         rune.echo("[Test Output] " .. modified)
     else
@@ -308,7 +305,7 @@ rune.command.add("timers", function(args)
         local group_str = t.group and ("  " .. cyan("<" .. t.group .. ">")) or ""
         local name_str = t.name and (" " .. dim("name:") .. t.name) or ""
         local src_str = t.source and ("  " .. dim("@" .. t.source)) or ""
-        local timing = string.format("%s %.1fs", t.mode, t.seconds)
+        local timing = string.format("%s %.1fs (%.1fs left)", t.mode, t.seconds, t.remaining)
         rune.echo(string.format("  %s %-12s %s %s%s%s%s",
             status, timing, dim("->"), t.value, group_str, name_str, src_str))
     end
@@ -341,13 +338,13 @@ rune.command.add("binds", function(args)
         rune.echo("  " .. dim("(none)"))
         return
     end
+    -- The key is the name, so there is no separate name column to print.
     for _, b in ipairs(binds) do
         local status = b.enabled and green("[on] ") or red("[off]")
         local group_str = b.group and ("  " .. cyan("<" .. b.group .. ">")) or ""
-        local name_str = b.name and ("  " .. dim("name:") .. b.name) or ""
         local src_str = b.source and ("  " .. dim("@" .. b.source)) or ""
-        rune.echo(string.format("  %s %-16s%s%s%s",
-            status, yellow(b.key), group_str, name_str, src_str))
+        rune.echo(string.format("  %s %-16s%s%s",
+            status, yellow(b.key), group_str, src_str))
     end
 end, "List all key bindings")
 

@@ -8,6 +8,7 @@ import (
 
 // Quit implements lua.Host.
 func (s *Session) Quit() {
+	s.cancelBackgroundWork()
 	s.ui.Quit()
 }
 
@@ -15,19 +16,23 @@ func (s *Session) Quit() {
 // Must be deferred because it destroys the currently executing Lua state.
 // The send is non-blocking by necessity: Reload runs ON the session
 // goroutine (called from inside a Lua dispatch), so blocking on the
-// async-result channel here would deadlock the loop that drains it.
+// internal-event channel here would deadlock the loop that drains it.
+// Scripts are told about the reload only once it is queued, so a full
+// queue never leaves them prepared for a reload that will not happen.
 func (s *Session) Reload() {
-	s.engine.CallHook("reloading")
 	select {
-	case s.asyncResults <- func() {
-		if err := s.boot(); err != nil {
-			s.ui.Print(text.Red(fmt.Sprintf("Reload Failed: %v", err)))
-		} else {
-			s.engine.CallHook("reloaded")
-		}
-	}:
+	case s.internalEvents <- reloadRequested{}:
+		s.engine.NotifyReloading()
 	default:
 		s.ui.Print(text.Red("Reload Failed: event queue full"))
+	}
+}
+
+func (s *Session) handleReloadRequested() {
+	if err := s.boot(); err != nil {
+		s.ui.Print(text.Red(fmt.Sprintf("Reload Failed: %v", err)))
+	} else {
+		s.engine.NotifyReloaded()
 	}
 }
 

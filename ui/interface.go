@@ -2,34 +2,33 @@ package ui
 
 import "github.com/mmcdole/rune/input"
 
-// UI defines the contract for the terminal display layer.
-// Implementation lives in the same package (BubbleTeaUI).
+// UI is the Session-facing display and input contract.
 type UI interface {
 	Run() error
 	Quit()
 
 	// Input/Output
-	Input() <-chan input.Submission
-	Outbound() <-chan UIEvent
+	Events() <-chan UIEvent
 	Print(text string)
 	Echo(text string)
 	SetPrompt(text string)
+	CommitPrompt(text string)
 	SetInput(text string)
 	SetInputSubmission(submission input.Submission)
 
 	// Updates
 	UpdateBars(content map[string]BarContent)
-	UpdateBinds(keys map[string]bool)
-	UpdateLayout(top, bottom []LayoutEntry)
+	UpdateBinds(keys input.Bindings)
+	UpdateLayout(layout LayoutTree)
+	UpdateConfig(cfg Config)
 
 	// Components
-	ShowPicker(opts ShowPickerMsg)
-	ShowSearch(opts ShowSearchMsg)
+	ShowPicker(opts PickerOptions)
+	ShowSearch(opts SearchOptions)
 	SetClipboard(text string)
 	CreatePane(name string)
 	WritePane(name, text string)
-	TogglePane(name string)
-	SetPaneVisible(name string, visible bool)
+	ReplacePane(name, text string)
 	ClearPane(name string)
 
 	// Input primitives. Cursor positions are zero-based rune offsets.

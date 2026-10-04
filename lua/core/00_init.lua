@@ -3,9 +3,27 @@
 -- rune.version is set by Go (single-sourced from the version package,
 -- which the telnet TTYPE/MNES responders also report) - data, not API.
 
-rune.config = {
-    delimiter = ";"
-}
+-- Application configuration. Go owns the typed values and defaults; these
+-- wrappers keep the public API in Lua like every other rune.* namespace.
+rune.config = {}
+
+function rune.config.get(key)
+    return rune._config.get(key)
+end
+
+function rune.config.set(key, value)
+    return rune._config.set(key, value)
+end
+
+setmetatable(rune.config, {
+    __newindex = function()
+        error("config values cannot be assigned directly; use rune.config.set(key, value)", 2)
+    end,
+})
+
+-- Interactive input helpers are filled in by later core scripts. Create the
+-- namespace here so dispatch can be defined before navigation and binds load.
+rune.input = {}
 
 rune.debug = false
 
@@ -139,17 +157,6 @@ end
 
 -- Core function wrappers around Go primitives (rune._*)
 
--- Send raw text to the server, bypassing alias processing.
--- Echoes send failures (e.g. not connected) rather than raising.
--- Returns true, or nil + error message.
-function rune.send_raw(text)
-    local ok, err = rune._send_raw(text)
-    if not ok then
-        rune.echo(rune.style.red("[Error]") .. " " .. tostring(err))
-    end
-    return ok, err
-end
-
 function rune.echo(text)
     rune._echo(text)
 end
@@ -233,27 +240,47 @@ function rune.store.delete(key)
     return rune._store.delete(key)
 end
 
--- Input history (Go owns the ring buffer so it survives reloads)
-
-rune.history = {}
-
-function rune.history.get()
-    return rune._history.get()
-end
-
-function rune.history.add(cmd)
-    rune._history.add(cmd)
-end
-
 -- UI namespace
 -- rune.ui.bar is added by 35_bars.lua, which owns the bar registry.
 
 rune.ui = {}
 
--- Set the layout configuration.
--- config = { top = {"bar1", {name="pane", height=10}}, bottom = {"input", "status"} }
+-- Install a layout from a root node. Returns true once the tree replaces the
+-- active layout; an invalid tree raises. The retired top/bottom table form is
+-- rejected with a notice and returns false instead of raising, because raising
+-- would abort the rest of the script that carried it.
 function rune.ui.layout(config)
+    if type(config) == "table" and config.type == nil
+        and (config.top ~= nil or config.bottom ~= nil or config.version ~= nil
+            or next(config) == nil) then
+        local source = rune.caller_source(1)
+        rune.echo(rune.style.red("[Error]") .. " rune.ui.layout: top/bottom layout tables are no longer supported"
+            .. (source and (" (" .. source .. ")") or ""))
+        rune.echo("  Pass a root node. See https://runemud.com/interface/layout/#migrating-from-topbottom-tables")
+        return false
+    end
     rune._ui.layout(config)
+    return true
+end
+
+-- A row or column with an id is a region. Region visibility hides or shows its
+-- subtree without changing the visibility or enabled state of contained resources.
+rune.ui.regions = {}
+
+function rune.ui.regions.show(id)
+    return rune._ui.region_show(id)
+end
+
+function rune.ui.regions.hide(id)
+    return rune._ui.region_hide(id)
+end
+
+function rune.ui.regions.toggle(id)
+    return rune._ui.region_toggle(id)
+end
+
+function rune.ui.regions.is_hidden(id)
+    return rune._ui.region_is_hidden(id)
 end
 
 -- Force an immediate bar refresh instead of waiting for the ticker.

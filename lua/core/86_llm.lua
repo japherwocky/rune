@@ -205,7 +205,10 @@ local function from_openai_response(data)
     local choice = data.choices and data.choices[1]
     local message = (choice and choice.message) or {}
     local content = {}
-    if message.content and message.content ~= "" then
+    -- A type check, not a truthiness check: OpenAI sends content as a
+    -- JSON null when the turn is tool_calls-only, and rune.json decodes
+    -- null to the rune.json.null sentinel (a table), which is truthy.
+    if type(message.content) == "string" and message.content ~= "" then
         table.insert(content, { type = "text", text = message.content })
     end
     for _, tc in ipairs(message.tool_calls or {}) do

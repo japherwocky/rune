@@ -15,11 +15,11 @@ func TestListingCommandsShowRegistrations(t *testing.T) {
 	defer cleanup()
 
 	if err := engine.DoString("setup", `
-		rune.alias.exact("zap", "cast zap", { name = "my-alias" })
+		rune.alias.exact("zap", "cast zap")
 		rune.trigger.contains("dragon", "flee", { name = "my-trigger" })
 		rune.timer.every(60, function() end, { name = "my-timer" })
 		rune.hooks.on("output", function() end, { name = "my-hook" })
-		rune.bind("f12", function() end, { name = "my-bind" })
+		rune.bind("f12", function() end)
 		rune.ui.bar("my-bar", function() return "bar" end)
 		rune.group.disable("my-group")
 	`); err != nil {
@@ -43,7 +43,7 @@ func TestListingCommandsShowRegistrations(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		engine.OnInput(c.command)
+		dispatchTestCommand(engine, c.command)
 		printed := strings.Join(host.DrainPrintCalls(), "\n")
 
 		if printed == "" {
@@ -83,7 +83,7 @@ func TestCommandRegistrationRejectsTableDescriptionWithoutBreakingHelp(t *testin
 	}
 
 	host.DrainPrintCalls()
-	engine.OnInput("/help")
+	dispatchTestCommand(engine, "/help")
 	printed := strings.Join(host.DrainPrintCalls(), "\n")
 	if strings.Contains(printed, "error:") {
 		t.Errorf("/help was broken by the rejected command:\n%s", printed)
@@ -146,8 +146,8 @@ func TestErrorTagIsRed(t *testing.T) {
 	engine, host, cleanup := setupTest(t)
 	defer cleanup()
 
-	engine.CallHook("error", "something broke")
-	engine.OnInput("/nosuchcommand")
+	engine.NotifyError("something broke")
+	dispatchTestCommand(engine, "/nosuchcommand")
 
 	printed := strings.Join(host.DrainPrintCalls(), "\n")
 	for _, want := range []string{

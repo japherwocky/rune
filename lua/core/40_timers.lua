@@ -1,6 +1,6 @@
 -- Timer System
 -- Timers execute actions after a delay or repeatedly at intervals.
--- Built on rune.registry (15_registry.lua).
+-- Built on rune.registry (20_registry.lua).
 --
 -- API:
 --   rune.timer.after(seconds, action, opts?)  -- One-shot timer
@@ -15,6 +15,7 @@
 -- disabled is removed - its wake-up is spent and cannot recur.
 --
 -- Returns a handle with :disable(), :enable(), :cancel(), :name(), :group()
+-- and :remaining() (seconds until the next wake-up, or nil after removal).
 --
 -- Options:
 --   name  = "string"  -- Unique ID for upsert/management
@@ -40,6 +41,14 @@ local registry = rune.registry.new{
     end,
 }
 
+local function remaining(self)
+    local data = self._data
+    if data.removed then
+        return nil
+    end
+    return rune._timer.remaining(data.timer_id)
+end
+
 -- Create a timer (internal)
 local function create_timer(seconds, action, opts, repeating)
     local data = {
@@ -51,6 +60,7 @@ local function create_timer(seconds, action, opts, repeating)
 
     local handle = registry:add(data, opts)
     handle.cancel = handle.remove -- :cancel() is intuitive for timers
+    handle.remaining = remaining
 
     local function callback()
         -- Individual state AND group master switch
@@ -120,6 +130,10 @@ function rune.timer.every(seconds, action, opts)
 end
 
 -- Management by name
+function rune.timer.get(name)
+    return registry:get(name)
+end
+
 function rune.timer.disable(name)
     return registry:disable(name)
 end
@@ -135,12 +149,14 @@ end
 -- Alias: cancel is intuitive for timers
 rune.timer.cancel = rune.timer.remove
 
--- List all timers - returns array of {seconds, mode, value, name, enabled, group}
+-- List all timers. Remaining seconds come from the Go schedule, even when
+-- callbacks are suppressed by disable/group state. A spent wake-up reads zero.
 function rune.timer.list()
     local result = {}
     for _, data in ipairs(registry:items()) do
         table.insert(result, {
             seconds = data.seconds,
+            remaining = rune._timer.remaining(data.timer_id),
             mode = data.repeating and "every" or "after",
             value = type(data.action) == "function" and "(function)" or tostring(data.action),
             name = data.name,

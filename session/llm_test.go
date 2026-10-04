@@ -72,7 +72,7 @@ func TestLLMRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	awaitAsyncResult(t, s)
+	awaitInternalEvent(t, s)
 
 	if v, _ := s.SessionGet("text"); v != "hi there" {
 		t.Errorf("text = %q, want %q", v, "hi there")
@@ -178,7 +178,7 @@ func TestLLMMissingAPIKeyDeliversError(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	awaitAsyncResult(t, s)
+	awaitInternalEvent(t, s)
 
 	if v, _ := s.SessionGet("err"); !strings.Contains(v, "OPENCODE_API_KEY") {
 		t.Errorf("err = %q, want it to mention OPENCODE_API_KEY", v)
@@ -220,7 +220,7 @@ func TestLLMRetriesOnRateLimitThenSucceeds(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	awaitAsyncResult(t, s)
+	awaitInternalEvent(t, s)
 
 	if v, _ := s.SessionGet("text"); v != "ok now" {
 		t.Errorf("text = %q, want %q (should succeed after retrying past the 429s)", v, "ok now")
@@ -260,7 +260,7 @@ func TestLLMRetriesExhaustedDeliversLastResponse(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	awaitAsyncResult(t, s)
+	awaitInternalEvent(t, s)
 
 	// A persistent 429 is still a response, not a transport error - it
 	// must reach the caller as the ordinary non-200 path (extracting
@@ -305,7 +305,7 @@ func TestLLMOpenAIProviderOmitsAuthWhenNoKey(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	awaitAsyncResult(t, s)
+	awaitInternalEvent(t, s)
 
 	if v, _ := s.SessionGet("text"); v != "hi there" {
 		t.Errorf("text = %q, want %q", v, "hi there")
@@ -343,7 +343,7 @@ func TestLLMOpenAIProviderSendsBearerWhenKeySet(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	awaitAsyncResult(t, s)
+	awaitInternalEvent(t, s)
 
 	if gotAuth != "Bearer local-key-456" {
 		t.Errorf("Authorization = %q, want %q", gotAuth, "Bearer local-key-456")
@@ -373,7 +373,7 @@ func TestLLMOpenAIProviderMissingURLDeliversError(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	awaitAsyncResult(t, s)
+	awaitInternalEvent(t, s)
 
 	if v, _ := s.SessionGet("err"); !strings.Contains(v, "RUNE_LLM_URL") {
 		t.Errorf("err = %q, want it to mention RUNE_LLM_URL", v)
@@ -401,7 +401,7 @@ func TestLLMUnknownProviderDeliversError(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	awaitAsyncResult(t, s)
+	awaitInternalEvent(t, s)
 
 	if v, _ := s.SessionGet("err"); !strings.Contains(v, "openia") {
 		t.Errorf("err = %q, want it to mention the bad provider name", v)

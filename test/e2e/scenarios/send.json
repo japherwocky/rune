@@ -1,5 +1,5 @@
 {
-  "description": "The input-to-wire pipeline (75_send.lua): the canary scenario plus command expansion. Expansion variants live in lua/send_test.go.",
+  "description": "The input-to-wire pipeline: canary coverage plus command and history expansion. Variants live in lua/send_test.go and lua/history_expansion_test.go.",
   "scenarios": [
     {
       "name": "typed input reaches the server",
@@ -16,6 +16,36 @@
         { "type": "say one;say two" },
         { "expect_sent": "say one" },
         { "expect_sent": "say two" }
+      ]
+    },
+    {
+      "name": "doubled separators stay literal through history replay",
+      "steps": [
+        { "connect": true },
+        { "type": "say one;;two;look" },
+        { "expect_sent": "say one;two" },
+        { "expect_sent": "look" },
+        { "type": "!" },
+        { "expect_sent": "say one;two\r\nlook\r\nsay one;two\r\nlook\r\n" }
+      ]
+    },
+    {
+      "name": "repeat a named command sequence",
+      "init_lua": "rune.alias.exact('round', 'kill rat;loot')",
+      "steps": [
+        { "connect": true },
+        { "type": "#2 round;score" },
+        { "expect_sent": "kill rat\r\nloot\r\nkill rat\r\nloot\r\nscore\r\n" }
+      ]
+    },
+    {
+      "name": "history expansion repeats the last command",
+      "steps": [
+        { "connect": true },
+        { "type": "north" },
+        { "expect_sent": "north" },
+        { "type": "!" },
+        { "expect_sent": "north" }
       ]
     }
   ]

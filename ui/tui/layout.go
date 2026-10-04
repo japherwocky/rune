@@ -1,142 +1,252 @@
 package tui
 
 import (
-	"strings"
+	"image"
 
 	"github.com/mmcdole/rune/ui"
 	"github.com/mmcdole/rune/ui/tui/widget"
 )
 
-func (m *Model) getLayout() ui.LayoutConfig {
-	if len(m.luaLayout.Top) > 0 || len(m.luaLayout.Bottom) > 0 {
-		return ui.LayoutConfig{
-			Top:    m.luaLayout.Top,
-			Bottom: m.luaLayout.Bottom,
+// layoutWidget supplies content measurements and renders at the allocated size.
+// All widgets exclude outside borders from measurement, sizing, and View.
+// Input owns only the separator inside its picker/search content.
+type layoutWidget interface {
+	MinimumSize() image.Point
+	SetSize(width, height int)
+	MeasureHeight(width, limit int) int
+	View() string
+}
+
+type splitAxis uint8
+
+const (
+	axisHorizontal splitAxis = iota
+	axisVertical
+)
+
+// layoutPlan is the complete geometry for one frame. The same plan sizes the
+// output window for interaction and places every leaf for rendering.
+type layoutPlan struct {
+	leaves  []*resolvedNode
+	borders borderGrid
+	output  image.Rectangle
+	// Text changes only affect geometry for these panes or their auto ancestors.
+	autoPanes map[string]bool
+}
+
+// resolvedNode is an active tree node. Leaves carry a widget and its geometry;
+// containers carry children.
+type resolvedNode struct {
+	node       ui.LayoutNode
+	widget     layoutWidget
+	children   []*resolvedNode
+	boundaries []boundary // resolved once, shared by measurement and allocation
+	outer      image.Rectangle
+	content    image.Rectangle
+	edges      borderEdges // outside borders: requested during measurement, final after placement
+	shared     borderEdges // anticipated shared cells, used only for measurement
+	hasInput   bool
+}
+
+func (m *Model) resolveLayout() layoutPlan {
+	plan := layoutPlan{}
+	if m.width <= 0 || m.height <= 0 {
+		return plan
+	}
+	root := m.resolveNode(m.layout.Root, m.width, axisVertical)
+	if root == nil {
+		return plan
+	}
+	assignSharedEdges(root, 0)
+	plan.borders = newBorderGrid(m.width, m.height)
+	m.placeNode(root, image.Rect(0, 0, m.width, m.height), axisVertical, 0, &plan)
+	plan.collectAutoPanes(root, false)
+	m.planBorders(&plan)
+	for _, leaf := range plan.leaves {
+		if leaf.widget == m.output {
+			plan.output = leaf.content
+			break
 		}
 	}
-	return ui.DefaultLayoutConfig()
+	return plan
 }
 
-// getWidget returns the Widget for a given name.
-func (m *Model) getWidget(name string) widget.Widget {
-	// Check widgets map (input, separator, bars)
-	if w, ok := m.widgets[name]; ok {
-		return w
-	}
-
-	// Panes (PaneManager returns *Pane which implements Widget)
-	if m.panes.Exists(name) {
-		return m.panes.Get(name)
-	}
-
-	return nil
-}
-
-// sizeDockEntry applies one layout entry and returns its widget and final
-// height. Measurement and rendering share this path so intrinsic-height
-// policy cannot drift between an Update-time reflow and the next View.
-func (m *Model) sizeDockEntry(entry ui.LayoutEntry) (widget.Widget, int, bool) {
-	w := m.getWidget(entry.Name)
-	if w == nil {
-		return nil, 0, false
-	}
-
-	// Options are per-entry but the widget instance is shared, so pass the
-	// bag unconditionally: an entry without options must reset whatever a
-	// previous entry configured in the same layout pass.
-	if c, ok := w.(widget.Configurable); ok {
-		c.SetOptions(entry.Opts)
-	}
-
-	// Width can affect intrinsic height (notably soft-wrapped composer text),
-	// so make the current width available before asking for it. Existing
-	// fixed-height widgets ignore the zero height.
-	w.SetSize(m.width, 0)
-	preferred := w.PreferredHeight()
-	if preferred == 0 {
-		return nil, 0, false
-	}
-
-	h := entry.Height
-	if h == 0 {
-		h = preferred
-	}
-	w.SetSize(m.width, h)
-	return w, h, true
-}
-
-// layoutDock sizes and renders one dock's widgets, returning the joined
-// view and total height. A zero-height widget is skipped entirely.
-func (m *Model) layoutDock(entries []ui.LayoutEntry) (string, int) {
-	var parts []string
-	totalHeight := 0
-	for _, entry := range entries {
-		w, h, ok := m.sizeDockEntry(entry)
-		if !ok {
-			continue
+func (p *layoutPlan) collectAutoPanes(node *resolvedNode, auto bool) {
+	auto = auto || node.node.Size.Kind == ui.LayoutSizeAuto
+	if auto && node.node.Type == ui.LayoutTypePane {
+		if p.autoPanes == nil {
+			p.autoPanes = make(map[string]bool)
 		}
-		parts = append(parts, w.View())
-		totalHeight += h
+		p.autoPanes[node.node.Name] = true
 	}
-	return strings.Join(parts, "\n"), totalHeight
+	for _, child := range node.children {
+		p.collectAutoPanes(child, auto)
+	}
 }
 
-// dockHeight measures a dock without rendering it. Search uses this during
-// Update so viewport positioning sees the same final geometry as View.
-func (m *Model) dockHeight(entries []ui.LayoutEntry) int {
-	totalHeight := 0
-	for _, entry := range entries {
-		_, h, ok := m.sizeDockEntry(entry)
-		if ok {
-			totalHeight += h
-		}
-	}
-	return totalHeight
-}
-
-func (m *Model) setViewportSize(topHeight, bottomHeight int) {
-	viewportHeight := m.height - topHeight - bottomHeight
-	if viewportHeight < 1 {
-		viewportHeight = 1
-	}
-	m.viewport.SetSize(m.width, viewportHeight)
-}
-
-// syncViewportSize makes layout geometry current outside View. Callers that
-// anchor content inside the viewport can then position it against the same
-// dimensions the next render will use.
-func (m *Model) syncViewportSize() {
+// applyLayout resolves current state and applies all leaf rectangles once at
+// the end of Update, before geometry-dependent navigation and rendering.
+func (m *Model) applyLayout() {
 	if !m.initialized {
 		return
 	}
-	cfg := m.getLayout()
-	m.setViewportSize(m.dockHeight(cfg.Top), m.dockHeight(cfg.Bottom))
+	plan := m.resolveLayout()
+	if width, height := plan.output.Dx(), plan.output.Dy(); width > 0 && height > 0 {
+		m.output.SetSize(width, height)
+	} else {
+		m.output.SetFallbackSize(m.width, m.height)
+	}
+	for _, leaf := range plan.leaves {
+		if !leaf.content.Empty() && leaf.widget != m.output {
+			leaf.widget.SetSize(leaf.content.Dx(), leaf.content.Dy())
+		}
+	}
+	m.layoutPlan = plan
+	m.needsClear = true
 }
 
-// View implements tea.Model.
-// Layout is calculated here to ensure it's always fresh when rendering.
-func (m *Model) View() string {
-	if !m.initialized {
-		return "Loading..."
+// resolveNode prunes hidden placements and leaves that cannot currently
+// render, returning nil for an inactive subtree. Leaf selection and initial
+// border measurement live here; placement applies the final dimensions later.
+func (m *Model) resolveNode(node ui.LayoutNode, availableWidth int, parentAxis splitAxis) *resolvedNode {
+	if node.Hidden {
+		return nil
+	}
+	if parentAxis == axisHorizontal {
+		if node.Size.Kind == ui.LayoutSizeCells {
+			availableWidth = min(availableWidth, node.Size.Value)
+		}
+		if maximum := nodeMaximum(node); maximum > 0 {
+			availableWidth = min(availableWidth, maximum)
+		}
+	}
+	resolved := &resolvedNode{node: node}
+	if node.IsContainer() {
+		resolved.children = make([]*resolvedNode, 0, len(node.Children))
+		for _, childNode := range node.Children {
+			if child := m.resolveNode(childNode, availableWidth, nodeAxis(node)); child != nil {
+				resolved.children = append(resolved.children, child)
+				resolved.hasInput = resolved.hasInput || child.hasInput
+			}
+		}
+		if len(resolved.children) == 0 {
+			return nil
+		}
+		resolved.boundaries = childBoundaries(node, resolved.children, nodeAxis(node))
+		resolved.edges = containerBorders(node, resolved.children)
+		// A hard cap can force descendants to drop borders. Do not promise that
+		// capped container's boundary to a neighbor before the fallback runs.
+		if maximum := nodeMaximum(node); resolved.hasInput && maximum > 0 && maximum < m.intrinsicMinimum(resolved, parentAxis) {
+			resolved.edges = 0
+		}
+		return resolved
 	}
 
-	// Calculate layout fresh each render - guarantees no stale dimensions
-	cfg := m.getLayout()
-	topView, topHeight := m.layoutDock(cfg.Top)
-	bottomView, bottomHeight := m.layoutDock(cfg.Bottom)
-
-	// The viewport spans the full terminal width; splitRows wraps
-	// appended rows to the same m.width.
-	m.setViewportSize(topHeight, bottomHeight)
-
-	var parts []string
-	if topView != "" {
-		parts = append(parts, topView)
+	switch node.Type {
+	case ui.LayoutTypeInput:
+		var height int
+		if parentAxis == axisVertical && node.Size.Kind == ui.LayoutSizeCells {
+			height = node.Size.Value
+		} else {
+			height = 2 + m.input.MeasureHeight(max(1, availableWidth), ui.MaxLayoutCells-2)
+		}
+		if parentAxis == axisVertical {
+			if maximum := nodeMaximum(node); maximum > 0 {
+				height = min(height, maximum)
+			}
+		}
+		resolved.widget, resolved.hasInput = m.input, true
+		resolved.edges = m.inputBorders(availableWidth, height)
+	case ui.LayoutTypeSeparator:
+		resolved.widget = widget.NewSeparator(node.SeparatorChar, m.styles.PaneBorder)
+	case ui.LayoutTypePane:
+		// First placement creates an empty named buffer, so it remains a
+		// visible pane even before any text is written to it.
+		resolved.widget = m.pane(node.Name)
+		resolved.edges = paneBorders(node.Border)
+	case ui.LayoutTypeBar:
+		bar := m.bars[node.Name]
+		// Missing and empty bars collapse even when assigned a fixed track.
+		if bar == nil || bar.MeasureHeight(availableWidth, 1) == 0 {
+			return nil
+		}
+		resolved.widget = bar
+	default:
+		return nil
 	}
-	parts = append(parts, m.viewport.View())
-	if bottomView != "" {
-		parts = append(parts, bottomView)
+	return resolved
+}
+
+func (m *Model) placeNode(node *resolvedNode, rect image.Rectangle, parentAxis splitAxis, shared borderEdges, plan *layoutPlan) {
+	if rect.Empty() {
+		return
+	}
+	if node.widget != nil {
+		edges := node.edges
+		if node.widget == m.input {
+			// Constrained input may drop borders at the allocated size.
+			edges = m.inputBorders(rect.Dx(), rect.Dy())
+		}
+		node.edges = edges
+		node.outer, node.content = rect, insetBorders(rect, edges|shared)
+		if node.node.Type == ui.LayoutTypeSeparator && node.node.SeparatorChar == "" && parentAxis == axisVertical {
+			// Default separators in columns join the border grid; custom
+			// characters and separators in rows keep their widget content.
+			plan.borders.markHorizontal(rect.Min.Y, rect.Min.X, rect.Max.X)
+			node.content = image.Rectangle{}
+		}
+		plan.leaves = append(plan.leaves, node)
+		return
 	}
 
-	return strings.Join(parts, "\n")
+	axis := nodeAxis(node.node)
+	allocation := m.allocateChildren(node, axisExtent(rect, axis), axis, crossExtent(rect, axis))
+
+	position := rect.Min.X
+	if axis == axisVertical {
+		position = rect.Min.Y
+	}
+	for i, child := range node.children {
+		size := allocation.sizes[i]
+		childArea := childRect(rect, axis, position, size).Intersect(rect)
+		inherited := childSharedEdges(node, i, shared, allocation.boundaries)
+		if childArea.Min.X != rect.Min.X {
+			inherited &^= shared & borderLeft
+		}
+		if childArea.Max.X != rect.Max.X {
+			inherited &^= shared & borderRight
+		}
+		if childArea.Min.Y != rect.Min.Y {
+			inherited &^= shared & borderTop
+		}
+		if childArea.Max.Y != rect.Max.Y {
+			inherited &^= shared & borderBottom
+		}
+		m.placeNode(child, childArea, axis, inherited, plan)
+		position += size
+		if i < len(node.children)-1 {
+			gap := allocation.boundaries[i].gap
+			// The tiny-terminal fallback drops gaps, and with them the cell a
+			// divider draws in, so dividers degrade away with their gap.
+			if node.node.Dividers && !allocation.constrained {
+				at := position + (gap-1)/2
+				if gap == 0 {
+					before, _ := seamBorders(node.children, i, axis)
+					at = position
+					if before {
+						at--
+					}
+				}
+				if axis == axisHorizontal {
+					plan.borders.markVertical(at, rect.Min.Y, rect.Max.Y)
+				} else {
+					plan.borders.markHorizontal(at, rect.Min.X, rect.Max.X)
+				}
+			}
+			position += gap
+			if allocation.boundaries[i].overlap {
+				position--
+			}
+		}
+	}
 }

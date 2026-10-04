@@ -7,6 +7,7 @@ layout-test
 
 # Generated files
 allcode.txt
+__pycache__/
 
 # Local files
 .DS_Store
@@ -15,3 +16,4 @@ init.lua.old
 .env
 script/luajit/vendor_luajit/
 bin/
+/perf-results/

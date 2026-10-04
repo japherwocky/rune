@@ -2,470 +2,388 @@ package tui
 
 import (
 	"os"
-	"strings"
 	"time"
 
+	tea "charm.land/bubbletea/v2"
 	osc52 "github.com/aymanbagabas/go-osc52/v2"
-	tea "github.com/charmbracelet/bubbletea"
+	uv "github.com/charmbracelet/ultraviolet"
 
 	"github.com/mmcdole/rune/input"
 	"github.com/mmcdole/rune/text"
 	"github.com/mmcdole/rune/ui"
 	"github.com/mmcdole/rune/ui/tui/style"
-	"github.com/mmcdole/rune/ui/tui/util"
 	"github.com/mmcdole/rune/ui/tui/widget"
 )
 
-// tickMsg closes a 16ms output batch window: the first server line
-// after an idle period renders immediately and opens the window; lines
-// arriving inside it are batched to prevent excessive renders on fast
-// MUD output. Ticks are scheduled on demand only - an idle client has
-// no standing timer and zero wakeups.
-type tickMsg time.Time
-
-// doTick returns a command that closes the batch window after 16ms.
-func doTick() tea.Cmd {
-	return tea.Tick(16*time.Millisecond, func(t time.Time) tea.Msg {
-		return tickMsg(t)
-	})
-}
-
 // Model is the main Bubble Tea model for the TUI. It routes messages
 // between the session and the widgets; input-mode policy lives in the
-// inputController, layout and rendering in layout.go.
+// inputController; layout planning and canvas rendering are separate.
 type Model struct {
 	// Layout
-	widgets map[string]widget.Widget // all named widgets: input, separator, bars
+	bars   map[string]*widget.Bar // bar namespace
+	styles style.Styles
 
 	// Widgets
-	scrollback *widget.ScrollbackBuffer
-	viewport   *widget.Viewport
-	input      *widget.Input
-	panes      *widget.PaneManager
+	output *widget.Output
+	input  *widget.Input
+	panes  map[string]pane
 
 	// Input-mode state machine (normal / modal picker / inline picker / search)
 	inputCtl *inputController
 
-	// Viewport geometry and focus for the active/committed search result.
+	// Output geometry and focus for the active/committed search result.
 	searchView searchViewState
 
 	// Push-based state from Session
-	boundKeys  map[string]bool
-	barContent map[string]ui.BarContent
-	luaLayout  struct {
-		Top    []ui.LayoutEntry
-		Bottom []ui.LayoutEntry
-	}
+	layout     ui.LayoutTree
+	layoutPlan layoutPlan
+
+	// Render throttle. Dirty means undrawn changes. A zero renderInterval
+	// renders immediately during Update and schedules no ticks.
+	renderInterval time.Duration
+	throttled      bool
+	dirty          bool
+	screen         string
+	renders        int
+
+	// Renderer state reused between renders: the cell grid and the styled
+	// border cell for each junction glyph.
+	canvas      uv.ScreenBuffer
+	needsClear  bool // layout changed; erase uncovered cells on the next render
+	borderCells map[string]*uv.Cell
+
+	// Last scroll state the Session queue accepted; see reportScrollState.
+	reportedScroll ui.ScrollStateChangedMsg
 
 	// State
-	lastPrompt  string
-	width       int
-	height      int
-	inputChan   chan<- input.Submission
-	outbound    chan<- ui.UIEvent
-	initialized bool
-	pendingRows []string
-	// flushScheduled is true while a batch-window tick is outstanding.
-	// At most one tick is ever in flight: it is armed only on the
-	// idle->hot transition and re-armed only from handleTick while
-	// output is still flowing.
-	flushScheduled bool
+	width        int
+	height       int
+	events       chan<- ui.UIEvent
+	mouseEnabled bool
+	numpadMode   bool
+	initialized  bool
 }
 
 // NewModel creates a new TUI model.
-func NewModel(inputChan chan<- input.Submission, outbound chan<- ui.UIEvent) *Model {
+func NewModel(events chan<- ui.UIEvent) *Model {
 	styles := style.DefaultStyles()
-	scrollback := widget.NewScrollbackBuffer(100000)
-	viewport := widget.NewViewport(scrollback, styles)
-	search := widget.NewSearch(scrollback, styles)
+	output := widget.NewOutput(100000, styles)
+	search := widget.NewSearch(output.Scrollback(), styles)
 	input := widget.NewInput(styles, search)
-	panes := widget.NewPaneManager(styles)
 
 	m := &Model{
-		scrollback: scrollback,
-		viewport:   viewport,
-		input:      input,
-		panes:      panes,
-		inputChan:  inputChan,
-		outbound:   outbound,
-		widgets:    make(map[string]widget.Widget),
+		output:      output,
+		input:       input,
+		panes:       map[string]pane{ui.OutputPaneName: output},
+		events:      events,
+		bars:        make(map[string]*widget.Bar),
+		borderCells: make(map[string]*uv.Cell),
+		styles:      styles,
+		layout:      ui.DefaultLayoutTree(),
+		// Session starts from the same value, so an untouched output window
+		// reports nothing.
+		reportedScroll: ui.ScrollStateChangedMsg{Mode: "live"},
 	}
-	m.inputCtl = newInputController(input, m.sendOutbound, m.sendLine, m.isBound, m.handleScrollKey, m)
-
-	// Register static widgets
-	m.widgets["input"] = input
-	m.widgets["separator"] = widget.NewSeparator()
+	m.inputCtl = &inputController{input: input, host: m}
 
 	return m
 }
 
-// Init implements tea.Model. No standing tick: batch-window ticks are
-// scheduled on demand when server output arrives.
+// Init implements tea.Model. No standing tick: renderTicks are scheduled on
+// demand when something changes.
 func (m *Model) Init() tea.Cmd {
-	return tea.EnterAltScreen
+	return nil
 }
 
-// Update implements tea.Model.
+// Update applies a message, resolves changed geometry, and renders when due.
+// Ordinary output only appends and marks pixels dirty. View returns the last
+// rendered screen and never changes session-visible scroll state.
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	render, layout := m.dispatch(msg)
+
+	previousOutput := m.layoutPlan.output
+	if layout {
+		m.applyLayout()
+	}
+	m.applySearchPosition(previousOutput != m.layoutPlan.output)
+
+	if render {
+		m.dirty = true
+	}
+	return m, m.renderIfDue()
+}
+
+// dispatch applies one message to state. Nothing here renders, reports
+// scroll state, or schedules work: Update does that once, afterwards.
+// The return values describe changed pixels and changed geometry. Text arriving
+// in ordinary panes needs rendering, but does not resize unrelated widgets.
+func (m *Model) dispatch(msg tea.Msg) (render, layout bool) {
 	switch msg := msg.(type) {
 	// System
 	case tea.WindowSizeMsg:
-		return m.handleWindowSize(msg)
-	case tickMsg:
-		return m.handleTick()
-	case tea.KeyMsg:
+		m.width, m.height = msg.Width, msg.Height
+		m.initialized = true
+		m.notifySession(ui.WindowSizeChangedMsg{Width: msg.Width, Height: msg.Height})
+	case renderTick:
+		// Allow pending pixels and scroll reports through. The scheduler
+		// ends the tick chain when neither needs more work.
+		m.throttled = false
+		return false, false
+	case tea.KeyPressMsg:
+		before := m.input.LayoutState()
 		m.inputCtl.HandleKey(msg)
-		return m, nil
-	case tea.MouseMsg:
-		return m.handleMouse(msg)
+		// A rejected event or submission can append a warning to output.
+		return true, before != m.input.LayoutState() || m.layoutPlan.autoPanes[ui.OutputPaneName]
+	case tea.PasteMsg:
+		before := m.input.LayoutState()
+		m.inputCtl.HandlePaste(msg.Content)
+		return true, before != m.input.LayoutState() || m.layoutPlan.autoPanes[ui.OutputPaneName]
+	case tea.MouseWheelMsg:
+		m.handleMouseWheel(msg)
+		return true, false
 
 	// Session config updates
-	case ui.UpdateBindsMsg, ui.UpdateBarsMsg, ui.UpdateLayoutMsg:
-		return m.handleConfigUpdate(msg)
+	case updateBindsMsg:
+		m.input.SetBindings(input.Bindings(msg))
+		return true, false
+	case updateBarsMsg:
+		return m.syncBars(msg)
+	case updateLayoutMsg:
+		m.layout = ui.LayoutTree(msg)
+	case updateConfigMsg:
+		m.inputCtl.SetKeepOnSubmit(msg.KeepInput)
+		m.mouseEnabled = msg.Mouse
+		m.numpadMode = msg.Numpad
+		return true, false
 
-	// Server output
-	case ui.PrintLineMsg, ui.EchoLineMsg, ui.PromptMsg:
-		return m.handleServerOutput(msg)
+	// Scrollback appends and the prompt overlay. Server lines and local
+	// echoes differ only in where Session sends them from.
+	case printLineMsg:
+		m.output.Write(string(msg))
+		return true, m.layoutPlan.autoPanes[ui.OutputPaneName]
+	case echoLineMsg:
+		m.output.Write(string(msg))
+		return true, m.layoutPlan.autoPanes[ui.OutputPaneName]
+	case setPromptMsg:
+		changed := m.output.SetPrompt(string(msg))
+		return changed, changed && m.layoutPlan.autoPanes[ui.OutputPaneName]
+	case commitPromptMsg:
+		changed := m.output.CommitPrompt(string(msg))
+		return changed, changed && m.layoutPlan.autoPanes[ui.OutputPaneName]
 
-	// Pane operations
-	case ui.PaneCreateMsg, ui.PaneWriteMsg, ui.PaneToggleMsg, ui.PaneSetVisibleMsg, ui.PaneClearMsg:
-		return m.handlePaneMsg(msg)
+	// Pane buffer content. Placement and visibility are layout-tree state
+	// and arrive as UpdateLayoutMsg instead.
+	case paneCreateMsg:
+		m.pane(msg.Name)
+		return false, false
+	case paneWriteMsg:
+		m.pane(msg.Name).Write(msg.Text)
+		return true, m.layoutPlan.autoPanes[msg.Name]
+	case paneReplaceMsg:
+		m.dropOutputSearch(msg.Name)
+		p := m.pane(msg.Name)
+		p.Clear()
+		p.Write(msg.Text)
+		// Clearing output can also close search and resize the input area.
+		return true, msg.Name == ui.OutputPaneName || m.layoutPlan.autoPanes[msg.Name]
+	case paneClearMsg:
+		m.dropOutputSearch(msg.Name)
+		if p, ok := m.panes[msg.Name]; ok {
+			p.Clear()
+		}
+		return true, msg.Name == ui.OutputPaneName || m.layoutPlan.autoPanes[msg.Name]
 
 	// Input control
-	case ui.ShowPickerMsg:
-		m.inputCtl.ShowPicker(msg)
-		return m, nil
-	case ui.ShowSearchMsg:
-		m.inputCtl.ShowSearch(msg)
-		return m, nil
-	case ui.SetInputMsg:
+	case showPickerMsg:
+		m.inputCtl.ShowPicker(msg.options)
+	case showSearchMsg:
+		m.inputCtl.ShowSearch(msg.options)
+	case setInputMsg:
 		m.inputCtl.SetText(string(msg))
-		return m, nil
-	case ui.SetInputSubmissionMsg:
+	case setInputSubmissionMsg:
 		m.inputCtl.SetSubmission(input.Submission(msg))
-		return m, nil
 
 	// Input primitives (from Lua)
-	case ui.InputSetCursorMsg:
+	case inputSetCursorMsg:
 		m.input.SetCursor(int(msg))
-		return m, nil
+		m.notifySession(ui.DraftAppliedMsg{Text: m.input.Value(), Cursor: m.input.Position()})
+		return true, m.layoutPlan.autoPanes[ui.OutputPaneName]
 
 	// Clipboard (from Lua). OSC 52 asks the terminal emulator to set
 	// the system clipboard; it renders nothing, so it bypasses the
 	// renderer and goes to the terminal on stderr.
-	case ui.SetClipboardMsg:
+	case setClipboardMsg:
 		osc52.New(string(msg)).WriteTo(os.Stderr) //nolint:errcheck // best-effort: no way to report terminal-side failure
-		return m, nil
+		return false, false
 
-	// Pane scrolling (from Lua). "main" is the output viewport; any
-	// other name scrolls that pane's own buffer. Unknown panes are
-	// ignored rather than auto-created.
-	case ui.PaneScrollUpMsg:
-		if msg.Name == "main" {
-			m.navigateMainViewport(func() {
-				m.viewport.ScrollUp(msg.Lines)
-			})
-		} else if m.panes.Exists(msg.Name) {
-			m.panes.Get(msg.Name).ScrollUp(msg.Lines)
-		}
-		return m, nil
-	case ui.PaneScrollDownMsg:
-		if msg.Name == "main" {
-			m.navigateMainViewport(func() {
-				m.viewport.ScrollDown(msg.Lines)
-			})
-		} else if m.panes.Exists(msg.Name) {
-			m.panes.Get(msg.Name).ScrollDown(msg.Lines)
-		}
-		return m, nil
-	case ui.PaneScrollToTopMsg:
-		if msg.Name == "main" {
-			m.navigateMainViewport(m.viewport.GotoTop)
-		} else if m.panes.Exists(msg.Name) {
-			m.panes.Get(msg.Name).ScrollToTop()
-		}
-		return m, nil
-	case ui.PaneScrollToBottomMsg:
-		if msg.Name == "main" {
-			m.navigateMainViewport(m.viewport.GotoBottom)
-		} else if m.panes.Exists(msg.Name) {
-			m.panes.Get(msg.Name).ScrollToBottom()
-		}
-		return m, nil
+	// Pane scrolling (from Lua). Every named pane follows the same pane
+	// contract.
+	case paneScrollUpMsg:
+		m.scrollPane(msg.Name, func(pane pane) { pane.ScrollUp(msg.Lines) })
+		return true, false
+	case paneScrollDownMsg:
+		m.scrollPane(msg.Name, func(pane pane) { pane.ScrollDown(msg.Lines) })
+		return true, false
+	case paneScrollToTopMsg:
+		m.scrollPane(msg.Name, func(pane pane) { pane.ScrollToTop() })
+		return true, false
+	case paneScrollToBottomMsg:
+		m.scrollPane(msg.Name, func(pane pane) { pane.ScrollToBottom() })
+		return true, false
+	default:
+		return false, false
 	}
-
-	return m, nil
+	return true, true
 }
 
-func (m *Model) handleWindowSize(msg tea.WindowSizeMsg) (tea.Model, tea.Cmd) {
-	m.width = msg.Width
-	m.height = msg.Height
-	m.initialized = true
-	m.syncViewportSize()
-	scrollStateChanged := m.recenterSearchFocus()
-	m.sendOutbound(ui.WindowSizeChangedMsg{Width: msg.Width, Height: msg.Height})
-	if scrollStateChanged {
-		m.updateScrollState()
+// syncBars reconciles the bar registry with the latest successful Lua snapshot.
+// Panes and built-in widgets have separate owners and namespaces.
+func (m *Model) syncBars(content map[string]ui.BarContent) (changed, layout bool) {
+	for name, bar := range m.bars {
+		if _, exists := content[name]; !exists {
+			delete(m.bars, name)
+			changed = true
+			layout = layout || bar.MeasureHeight(0, 1) != 0
+		}
 	}
-	return m, nil
+
+	for name, barContent := range content {
+		bar, exists := m.bars[name]
+		if !exists {
+			bar = new(widget.Bar)
+			m.bars[name] = bar
+			changed = true
+		}
+		contentChanged, visibilityChanged := bar.SetContent(barContent)
+		changed = changed || contentChanged
+		layout = layout || visibilityChanged
+	}
+	return changed, layout
 }
 
-// handleTick closes the current batch window: flushes any lines that
-// arrived inside it and re-arms the window only while output is still
-// flowing. A tick that finds nothing pending (output went quiet, or an
-// echo already flushed eagerly) ends the chain - back to zero wakeups.
-func (m *Model) handleTick() (tea.Model, tea.Cmd) {
-	m.flushScheduled = false
-	if len(m.pendingRows) == 0 {
-		return m, nil
-	}
-	m.flushPending()
-	m.flushScheduled = true
-	return m, doTick()
-}
-
-// flushPending appends all batched server rows to the scrollback.
-func (m *Model) flushPending() {
-	if len(m.pendingRows) == 0 {
+// dropOutputSearch abandons an active scrollback search before the output
+// buffer it anchors to is emptied.
+func (m *Model) dropOutputSearch(name string) {
+	if name != ui.OutputPaneName {
 		return
 	}
-	m.appendRows(m.pendingRows...)
-	m.pendingRows = nil
+	if m.input.SearchActive() {
+		m.inputCtl.closeSearch(false)
+	}
+	m.searchView = searchViewState{}
 }
 
-func (m *Model) handleConfigUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
-	layoutChanged := false
-	switch msg := msg.(type) {
-	case ui.UpdateBindsMsg:
-		m.boundKeys = msg
-	case ui.UpdateBarsMsg:
-		m.syncBars(msg)
-		layoutChanged = true
-	case ui.UpdateLayoutMsg:
-		m.luaLayout.Top = msg.Top
-		m.luaLayout.Bottom = msg.Bottom
-		layoutChanged = true
+// scrollPane applies one navigation operation to an existing pane.
+func (m *Model) scrollPane(name string, scroll func(pane)) {
+	pane, ok := m.panes[name]
+	if !ok {
+		return
 	}
-	if layoutChanged {
-		m.syncViewportSize()
-		if m.recenterSearchFocus() {
-			m.updateScrollState()
-		}
+	if pane == m.output {
+		m.clearCommittedSearchFocus()
 	}
-	return m, nil
+	scroll(pane)
 }
 
-// syncBars updates the widgets map to match the current bar content.
-// Creates new Bar instances for new names, removes stale ones, updates
-// existing ones. A bar whose name collides with a built-in widget
-// ("input", "separator") is ignored rather than allowed to clobber it.
-func (m *Model) syncBars(content map[string]ui.BarContent) {
-	// Remove bars that no longer exist in content
-	for name := range m.barContent {
-		if _, exists := content[name]; !exists {
-			if _, isBar := m.widgets[name].(*widget.Bar); isBar {
-				delete(m.widgets, name)
-			}
-		}
-	}
-
-	// Add or update bars
-	for name, barContent := range content {
-		w, exists := m.widgets[name]
-		if !exists {
-			w = widget.NewBar(name)
-			m.widgets[name] = w
-		}
-		if bar, isBar := w.(*widget.Bar); isBar {
-			bar.SetContent(barContent)
-		}
-	}
-
-	m.barContent = content
-}
-
-func (m *Model) handleServerOutput(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
-	case ui.PrintLineMsg:
-		rows := splitRows(string(msg), m.width)
-		if m.flushScheduled {
-			// Inside a batch window: coalesce with the burst.
-			m.pendingRows = append(m.pendingRows, rows...)
-			return m, nil
-		}
-		// Idle: render this line now and open a batch window so a
-		// following burst coalesces instead of rendering line-by-line.
-		m.appendRows(rows...)
-		m.flushScheduled = true
-		return m, doTick()
-	case ui.EchoLineMsg:
-		// Flush batched server lines first so the echo cannot render
-		// ahead of output that arrived before it.
-		m.flushPending()
-		m.appendMessage(string(msg))
-	case ui.PromptMsg:
-		text := util.ExpandTabs(string(msg))
-		if text != m.lastPrompt {
-			m.viewport.SetPrompt(text)
-			m.lastPrompt = text
-		}
-	}
-	return m, nil
-}
-
-func (m *Model) handlePaneMsg(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
-	case ui.PaneCreateMsg:
-		m.panes.Create(msg.Name)
-	case ui.PaneWriteMsg:
-		m.panes.Write(msg.Name, msg.Text)
-	case ui.PaneToggleMsg:
-		m.panes.Toggle(msg.Name)
-	case ui.PaneSetVisibleMsg:
-		m.panes.SetVisible(msg.Name, msg.Visible)
-	case ui.PaneClearMsg:
-		m.panes.Clear(msg.Name)
-	}
-	return m, nil
-}
-
-// wheelScrollLines is how far one mouse-wheel tick scrolls the main
-// viewport. Matches the common terminal-emulator default.
+// wheelScrollLines is how far one mouse-wheel tick scrolls the output
+// output window. Matches the common terminal-emulator default.
 const wheelScrollLines = 3
 
-// handleMouse scrolls the main viewport on wheel events. The terminal
-// mouse is captured for this (which is why text selection needs
-// shift+drag); everything else is ignored.
-func (m *Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
-	if msg.Action != tea.MouseActionPress {
-		return m, nil
-	}
+// handleMouseWheel moves the search selection while search is open and
+// scrolls the output window otherwise.
+func (m *Model) handleMouseWheel(msg tea.MouseWheelMsg) {
 	switch msg.Button {
-	case tea.MouseButtonWheelUp:
-		if m.inputCtl.selectOlderSearch() {
-			return m, nil
+	case tea.MouseWheelUp:
+		if !m.inputCtl.selectOlderSearch() {
+			m.clearCommittedSearchFocus()
+			m.output.ScrollUp(wheelScrollLines)
 		}
-		m.navigateMainViewport(func() {
-			m.viewport.ScrollUp(wheelScrollLines)
-		})
-	case tea.MouseButtonWheelDown:
-		if m.inputCtl.selectNewerSearch() {
-			return m, nil
-		}
-		m.navigateMainViewport(func() {
-			m.viewport.ScrollDown(wheelScrollLines)
-		})
-	}
-	return m, nil
-}
-
-// splitRows shapes a message into physical scrollback rows: one row
-// per line break, tabs expanded per row so columns restart on every
-// row, rows wider than the terminal word-wrapped. Rows are final at
-// append time; a resize does not rewrap old output.
-func splitRows(msg string, width int) []string {
-	if !strings.ContainsAny(msg, "\r\n") {
-		return util.WrapLine(util.ExpandTabs(msg), width)
-	}
-	var rows []string
-	for _, line := range util.SplitLines(msg) {
-		rows = append(rows, util.WrapLine(util.ExpandTabs(line), width)...)
-	}
-	return rows
-}
-
-func (m *Model) appendRows(rows ...string) {
-	for _, row := range rows {
-		m.scrollback.Append(row)
-	}
-	m.viewport.OnNewRows(len(rows))
-	m.updateScrollState()
-}
-
-// appendMessage shapes text into rows and appends them.
-func (m *Model) appendMessage(text string) {
-	m.appendRows(splitRows(text, m.width)...)
-}
-
-// sendLine offers a submitted input snapshot to the session. It rejects
-// oversized verbatim drafts or a busy engine with a visible warning rather
-// than blocking the render loop; false tells the controller to retain them.
-func (m *Model) sendLine(submission input.Submission) bool {
-	if submission.Mode == input.ModeVerbatim {
-		lineCount := 1 + strings.Count(submission.Text, "\n")
-		if len(submission.Text) > maxVerbatimBytes || lineCount > maxVerbatimLines {
-			m.appendMessage(text.Red("[WARNING] Verbatim input not sent - limit is 1000 lines or 256 KiB"))
-			return false
+	case tea.MouseWheelDown:
+		if !m.inputCtl.selectNewerSearch() {
+			m.clearCommittedSearchFocus()
+			m.output.ScrollDown(wheelScrollLines)
 		}
 	}
+}
+
+// submit offers a submission and its following draft to the session as one
+// transition. It rejects invalid command text or a busy engine with a
+// visible warning rather than blocking the render loop; false tells the
+// controller to retain the current local draft.
+func (m *Model) submit(msg ui.InputSubmittedMsg) bool {
+	if msg.Submission.Mode == input.ModeCommand && !input.ValidCommandText(msg.Submission.Text) {
+		warning := "[WARNING] Command not run - invalid text or terminal controls."
+		if key := m.input.Bindings().Hint("toggle_mode"); key != "" {
+			warning += " Use " + key + " for verbatim."
+		}
+		m.output.Write(text.Red(warning))
+		return false
+	}
+	if m.tryPost(msg) {
+		return true
+	}
+	m.showWarning("Input not sent - engine lagging")
+	return false
+}
+
+func (m *Model) tryPost(event ui.UIEvent) bool {
 	select {
-	case m.inputChan <- submission:
+	case m.events <- event:
 		return true
 	default:
-		m.appendMessage(text.Red("[WARNING] Input not sent - engine lagging"))
 		return false
 	}
 }
 
-const (
-	maxVerbatimBytes = 256 * 1024
-	maxVerbatimLines = 1000
-)
-
-func (m *Model) isBound(key string) bool {
-	return m.boundKeys[key]
-}
-
-func (m *Model) sendOutbound(msg ui.UIEvent) {
-	if m.outbound == nil {
+func (m *Model) notifySession(event ui.UIEvent) {
+	if m.tryPost(event) {
 		return
 	}
-	select {
-	case m.outbound <- msg:
-	default:
-		// The session is not draining UI events. Dropping is the only
-		// safe option here (blocking would deadlock the render loop),
-		// but it must never be silent: a lost InputChangedMsg desyncs
-		// completion state, a lost PickerSelectMsg strands a picker
-		// callback. Make it visible so it can be reported.
-		m.scrollback.Append(text.Red("[WARNING] UI event dropped - engine lagging"))
+	// Blocking would deadlock the render loop, but a lost event must be
+	// visible: it can desync input state or strand a picker callback.
+	m.showWarning("UI event dropped - engine lagging")
+}
+
+func (m *Model) showWarning(message string) {
+	m.output.Write(text.Red("[WARNING] " + message))
+}
+
+// reportScrollState posts the output window's scroll state when it differs
+// from the last value Session accepted. It is derived state with one reporter:
+// nothing else posts it. A full queue is not a dropped event - the value is
+// simply still unreported - so it reports false and the caller retries.
+func (m *Model) reportScrollState() bool {
+	state := ui.ScrollStateChangedMsg{Mode: "live", NewLines: m.output.NewLineCount()}
+	if m.output.Mode() != widget.ModeLive {
+		state.Mode = "scrolled"
 	}
-}
-
-func (m *Model) updateScrollState() {
-	mode := m.viewport.Mode()
-	newLines := m.viewport.NewLineCount()
-
-	modeStr := "live"
-	if mode != widget.ModeLive {
-		modeStr = "scrolled"
+	if state == m.reportedScroll {
+		return true
 	}
-	m.sendOutbound(ui.ScrollStateChangedMsg{Mode: modeStr, NewLines: newLines})
+	if !m.tryPost(state) {
+		return false
+	}
+	m.reportedScroll = state
+	return true
 }
 
-// navigateMainViewport is the single path for deliberate user/script
-// navigation of the main output surface. Search previews position the
-// viewport directly so their committed marker remains intact.
-func (m *Model) navigateMainViewport(move func()) {
-	m.clearCommittedSearchFocus()
-	move()
-	m.updateScrollState()
-}
-
-// handleScrollKey handles viewport scrolling keys.
+// handleScrollKey handles output window scrolling keys.
 // Returns true if the key was handled.
-func (m *Model) handleScrollKey(keyType tea.KeyType) bool {
-	switch keyType {
-	case tea.KeyPgUp:
-		m.navigateMainViewport(m.viewport.PageUp)
-	case tea.KeyPgDown:
-		m.navigateMainViewport(m.viewport.PageDown)
-	case tea.KeyCtrlHome:
-		m.navigateMainViewport(m.viewport.GotoTop)
-	case tea.KeyCtrlEnd:
-		m.navigateMainViewport(m.viewport.GotoBottom)
+func (m *Model) handleScrollKey(msg tea.KeyPressMsg) bool {
+	var move func()
+	switch {
+	case matchesKey(msg, tea.KeyPgUp, 0):
+		move = m.output.PageUp
+	case matchesKey(msg, tea.KeyPgDown, 0):
+		move = m.output.PageDown
+	case matchesKey(msg, tea.KeyHome, tea.ModCtrl):
+		move = m.output.ScrollToTop
+	case matchesKey(msg, tea.KeyEnd, tea.ModCtrl):
+		move = m.output.ScrollToBottom
 	default:
 		return false
 	}
+	m.clearCommittedSearchFocus()
+	move()
 	return true
 }

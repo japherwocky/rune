@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/mmcdole/rune/input"
+	"github.com/mmcdole/rune/ui"
 )
 
 const waitTimeout = 2 * time.Second
@@ -60,10 +61,11 @@ func TestVisualOnlyMethodsAreNoOps(t *testing.T) {
 	h.SetInputSubmission(input.Command("x"))
 	h.UpdateBars(nil)
 	h.UpdateBinds(nil)
-	h.UpdateLayout(nil, nil)
+	h.UpdateLayout(ui.LayoutTree{})
+	h.UpdateConfig(ui.Config{})
+	h.ShowPicker(ui.PickerOptions{})
+	h.ShowSearch(ui.SearchOptions{})
 	h.CreatePane("p")
-	h.TogglePane("p")
-	h.SetPaneVisible("p", true)
 	h.ClearPane("p")
 	h.InputSetCursor(0)
 	h.PaneScrollUp("p", 1)
@@ -129,17 +131,12 @@ func TestRunBlocksUntilQuit(t *testing.T) {
 	h.Quit()
 }
 
-func TestInputAndOutboundStartEmpty(t *testing.T) {
+func TestEventsStartEmpty(t *testing.T) {
 	h := New(context.Background(), &bytes.Buffer{})
 
 	select {
-	case v := <-h.Input():
-		t.Fatalf("expected no input, got %v", v)
-	default:
-	}
-	select {
-	case v := <-h.Outbound():
-		t.Fatalf("expected no outbound event, got %v", v)
+	case v := <-h.Events():
+		t.Fatalf("expected no UI event, got %v", v)
 	default:
 	}
 }

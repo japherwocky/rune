@@ -9,8 +9,8 @@ import (
 )
 
 // TestLogCapturesSessionToFile drives a logged session end-to-end and
-// verifies the file reads like the screen: ANSI-stripped output, the
-// local echo of typed input, no gagged lines, start/stop stamps.
+// verifies the file reads like the screen: ANSI-stripped output, the locally
+// echoed command, no gagged lines, start/stop stamps.
 func TestLogCapturesSessionToFile(t *testing.T) {
 	s, net, _ := newTestSession(t)
 	net.connected = true
@@ -26,8 +26,8 @@ func TestLogCapturesSessionToFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	serverLine(s, "Hello \x1b[31mred\x1b[0m world")
-	serverLine(s, "a secret line")
+	completeLine(s, "Hello \x1b[31mred\x1b[0m world")
+	completeLine(s, "a secret line")
 	userInput(s, "kill rat")
 	userInput(s, "/log stop")
 
@@ -88,14 +88,13 @@ func TestLogSurvivesReload(t *testing.T) {
 	userInput(s, "/log start "+path)
 
 	s.Reload()
-	cb := <-s.asyncResults // reload is deferred
-	cb()
+	awaitInternalEvent(t, s)
 
 	if got, active := s.LogStatus(); !active || got != path {
 		t.Fatalf("log did not survive reload: path=%q active=%v", got, active)
 	}
 
-	serverLine(s, "after reload")
+	completeLine(s, "after reload")
 	userInput(s, "/log stop")
 
 	data, err := os.ReadFile(path)
@@ -259,5 +258,38 @@ func TestLogReadSeesWritesToStillOpenLog(t *testing.T) {
 	}
 	if len(got) != 2 || got[1] != "second" {
 		t.Fatalf("LogRead after a further write = %q, want the new line included", got)
+	}
+}
+
+func TestLogStartTildePaths(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("home", home)
+	cwd := t.TempDir()
+	t.Chdir(cwd)
+	s, _, _ := newTestSession(t)
+	for _, tc := range []struct{ path, want string }{
+		{"~/session.log", filepath.Join(home, "session.log")},
+		{"~user/session.log", filepath.Join(cwd, "~user", "session.log")},
+	} {
+		t.Run(tc.path, func(t *testing.T) {
+			got, err := s.LogStart(tc.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.LogStop()
+			if got != tc.want {
+				t.Fatalf("LogStart(%q) = %q, want %q", tc.path, got, tc.want)
+			}
+			s.LogWrite("test line")
+			content, err := os.ReadFile(tc.want)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(content) != "test line\n" {
+				t.Fatalf("log content = %q", content)
+			}
+		})
 	}
 }

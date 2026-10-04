@@ -23,7 +23,7 @@ func startAgentAndWake(t *testing.T, engine *Engine, host *MockHost) int {
 		t.Fatal(err)
 	}
 	before := len(host.LLMCalls)
-	engine.OnPrompt(text.NewLine("prompt"))
+	engine.OnPrompt(text.NewLine("prompt"), true)
 	if len(host.LLMCalls) != before+1 {
 		t.Fatalf("expected a new LLM call after prompt, had %d now have %d", before, len(host.LLMCalls))
 	}

@@ -10,6 +10,8 @@ package lua
 import (
 	"strings"
 	"testing"
+
+	"github.com/mmcdole/rune/input"
 )
 
 func TestAgentUIBarStoppedWhenInactive(t *testing.T) {
@@ -206,7 +208,7 @@ func TestAgentCommandShowsStatus(t *testing.T) {
 	defer cleanup()
 	withAPIKey(host)
 
-	engine.OnInput("/agent")
+	engine.ExecuteInputLine(input.Line{Text: "/agent", Mode: input.ModeCommand})
 	joined := strings.Join(host.PrintCalls, "\n")
 	if !strings.Contains(joined, "stopped") {
 		t.Fatalf("expected /agent to report stopped before start(), got:\n%s", joined)
@@ -216,7 +218,7 @@ func TestAgentCommandShowsStatus(t *testing.T) {
 	id := startAgentAndWake(t, engine, host)
 	deliverEndTurn(engine, host, id, "resting up")
 
-	engine.OnInput("/agent")
+	engine.ExecuteInputLine(input.Line{Text: "/agent", Mode: input.ModeCommand})
 	joined = strings.Join(host.PrintCalls, "\n")
 	if !strings.Contains(joined, "idle") || !strings.Contains(joined, "resting up") {
 		t.Fatalf("expected /agent to report idle + goal after a turn, got:\n%s", joined)
@@ -232,7 +234,7 @@ func TestAgentCommandStartWithExplicitModel(t *testing.T) {
 	defer cleanup()
 	withAPIKey(host)
 
-	engine.OnInput("/agent start big-pickle")
+	engine.ExecuteInputLine(input.Line{Text: "/agent start big-pickle", Mode: input.ModeCommand})
 
 	if err := engine.DoString("check", `
 		local s = rune.agent.status()
@@ -258,9 +260,9 @@ func TestAgentCommandShowsProviderOverrideInStatus(t *testing.T) {
 		"RUNE_LLM_PROVIDER": "openai",
 	}
 
-	engine.OnInput("/agent start big-pickle")
+	engine.ExecuteInputLine(input.Line{Text: "/agent start big-pickle", Mode: input.ModeCommand})
 	host.PrintCalls = nil
-	engine.OnInput("/agent")
+	engine.ExecuteInputLine(input.Line{Text: "/agent", Mode: input.ModeCommand})
 
 	joined := strings.Join(host.PrintCalls, "\n")
 	if !strings.Contains(joined, "provider: openai") {
@@ -276,7 +278,7 @@ func TestAgentCommandStartUsesEnvModelDefault(t *testing.T) {
 		"RUNE_LLM_MODEL":   "claude-haiku-4-5",
 	}
 
-	engine.OnInput("/agent start")
+	engine.ExecuteInputLine(input.Line{Text: "/agent start", Mode: input.ModeCommand})
 
 	if err := engine.DoString("check", `
 		local s = rune.agent.status()
@@ -292,7 +294,7 @@ func TestAgentCommandStartWithoutModelOrEnvShowsUsage(t *testing.T) {
 	defer cleanup()
 	withAPIKey(host) // no RUNE_LLM_MODEL set
 
-	engine.OnInput("/agent start")
+	engine.ExecuteInputLine(input.Line{Text: "/agent start", Mode: input.ModeCommand})
 
 	if err := engine.DoString("check", `assert(not rune.agent.status().active, "agent must not start with no model available")`); err != nil {
 		t.Fatal(err)
@@ -308,9 +310,9 @@ func TestAgentCommandStartWhenAlreadyActiveIsNoop(t *testing.T) {
 	defer cleanup()
 	withAPIKey(host)
 
-	engine.OnInput("/agent start big-pickle")
+	engine.ExecuteInputLine(input.Line{Text: "/agent start big-pickle", Mode: input.ModeCommand})
 	host.PrintCalls = nil
-	engine.OnInput("/agent start some-other-model")
+	engine.ExecuteInputLine(input.Line{Text: "/agent start some-other-model", Mode: input.ModeCommand})
 
 	if err := engine.DoString("check", `
 		local s = rune.agent.status()
@@ -329,9 +331,9 @@ func TestAgentCommandStop(t *testing.T) {
 	defer cleanup()
 	withAPIKey(host)
 
-	engine.OnInput("/agent start big-pickle")
+	engine.ExecuteInputLine(input.Line{Text: "/agent start big-pickle", Mode: input.ModeCommand})
 	host.PrintCalls = nil
-	engine.OnInput("/agent stop")
+	engine.ExecuteInputLine(input.Line{Text: "/agent stop", Mode: input.ModeCommand})
 
 	if err := engine.DoString("check", `assert(not rune.agent.status().active, "expected agent stopped")`); err != nil {
 		t.Fatal(err)
@@ -347,7 +349,7 @@ func TestAgentCommandStopWhenAlreadyStoppedIsNoop(t *testing.T) {
 	defer cleanup()
 	withAPIKey(host)
 
-	engine.OnInput("/agent stop")
+	engine.ExecuteInputLine(input.Line{Text: "/agent stop", Mode: input.ModeCommand})
 
 	joined := strings.Join(host.PrintCalls, "\n")
 	if !strings.Contains(joined, "already stopped") {
@@ -360,7 +362,7 @@ func TestAgentCommandUnknownSubcommandShowsUsage(t *testing.T) {
 	defer cleanup()
 	withAPIKey(host)
 
-	engine.OnInput("/agent bogus")
+	engine.ExecuteInputLine(input.Line{Text: "/agent bogus", Mode: input.ModeCommand})
 
 	joined := strings.Join(host.PrintCalls, "\n")
 	if !strings.Contains(joined, "Usage") {

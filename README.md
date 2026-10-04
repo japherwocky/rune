@@ -1,12 +1,12 @@
 # Rune
 
-A modern MUD client built with Go and Lua.
+A terminal MUD client built with Go and Lua.
 
 [![CI](https://github.com/mmcdole/rune/actions/workflows/ci.yml/badge.svg)](https://github.com/mmcdole/rune/actions/workflows/ci.yml)
 
-![One rune session: the world picker, tab completion cycling, history search, combat, and the multiline verbatim composer](.github/montage.gif)
+![One rune session: the world picker, tab completion cycling, history search, combat, and the multiline verbatim draft editor](.github/montage.gif)
 
-Rune combines Go's performance and concurrency with Lua's flexibility for scripting. The architecture follows a kernel philosophy: Go handles I/O, memory, and concurrency while Lua handles logic, features, and presentation.
+Go handles networking, terminal rendering, and concurrent I/O. Lua scripts define aliases, triggers, key bindings, layouts, and client commands.
 
 Guides, cookbook recipes, and the full API reference live at **[runemud.com](https://runemud.com)**.
 Questions, ideas, and feedback are welcome in the **[Rune Discord](https://discord.gg/gNZkrJ2jHe)**.
@@ -21,15 +21,15 @@ Scripting:
 - **Hooks** - Event system for connecting to input/output pipeline
 - **Key Bindings** - Bind keys to Lua callbacks
 - **Groups** - Master switches to enable/disable sets of aliases/triggers/timers
-- **Command Chaining** - `kill rat;loot` sends both; `#3 {kill rat;loot}` repeats
-- **Robust Scripting** - Watchdog interrupts runaway scripts; failing callbacks are quarantined individually instead of taking the client down
+- **Command Chaining** - `kill rat;loot` sends both; `#3 north` repeats a command or alias
+- **Script Error Handling** - Failing callbacks are disabled individually; a watchdog interrupts script execution subject to the [LuaJIT limits](docs/luajit.md#luajit-backend-notes)
 
 Protocols:
 
 - **GMCP** - Structured server data (vitals, room info, channels) with a scriptable `rune.gmcp` API and automatic `Core.Hello` handshake
 - **MCCP2** - Transparent zlib stream compression
 - **TLS** - Encrypted connections (`tls://host:port`), including self-signed certs
-- **Modern Telnet** - TTYPE/MTTS, NAWS, CHARSET (UTF-8), and MNES identification out of the box
+- **Telnet Negotiation** - TTYPE/MTTS, NAWS, CHARSET (UTF-8), and MNES identification
 
 Quality of life:
 
