@@ -103,10 +103,14 @@ go test ./...           # tests
   (opencode.ai/zen, see T2/T4); Phase 2 hardens into a Go `rune._llm` primitive
   (streaming, key-in-Go, retries, usage).
 - **Cognition** — the callback-driven state machine and think-cadence policy.
-- **Action** — tools: `send_command`, `speak`, and the reflex-programming tools
-  (`create_trigger` etc.) built on `rune.trigger`.
-- **Memory** — working context + durable state in `rune.store`, plus the session log as
-  searchable long-term recall (T12: `rune.log.read`/`search`, `search_log`/`read_log`).
+- **Action** — tools: `send_command` and `speak`. (The reflex-programming tools
+  `create_trigger` et al. shipped in T6 and were dropped on 2026-07-25 — see §6.)
+- **Memory** — three tiers, narrowest first. `rune.perception.transcript()` is the
+  200-line rolling window of raw output (T3); `rune.memory` is the durable, scored stream
+  of what the agent *learned*, retrieved into every observation and periodically
+  compressed by reflection (T13); the session log is the exhaustive backstop the agent
+  can grep when neither of the first two has it (T12: `rune.log.read`/`search`,
+  `search_log`/`read_log`).
 - **Governance** — budget/rate/oscillation limits; quarantine→re-plan wiring.
 - **Dual-mode** — a second `ui.UI` implementation; the Session is unchanged.
 - **Observability** — `rune.pane`/`rune.bars`/`rune.log`.
@@ -122,950 +126,185 @@ human's mapper client.
 
 ## 5. Tasks
 
-Dependency-ordered. `[Go]` = kernel primitive, `[Lua]` = user-space module,
-`[Go+cmd]` = kernel + entry point. Each task is meant to be a self-contained unit of
-work with its own tests and commit.
+`[Go]` = kernel primitive, `[Lua]` = user-space module, `[Go+cmd]` = kernel + entry
+point. Each task is a self-contained unit of work with its own tests and commit.
 
-### Phase 1 — one bot fighting in the live TUI
+### Shipped (T1–T12, 2026-07)
 
-The two tasks that unblock everything and do **not** depend on botmud#20 are T1 and T3
-(T3 is testable now with GMCP fixtures). Start there.
+T1–T10 and T12 all landed; **T11 (headless control surface) was cut, not deferred** —
+the point of headless mode is a bot that runs without input, and everything T11 was
+meant to guarantee is covered by T9's governance, SIGTERM→ctx-cancel shutdown, and the
+session log. Their full write-ups were removed from this file once the work was done;
+`git log PLAN.md` has them, and source comments still cite task numbers:
 
-#### T1 `[Go]` — `rune.json` primitive
-- **Why:** Lua must build Messages API request bodies and parse responses (HTTP body is
-  a string; `rune.store` already handles tables, but the wire needs JSON).
-- **Create:** `lua/api_json.go` registering `rune._json.encode(value) -> string` and
-  `rune._json.decode(string) -> value, err`. Add `lua/core/NN_json.lua` (pick a free
-  number, e.g. `82_json.lua`) exposing `rune.json.encode` / `rune.json.decode`.
-- **Mirror:** the registration style in `lua/api_http.go`; reuse the JSON encode/decode
-  the GMCP bridge already uses in `lua/engine.go` (search `json.Unmarshal` there).
-- **Decode convention:** return `nil, errmsg` on invalid JSON (recoverable). Map JSON
-  objects→Lua tables (string keys), arrays→sequence tables. Decide and document the
-  empty-array vs empty-object ambiguity.
-- **Tests:** table-driven Go round-trip in `lua/` (encode∘decode identity for
-  object/array/string/number/bool/null/nested; invalid JSON → error). A Lua-against-mock
-  test that `rune.json` is callable.
-- **Done when:** `rune.json.encode`/`decode` round-trip in Lua; invalid input returns
-  `nil, err` not a raise.
+- T1 `rune.json` · T2 `rune.env` · T3 perception (`84_perception.lua`) · T4/T4b/T8/T9b
+  LLM transport (`86_llm.lua`, `session/lua_llm.go`) · T5 agent core (`87_agent.lua`) ·
+  T6 tools (`88_agent_tools.lua`) · T7 observability (`96_agent_ui.lua`) · T9 governance
+  (`91_agent_policy.lua`) · T10 headless (`ui/headless/`) · T12 logging-as-memory
+  (`92_agent_log.lua`).
 
-#### T2 `[Go]` — `rune.env` primitive (API-key access)
-- **Why:** the LLM client needs the API key; no env accessor exists today (confirmed).
-  Keeps the key out of scripts-in-git.
-- **Provider:** [OpenCode Zen](https://opencode.ai/docs/zen/), not Anthropic directly.
-  Zen is a multi-model gateway behind one API key, including several free/promotional
-  models at time of writing (e.g. "DeepSeek V4 Flash Free") - the point is cheap
-  experimentation across models, not a specific vendor. See T4/T8 for the transport and
-  §6 for what's confirmed vs. still unverified about Zen's wire format.
-- **Create:** `lua/api_env.go` registering `rune._env.get(name) -> string|nil`, and a
-  thin `rune.env(name)` in a core file (or fold into `82_json.lua`'s neighbor). Allowlist
-  just `OPENCODE_API_KEY` for now so scripts can't read arbitrary environment.
-- **Tests:** Go unit via the Host/mock; allowlist enforced.
-- **Done when:** `rune.env("OPENCODE_API_KEY")` returns the value in a real run and
-  `nil` for non-allowlisted names.
+### Phase 4 — memory
 
-#### T3 `[Lua]` — world-model module (perception) — **done**, `lua/core/84_perception.lua`
-- **Why:** the agent's sensors. **Buildable/testable now** with GMCP fixtures, before
-  botmud#20 ships.
-- **Namespace:** `rune.perception`, not `rune.world` — `65_worlds.lua` already owns
-  `rune.world` for MUD server bookmarks (`/world add`, `/connect`). A later file loading
-  after it (`8x_*.lua` > `65_worlds.lua`) would silently clobber that table if it also
-  assigned `rune.world = {}`; caught via a broken `TestWorldResolution` while implementing.
-- **Public surface (implemented):** `rune.perception.snapshot()` returns
-  `{ vitals, status, room, channels }`, a fresh defensive copy each call.
-  `rune.perception.transcript()` returns the rolling output ring buffer (T5 needs this
-  alongside `snapshot()` for the LLM turn - it isn't part of `snapshot()` itself).
-  `rune.perception.map()` returns the durable learned map.
-- **Gated behind `enable()` - not in the original plan, required:** this is a **core**
-  file, loaded for every Rune session whether or not an agent is running. Subscribing to
-  GMCP packages and writing to the durable store are observable side effects a plain
-  human user never asked for, so the module registers nothing at load time. **T5's agent
-  core MUST call `rune.perception.enable()` at startup** (and may call `.disable()` to
-  pause perception + GMCP subscriptions; both idempotent, `.is_enabled()` to query).
-  Discovered because unconditional subscription at load time broke two pre-existing GMCP
-  handshake tests that assumed a clean default subscription set
-  (`TestGMCPHandshakeAndSubscriptions`, `TestGMCPEnabledTriggersHandshake`) - a good
-  signal that core scripts must stay opt-in for anything with an observable side effect.
-- **Wire (implemented, inside `enable()`):**
-  - `rune.gmcp.subscribe("Char", 1)`, `rune.gmcp.subscribe("Room", 1)`,
-    `rune.gmcp.subscribe("Comm", 1)` (triggers `Core.Supports.Set`).
-  - `rune.gmcp.on("Char.Vitals", ...)`, `"Char.Status"`, `"Room.Info"` **replace** the
-    corresponding local outright (`vitals = data`, not a merge) - the GMCP spec emits a
-    full snapshot of each package on every update and omits fields that no longer apply
-    (e.g. `Char.Status` drops `enemy`/`enemy_condition` once combat ends). Merging would
-    leave a stale "phantom" enemy behind after the fight ends.
-  - `rune.gmcp.on("Comm.Channel", ...)` appends to a bounded ring (cap 20).
-  - `rune.hooks.on("output", ...)` at priority 200 (after triggers, so a gagged line
-    stays out of the transcript too - a human wouldn't see it either) appends
-    `line:clean()` to a bounded rolling transcript (cap 200). Never gags.
-  - `rune.hooks.on("disconnected", ...)` resets all volatile state.
-  - **Not in the original plan, needed for the durable map below:** `rune.hooks.on(
-    "input", ...)` at default priority (50, below the core handler's 100) watches
-    outgoing text against ROM's fixed movement vocabulary (n/north, s/south, ... - see
-    the module) and remembers it as `last_dir`, cleared on every input (movement or not)
-    so a stale direction from an earlier blocked move can't be attributed to a later,
-    unrelated room change (e.g. recall/teleport).
-- **Durable map (implemented):** on `Room.Info`, record the room by `num` in
-  `rune.store` under `rooms[tostring(num)]`, and when the previous room and `last_dir`
-  are both known and the new room differs, record `edges[tostring(prev_num)][last_dir] =
-  num`. Keys are stringified - `rune.store`'s JSON bridge (`api_store.go`) rejects tables
-  with sparse/non-sequential numeric keys, which arbitrary room numbers always are. Only
-  called from the (comparatively rare) `Room.Info` handler, never from chatty
-  `Char.Vitals`, so this stays out of the hot path despite `rune.store.set` being a
-  synchronous file write.
-- **Tests (implemented differently than originally planned):** Lua-against-mock only
-  (`lua/perception_test.go`), not e2e. Per `docs/testing.md`'s "lowest layer that can
-  express the failure": `Engine.OnGMCP`/`OnOutput`/`OnInput` reach this module directly
-  against `MockHost`, no live session/TCP needed, and nothing here is user-visible yet
-  (T7 adds that) for an e2e scenario to assert on. Covers: empty initial snapshot,
-  snapshot reflecting injected GMCP, `Char.Status` fields clearing (not going stale) when
-  a later update omits them, channel/transcript ring-buffer caps, disconnect reset, and
-  the map recording an edge only after a real move (not on a repeated room, not across a
-  non-movement command).
-- **Done when:** snapshot reflects injected GMCP; transcript stays bounded; map records
-  dir→dest only after a move. ✓
-
-#### T4 `[Lua]` — LLM client (Phase 1 transport via rune.http)
-- **Why:** talk to an LLM without new Go yet.
-- **Provider: OpenCode Zen**, not Anthropic directly (see T2). Zen is a multi-model
-  gateway behind one API key. <https://opencode.ai/zen/v1/messages> is documented as the
-  Anthropic-Messages-API-shaped endpoint (it's what the `@ai-sdk/anthropic` provider
-  points at), so request/response bodies should follow the same
-  `content`/`tool_use`/`stop_reason`/`usage` shape as Anthropic's Messages API - just
-  against Zen's host, auth, and model catalog. `GET https://opencode.ai/zen/v1/models`
-  lists available models, including the free/promotional ones that motivated this
-  provider choice (subject to change - check it rather than assuming a model id).
-- **Verified live (2026-07-17) against `https://opencode.ai/zen/v1/messages`:** the auth
-  header is `x-api-key`, not `Authorization: Bearer` as Zen is documented elsewhere. A
-  request with a bad `x-api-key` gets a distinct `401
-  {"type":"error","error":{"type":"AuthError","message":"Invalid API key."}}` - the
-  gateway recognizes and validates the header. A request with a bad (or no)
-  `Authorization: Bearer` instead gets a generic `400 {"error":{"message":"Error from
-  provider (Console): Upstream request failed",...}}` - i.e. `Authorization` is not
-  inspected at all and the malformed request is passed straight through to the upstream
-  provider. Sending both headers behaves identically to `x-api-key` alone. `GET
-  /v1/models` needs no auth. `anthropic-version` was not settled by this probe (no valid
-  key on hand to observe a 200) - send `2023-06-01` per Anthropic Messages API
-  convention; revisit if Zen ever rejects it.
-- **Create:** `lua/core/86_llm.lua` exposing
-  `rune.llm.chat({ model, system, messages, tools, max_tokens }, function(reply, err) ... end)`.
-  `model` is required, not defaulted - Zen's catalog rotates (including which models are
-  free/promotional; see the `/v1/models` note above), so picking one is a policy decision
-  left to the caller (T5), not baked into the transport.
-- **Implement:** build the request table, `rune.json.encode` it, `rune.http.post(url,
-  body, { headers = { ... } }, cb)` against the Zen endpoint/auth confirmed above. In
-  `cb`, `rune.json.decode(resp.body)`, surface `stop_reason`, `content` (text +
-  `tool_use` blocks, verbatim - a follow-up turn with `tool_result` blocks must echo the
-  assistant's `content` back unchanged), and `usage`; also split `content` into
-  convenience `text`/`tool_uses` fields so T5/T6 don't have to re-walk it. No `id ->
-  callback` map needed: `rune.http` already owns that (80_http.lua); single-flight is
-  T5's job, not the transport's.
-- **Tests:** Lua-against-mock where the mock Host returns a canned Zen JSON body for an
-  HTTP request; assert `rune.llm.chat` parses text + tool_use + usage. Cover the error
-  path (HTTP err, non-200, malformed JSON, missing API key). See `lua/llm_test.go`.
-- **Done when:** a canned response parses into a normalized reply table; errors surface
-  as `err`. ✓
-
-#### T4b `[Go+Lua]` — fix: Zen fronts two endpoints, not one ✓
-- **Why:** every real agent run against the "zen" provider failed live, for every model
-  tried (`big-pickle`, `deepseek-v4-flash-free`, `hy3-free`) with an opaque 400 -
-  `Input required: specify "prompt" or "messages"` or `Error from provider (Console):
-  Upstream request failed` - despite `rune.llm.chat` sending a well-formed request and
-  the API key checking out (a garbage key gets a distinct `401 AuthError`, proving the
-  real key authenticates fine). Root cause, found by replaying the exact bytes the real
-  agent sends straight at Zen with curl, bypassing rune entirely to separate "our
-  request is wrong" from "their endpoint is wrong": **Zen's docs
-  (<https://opencode.ai/docs/zen/>) list two separate endpoints** -
-  `https://opencode.ai/zen/v1/messages` (Anthropic-Messages-API shape) for Claude models
-  only, and `https://opencode.ai/zen/v1/chat/completions` (OpenAI chat/completions
-  shape) for everything else - deepseek, glm (`big-pickle`), hy3, mimo, the actual
-  free/promotional models this provider exists for. `session/lua_llm.go` hardcoded
-  `/v1/messages` for every model. Sending a non-Claude model there doesn't 404 - it
-  reaches a real backend that then fails opaquely, which is why this took a live-fire
-  investigation rather than showing up as an obvious error. Confirmed live
-  (2026-07-18): a Claude model 200s at `/v1/messages` and 401s at `/v1/chat/completions`;
-  a non-Claude model 200s at `/v1/chat/completions` and 400s at `/v1/messages` - the
-  split is real, not an artifact of one bad request.
-- **Also worth naming:** T4's original "confirmed" auth-header finding was live-verified
-  only against a *bad* key (distinguishing `x-api-key` from `Authorization: Bearer` via
-  401-vs-400) - nobody had a valid key on hand at T4 time to observe an actual 200
-  (T4's own note: "`anthropic-version` was not settled by this probe... revisit if Zen
-  ever rejects it"). The full success path, including which endpoint a given model
-  actually needs, was never confirmed until this task. Worth remembering next time
-  something here is marked "confirmed" - confirm the happy path, not just the failure
-  shape of a deliberately-bad request.
-- **Fix:** `session/lua_llm.go` gains `zenModelUsesMessagesAPI(model)` (a `"claude"`
-  prefix check - every Claude id in Zen's live catalog is `claude-*`, no non-Claude id
-  is, so this is a low-maintenance split against a rotating catalog rather than a
-  hardcoded model list) and two URL constants (`llmZenMessagesURL`,
-  `llmZenChatCompletionsURL`); `resolveLLMProvider` now takes `model` and picks between
-  them when `RUNE_LLM_URL` doesn't override. `lua/core/86_llm.lua` gains the identical
-  `zen_model_uses_messages_api` check and now picks the wire format (Anthropic vs. the
-  OpenAI shape already built for T8b) the same way - reusing T8b's translation code
-  entirely rather than adding a third shape. The two sides agree independently from the
-  same `req.model`, the same "agree without one telling the other" pattern
-  `RUNE_LLM_PROVIDER` already used - `lua.LLMRequest` gained a `Model` field
-  (`lua/host.go`, `lua/api_llm.go`) purely so Go can see it too. `RUNE_LLM_URL`, when
-  set, still wins outright regardless of model (full override, not just a changed
-  default).
-- **Tests:** `session/llm_test.go` gained `TestZenResolvesEndpointByModelFamily` and
-  `TestZenURLOverrideBypassesModelRouting` (direct `resolveLLMProvider` coverage, no
-  network). `lua/llm_test.go` gained `TestLLMChatZenNonClaudeModelUsesOpenAIShape` /
-  `TestLLMChatZenClaudeModelUsesAnthropicShape` (full request-shape + response-round-trip
-  coverage for both families under the *default* provider). Every pre-existing test that
-  used a placeholder non-Claude model name (`deepseek-v4-flash-free`) while asserting
-  Anthropic-shaped request/response behavior under the default provider - scattered
-  across `session/llm_test.go`, `lua/llm_test.go`, `lua/agent_test.go`,
-  `lua/agent_policy_test.go`, `lua/agent_tools_test.go` - switched to a real Claude id
-  (`claude-haiku-4-5`) so the placeholder keeps meaning what it meant before this task;
-  error-path tests that never reach the shape-specific branch were left alone.
-  Verified against the live endpoint (not just tests) via a throwaway harness exercising
-  the real `session.Session`/`rune.llm.chat` path end to end, key never printed: both
-  `hy3-free` and `claude-haiku-4-5` round-tripped a real completion with no
-  `RUNE_LLM_PROVIDER`/`RUNE_LLM_URL` override, i.e. exactly the unconfigured default a
-  real deployment hits.
-- **Done when:** a non-Claude Zen model (e.g. `hy3-free`) and a Claude Zen model both
-  complete a live `rune.agent.start` turn successfully with no env override beyond
-  `OPENCODE_API_KEY`. ✓
-
-#### T5 `[Lua]` — agent core (state machine + cadence) ✓
-- **Depends:** T3, T4.
-- **Created:** `lua/core/87_agent.lua`. A single-flight state machine:
-  `idle → observing → waiting_llm → acting → observing`, tracked as `thinking`/
-  `wake_pending` booleans rather than a literal named-state enum (a tool_use round trip
-  loops `acting → waiting_llm` directly, without revisiting `observing` - re-gathering a
-  fresh perception snapshot mid-tool-exchange would break the Anthropic-shaped
-  conversation, since the model needs the *same* messages array it made the tool call
-  against). `rune.agent.status()` exposes `{active, thinking, wake_pending, goal}` for
-  tests and T7. **Calls `rune.perception.enable()` at startup** (`rune.agent.start()`)
-  and `.disable()` on `rune.agent.stop()` — see T3.
-- **Cadence (combine), as spec'd, confirmed by tests in `lua/agent_test.go`:**
-  - salient GMCP deltas only set the wake flag, never think immediately - grounded in
-    botmud#20's *confirmed* package shapes (no separate verification needed, the spec
-    was written this session): `Char.Vitals` hp/maxhp `< 0.3` (low-hp), `Char.Status`
-    `position` transitioning *into* `"fighting"` (edge-triggered - repeated
-    `"fighting"` updates while already fighting do not re-wake, so routine combat
-    rounds don't spam thinks), any `Comm.Channel` message (there is no dedicated tell
-    package - PLAN.md's "a tell arriving" is a channel message in practice, per the
-    spec's actual `Comm.Channel` shape);
-  - `rune.hooks.on("prompt", ...)` wakes **and** attempts a think immediately - the one
-    signal treated as urgent, since it's already rate-limited by the MUD's own round
-    cadence;
-  - `rune.timer.every(2, ...)` (`DEBOUNCE_SECONDS`) is the fallback that catches a
-    salient-event wake with no prompt nearby;
-  - **single-flight** via a `thinking` boolean; **think-again-on-return** via
-    `finish_turn()` rechecking `wake_pending` the instant a turn completes - both
-    literally as spec'd. Deliberately **not** rate-limited beyond that (no cooldown
-    between thinks): spamming is T9's job ("governance: budget, rate-limit,
-    oscillation"), not T5's - see the design-choice note in `87_agent.lua`'s header.
-- **Turn:** each turn starts from **one fresh message** - `## Your goal` (from
-  `rune.store`, persists across turns and reloads) + `## Vitals`/`## Status`/`## Room`
-  (`rune.json.encode`d snapshots) + `## Recent output` (transcript) - not a growing chat
-  history (that would blow out context over a long session). `stop_reason == "tool_use"`
-  appends the assistant's `content` verbatim plus a `tool_result` user message and
-  calls `rune.llm.chat` again on the *same* accumulating `messages` array (required by
-  the Anthropic-shaped protocol); anything else sets `goal = reply.text` and idles.
-- **Tool dispatch seam (T6 depends on this):** `rune.agent.register_tool(name,
-  description, input_schema, fn)` / `.unregister_tool(name)` - a flat name → fn map,
-  *not* the `rune.registry.new{kind="tool"}` T6 owns. T5 ships with zero tools
-  registered and has no opinion on what exists; `lua/agent_test.go` registers fakes to
-  exercise the full dispatch/continuation cycle standalone. **T6 should build its
-  registry *on top of* this seam**, not replace it: each real tool's registration
-  wraps a registry-governed function (so it gets quarantine/groups/`/tools` listing)
-  and then calls `rune.agent.register_tool(name, ..., that_wrapped_fn)` so T5's turn
-  loop can dispatch it unchanged. A missing or throwing tool becomes a `tool_result`
-  with `is_error = true` (the model sees the failure and can react), never aborts the
-  turn.
-- **Reload safety:** `thinking`/`wake_pending`/in-flight `messages` are plain Lua
-  locals - die with the VM on `/reload`, same as `80_http.lua`'s pending map. Also
-  covers `rune.agent.stop()`: an LLM call already in flight can't be recalled (Go has
-  no HTTP cancel primitive), so `on_reply` checks `active` first and drops a stale
-  result rather than continuing the turn or updating `goal` on a stopped agent's
-  behalf - see `TestAgentStopUnwindsAndDropsInFlightResult`. `goal` alone persists
-  through `rune.store`.
-- **Tests:** `lua/agent_test.go`, Lua-against-mock (same MockHost HTTP capture/delivery
-  as `lua/llm_test.go`) - 11 tests: start requires a model, start enables perception
-  (and is idempotent), prompt → request shape (default `max_tokens`, `tools` omitted
-  when none registered), single-flight + coalesced re-wake in one flow, full tool_use
-  dispatch + continuation (request shape of the follow-up `messages`, including a
-  registered fake tool's schema in `tools`) through to `goal` update, unknown-tool
-  error surfaced as `is_error`, low-hp/combat-start/channel wake sources (combat-start
-  specifically proven edge-triggered), stop unwinding hooks/timer/perception and
-  dropping an in-flight result.
-- **2026-07-25 fix - fabricated narrative compounding via the goal:** live runs on a
-  real MUD showed the model writing whole invented NPC exchanges (names, dialogue, a
-  plot) into a turn's `reply.text` instead of a short plan - and since `set_goal`
-  persists that text verbatim and `build_observation` re-serves it next turn under a
-  bare `## Goal` heading, the model read its own fiction back as established context
-  and continued it, in one case then issuing a real `send_command` acting out a line
-  the fiction had predicted. Two changes, both prompt-level (not a code guardrail on
-  `set_goal` itself): `DEFAULT_SYSTEM` now says explicitly that its text response is a
-  private plan nothing else ever sees, and that only a tool result or the next turn's
-  `## Recent output` reflects what actually happened; the heading became `## Your goal
-  (your own words from the end of your last turn - not confirmed fact)` so even
-  narrative-flavored text is harder to mistake for ground truth on re-read.
-  `perception.transcript()` (T3) was confirmed unaffected - it only ever listens to the
-  real "output" hook, never `rune.echo`, so this was never a contamination-via-echo
-  issue.
-- **2026-07-25 simplification - dropped the GMCP framing, targeted a smaller model:**
-  the fabrication above kept recurring even after the fix, now shaped as a whole fake
-  session replay (invented `Command:` labels, the room name repeated after every line,
-  invented ambient weather/time messages) written in a single turn with zero tool
-  calls - `store.json` had no `perception_map` key anywhere in the session, confirming
-  `Room.Info` GMCP had never actually fired, so `DEFAULT_SYSTEM`'s claim of
-  "structured data fed by the game's GMCP protocol" was describing perception the
-  model was never actually given. Reworded to drop protocol-name jargon entirely (a
-  smaller model doesn't need to know GMCP exists) in favor of one honest, generic
-  phrase ("some status data, may be empty") true whether or not GMCP is negotiated,
-  replaced the abstract "never invent information you have not been given" with a
-  concrete ban on the exact formats that showed up (a room name alone on its own
-  line, a `Command:` label, another character's dialogue), and added an explicit
-  push toward brevity ("one short sentence of plan and stop there") on the theory
-  that less room to write is less room to fabricate in. GMCP negotiation itself was
-  left alone - a real capability, just not this session's problem, and not something
-  a smaller local model needs described to it in detail regardless.
-- **Done when:** the loop completes a full observe→think→act→observe cycle against a
-  mock LLM without blocking the Session. ✓
-
-#### T6 `[Lua]` — tool layer (incl. reflex-programming; the centerpiece) ✓
-- **Depends:** T5.
-- **Created:** `lua/core/88_agent_tools.lua`. `rune.registry.new{kind="tool"}` as
-  planned, built *on top of* T5's `rune.agent.register_tool` seam exactly as sketched:
-  a local `register(name, description, input_schema, fn)` helper adds a registry entry
-  for source/quarantine bookkeeping, then registers a wrapper (not `fn` directly) that
-  checks `registry:active(data)` and runs `fn` through `rune.guarded_call`.
-- **Shipped these tools** (all string/data-only actions, no `loadstring` anywhere):
-  - `send_command(cmd)` → `rune.send`.
-  - `speak(channel, message, target?)` → `say "<msg>"` / `gossip "<msg>"` /
-    `tell <target> <msg>` (`target` required and validated when `channel == "tell"`).
-  - `create_trigger(pattern, command, group, once?, gag?)` → `rune.trigger.regex(pattern,
-    command, {group = "agent-" .. group, once, gag})`. String-action form throughout, so
-    `%1`/`%2` capture substitution "just works" and every reflex stays auditable/`/tools`
-    +`/triggers`-listable, per the original plan.
-  - `create_alias(word, expansion, group)` → `rune.alias.exact` (word-match, not regex -
-    the common alias case, and matches create_trigger's data-only minimalism).
-  - `remove_group(group)` → `rune.trigger.remove_group("agent-"..group) +
-    rune.alias.remove_group("agent-"..group)` (both kinds, one call - a zone switch
-    shouldn't need the model to remember it made both a trigger and an alias).
-  - `list_automation()` → merges `rune.trigger.list()` + `rune.alias.list()`, filtered to
-    `group:match("^agent%-")` so the agent only ever sees its *own* automation, never a
-    human's.
-- **Group discipline, made structural rather than conventional:** every tool's
-  `input_schema` asks the model for a short **label** ("combat", "nav"), never a full
-  group string - the `"agent-"` prefix is prepended by the tool's own Lua, not something
-  the model can spell (or forget to spell, or collide with a human's own trigger groups
-  by omitting). `remove_group`/`list_automation` apply the identical prefix rule, so the
-  three tools can't drift out of sync with each other. The label is validated against
-  `^[%w_-]+$` (letters/digits/`-`/`_`) so a malformed label (a space, punctuation) fails
-  fast with a specific message instead of producing a group nothing else can address.
-- **`rune.guarded_call` gained a 3rd return value (`00_init.lua`):** on failure it
-  already echoed the specific error message locally but returned only `false, nil` to
-  the caller - fine for hooks/timers/triggers/etc., which never needed the message back,
-  but wrong for a tool: the model only sees what comes back in the `tool_result`, never
-  the local echo, so swallowing the message left it with a useless generic
-  "see the echoed error above" and no way to correct its next call. Added `, tostring
-  (result)` as a 3rd return on the failure path - purely additive, every existing caller
-  destructures at most `ok, result` and silently ignores extra returns, confirmed against
-  all 10 call sites. `88_agent_tools.lua`'s wrapper re-raises that message so
-  `dispatch_tool` (T5) surfaces it as `tool_result.content`, `is_error = true`.
-- **Do NOT (yet):** ship a `run_lua(code)` codegen tool. Deferred, gated (see §6).
-- **Combat walkthrough, validated by `TestAgentToolsCreateTriggerFiresReflex`:** a canned
-  `tool_use` for `create_trigger` installs a regex trigger; a subsequent
-  `engine.OnOutput` matching it sends the substituted command with **zero** additional
-  HTTP calls (asserted directly - total call count stays at 2, the original think plus
-  the tool-result continuation) - the reflex genuinely runs at machine speed, off the
-  LLM path entirely, exactly as T9's eventual quarantine→re-plan story assumes.
-- **Tests:** `lua/agent_tools_test.go`, driven through the real turn cycle (start → wake
-  → canned `tool_use` → continuation), not a backdoor into T5's private tool map - 11
-  tests: `send_command`/`speak` (incl. `tell` validation and an unknown-channel error),
-  `create_trigger` firing a reflex with capture substitution, the `agent-` prefix
-  applied structurally (and rejecting a malformed label), `remove_group` clearing both a
-  trigger *and* an alias in one call, `list_automation` excluding a human-authored
-  (ungrouped) trigger, and quarantine: 3 consecutive invalid `create_trigger` calls
-  disable the tool, and a 4th call **with valid input** still fails with a "disabled"
-  `tool_result` - proving quarantine, not the earlier validation error, is what's now
-  blocking it.
-- **2026-07-23 simplification - dropped `create_alias`:** live local runs showed the
-  model never reached for a bespoke shorthand of its own tool calls - it just called
-  `send_command`/`create_trigger` directly - so the tool was pure unused surface: one
-  more schema for the model to weigh every turn, one more kind of automation
-  `remove_group`/`list_automation` had to track and merge. Removed; `remove_group` now
-  only clears triggers and `list_automation` only lists triggers (both simplified from
-  a trigger+alias merge to a single loop). `agent_tools_test.go`'s former
-  `TestAgentToolsRemoveGroupClearsTriggersAndAliases` narrowed to
-  `TestAgentToolsRemoveGroupClearsTriggers`.
-- **2026-07-23 fix - trigger-happy on one-off actions:** the same live runs showed the
-  model installing a `create_trigger` reflex for things that only happen once (walking
-  a fixed route), not just genuinely repetitive ones (combat) - `DEFAULT_SYSTEM`
-  (`87_agent.lua`) said to "prefer" a trigger "for repetitive situations," which the
-  model over-generalized. Reworded both `DEFAULT_SYSTEM` and `create_trigger`'s own
-  `description` to require recurrence ("something that will keep recurring many times
-  before it's done") and explicitly say NOT to use it for a one-off action.
-- **2026-07-25 removal - dropped `create_trigger`/`remove_group`/`list_automation`
-  entirely:** despite the two fixes above, live use kept showing the same root problem -
-  a two-layer agent (some actions direct, some running unattended as self-installed
-  triggers) was hard for both the human watching and the model itself to reason about;
-  confusing enough in practice to outweigh the machine-speed win. `88_agent_tools.lua`
-  now ships only `send_command`/`speak` (plus T12's `search_log`/`read_log`).
-  `DEFAULT_SYSTEM` (`87_agent.lua`) dropped its trigger-usage guidance. T9's
-  quarantine -> re-plan hook (`91_agent_policy.lua`) is removed too, not left inert -
-  `create_trigger` was the only thing that ever tagged a registry entry with an
-  `"agent-"` group, so the hook's condition could no longer be satisfied by anything;
-  rate limit, denylist, oscillation, and budget are unaffected; they gate
-  `rune.agent_policy.send`, which `send_command`/`speak` still call. Removed 7 tests in
-  `agent_tools_test.go` and 2 in `agent_policy_test.go` that existed solely to cover the
-  removed surface (the generic 3-strikes quarantine mechanism they partly overlapped
-  with stays covered elsewhere - see `engine_test.go`/`gmcp_test.go`).
-- **Done when:** the agent can send commands and speak, tools that fail are quarantined
-  individually. ✓
-
-#### T7 `[Lua]` — observability (live mode) ✓
-- **Created:** `lua/core/96_agent_ui.lua` - **not** `NN` picked naively. `rune.pane` is
-  defined in `95_ui.lua`, one of the last core files to load; a first attempt at `89_`
-  loaded before it and every session-boot failed with "attempt to index a non-table
-  object(nil)" on `rune.pane.create`. Numbering a new core file has to check what it
-  actually depends on, not just take the next free slot after the task it logically
-  follows - lesson recorded here so it isn't relearned.
-- **T5 grew five hook points for this (`87_agent.lua`, documented in `20_hooks.lua`'s
-  event list):** `agent_turn_start` (no args), `agent_reply(reply)` (fires per hop,
-  including intermediate tool_use replies - carries reasoning text alongside a tool
-  call), `agent_tool_call(name, input, result, is_error)`, `agent_turn_end(reply)`,
-  `agent_error(err)`. T7 is a **pure observer** of these - it never calls back into
-  `rune.agent`, so a broken renderer can't derail a think (and, being ordinary hook
-  handlers, a failing one is quarantined after 3 errors like anything else rather than
-  spamming). This keeps T5 fully ignorant of panes/bars/logs, same separation as T5/T6.
-- **Reasoning pane:** `rune.pane.create("agent")` at load (idempotent - confirmed
-  against `ui/tui/widget/pane.go`'s `Create`, a safe no-op on an existing name, so this
-  survives `/reload` without resetting content/visibility) + `rune.pane.show("agent")`
-  on every turn start. Writes turn-start/end markers, reasoning text, and
-  `[tool] name(input) -> result` lines - registered unconditionally (like the core
-  status bar) but genuinely inert for a plain human session: nothing ever calls the
-  `agent_*` hooks unless `rune.agent.start()` runs, and the pane is invisible unless
-  something places `{name="agent", height=N}` into `rune.ui.layout` (not done
-  automatically - forcing a new pane into a human's screen would be exactly the
-  unwanted-side-effect mistake T3 already ran into once).
-- **State bar:** `rune.ui.bar("agent_status", ...)` shows `state | tokens | last-action | goal`,
-  or just `"agent: stopped"` when inactive. `rune.agent_ui.summary()` exposes the same
-  fields as plain data (`{input_tokens, output_tokens, cost, last_action}`) so tests (and
-  `/agent`) don't have to scrape a styled/rendered string.
-- **2026-07-18 bug fix - bar/pane name collision:** the bar was originally registered as
-  `rune.ui.bar("agent", ...)`, the same name as the pane (`rune.pane.create("agent")`).
-  `ui/tui/layout.go`'s `getWidget` checks `m.widgets` (bars) before panes for a given
-  name, so any layout entry `{name="agent", ...}` always resolved to the 1-line bar -
-  the reasoning pane could never actually be placed, in any layout, by any user. Worse,
-  `widget.Bar.SetSize` ignores its height argument (bars are always 1 line), so a layout
-  entry with an explicit height (e.g. `{name="agent", height=12}`) still reserved 12 rows
-  in the viewport-height calculation while only ever rendering 1 - the other ~11 rows
-  went completely unused, showing as a dead gap at the bottom of the terminal. Fixed by
-  renaming the bar to `"agent_status"`, leaving the pane as `"agent"`. A user's layout
-  now wants `{name="agent", height=N}` for the reasoning pane and, optionally,
-  `"agent_status"` alongside `"status"` for the compact bar.
-- **On "$":** deliberately **not** computed by default. Zen's model catalog rotates
-  (T4/T8) and fabricating a number from guessed per-model pricing would be actively
-  misleading - worse than omitting it. `rune.agent_ui.pricing = {input_per_million,
-  output_per_million}` is an optional config slot a deployer can set for a real
-  estimate; `summary().cost` stays `nil` until they do. Real budget *enforcement* is
-  T9's job ("governance: budget, rate-limit, ..."); this layer only ever displays.
-- **Per-turn logging:** `rune.log.write("[Agent] " .. ...)` from the same hook handlers -
-  reuses the one shared session log (`60_log.lua` explicitly documents this escape
-  hatch) rather than opening a second file handle that would fight over `rune._log`'s
-  single Go-owned handle. No-ops while no log is open, exactly like every other
-  `rune.log.write` caller - confirmed by test, not just inferred from the doc comment.
-- **`/agent` command:** status by default (active/thinking/goal/tokens/last-action),
-  plus `/agent start [model]` and `/agent stop`. Originally shipped status-only,
-  deliberately **not** `/agent start|stop` - the concern at the time was adding
-  start/stop control would silently expand T5's "Lua-API-only" decision under T7's
-  "observability" banner instead of being its own deliberate call. **Reversed
-  2026-07-18** by explicit user request, once end-to-end use made `/lua
-  rune.agent.start{model="..."}` too awkward for routine start/stop - i.e. this *is*
-  that deliberate call, just made later. `start` resolves the model as `<arg> >
-  RUNE_LLM_MODEL (.env, allowlisted in api_env.go) > usage error`; `rune.agent.start`
-  itself is unchanged and still requires an explicit non-empty `model` in its opts
-  (T5's contract, unchanged for scripted/programmatic callers). `rune.agent.status()`
-  (`87_agent.lua`) gained a `model` field so both `/agent` and `/agent start` (when
-  already running) can report which model is active. Provider is shown alongside it
-  (`(model: ..., provider: ...)`) via a new `rune.llm.provider()` getter in
-  `86_llm.lua` - the exact `RUNE_LLM_PROVIDER`-or-`"zen"` default `rune.llm.chat`
-  already resolved internally, now exposed as a function instead of re-derived a
-  second time in `96_agent_ui.lua`. Provider deliberately did **not** go on
-  `rune.agent.status()` itself - unlike `model` (an explicit per-call argument to
-  `rune.agent.start`), provider is global transport config with no per-agent
-  identity, and 87_agent.lua staying ignorant of providers is exactly the boundary
-  T9b's "Bore out as intended" note above already validated.
-- **Collateral fix:** `pane_test.go` (predates T7) asserted an *exact* global pane-call
-  count; booting now also creates the "agent" pane, so it was updated to filter to the
-  `"chat"` pane it actually pins - the same class of fix as T6's `agent_test.go` updates
-  when tool registration stopped being empty-by-default.
-- **Tests:** `lua/agent_ui_test.go`, Lua-against-mock - 8 tests: bar content for
-  stopped/thinking/idle states (including the goal appearing in the idle bar),
-  `summary()` tracking tokens and `last_action` mid-turn (`"tool: send_command"`) and at
-  turn end (`"idle"`), pricing left `nil` by default vs. computing correctly once
-  configured, pane writes occurring at each lifecycle point (turn start / tool call /
-  turn end - "best-effort" per the plan, so occurrence is checked, not exact text),
-  `rune.log.write` firing per-turn when a log is active and silent when it isn't
-  (proving the no-op claim, not just trusting the doc comment), and `/agent`'s output
-  before and after a turn. **Start/stop addendum (2026-07-18):** 9 more tests covering
-  `/agent start <model>`, `/agent start` resolving `RUNE_LLM_MODEL` from `.env`,
-  the usage error when neither is available, already-running/already-stopped as
-  no-ops that print a notice rather than erroring, `/agent stop`, an unknown
-  subcommand falling through to usage, and the displayed provider following
-  `RUNE_LLM_PROVIDER` (plus 2 tests on `rune.llm.provider()` itself in
-  `lua/llm_test.go` - default `"zen"` and the env override).
-- **Done when:** in a live run you can watch reasoning + state; every turn is logged. ✓
-
-### Phase 2 — harden + govern
-
-#### T8 `[Go]` — `rune._llm` transport ✓
-- **Created:** `lua/api_llm.go` + `session/lua_llm.go`, mirroring `lua/api_http.go` +
-  `session/lua_http.go` as planned - same async goroutine → `event.AsyncResult` →
-  `Engine.OnLLMResult` → `rune.llm._deliver` shape as HTTP, one final result per call
-  (see "Streaming" below for why, not incremental deltas).
-- **`LLMRequest` is narrower than `HTTPRequest` by design:** `lua/host.go`'s new
-  `LLMRequest{Body string}` carries *only* the pre-encoded JSON body - no method, url, or
-  headers fields, unlike `HTTPRequest`. The destination (`llmURL`), `x-api-key`, and
-  `anthropic-version` are now attached entirely inside `session/lua_llm.go`'s
-  `doLLMRequest`, from the real process environment (`s.Env("OPENCODE_API_KEY")`) - so
-  the key doesn't just avoid being logged, it never exists as a Lua value at any point.
-  `Engine.OnLLMResult` reuses `HTTPResponse` (status/body/headers) as the delivery shape
-  rather than adding a near-identical duplicate type.
-- **Consequence: the missing-key check moved from Lua to Go.** T4's `86_llm.lua` used to
-  call `rune.env("OPENCODE_API_KEY")` itself and fail fast, before ever making a call -
-  but that would mean touching the key from Lua just to check it exists, undermining the
-  point above. Now `rune.llm.chat` always calls `rune._llm.request` and always gets an id;
-  a missing key is detected in `doLLMRequestWithRetry` and delivered through the *same*
-  `_deliver(id, nil, err)` path as a transport failure - `86_llm.lua` doesn't special-case
-  it, it's just another error string prefixed and handed to the caller's callback.
-  `TestLLMChatMissingAPIKey` (Lua/MockHost-level) was removed for this reason - MockHost's
-  `LLMRequest` is a dumb recorder like `HTTPRequest`'s, so the check isn't reachable at
-  that layer anymore - and replaced by `TestLLMMissingAPIKeyDeliversError` in the new
-  `session/llm_test.go`, which is the lowest layer that can actually express this failure
-  now (per `docs/testing.md`).
-- **Retries/backoff on 429/529:** `doLLMRequestWithRetry` retries up to `llmMaxAttempts`
-  (4 = 1 initial + 3 retries) with exponential backoff (`llmRetryBackoff`, 250ms·2ⁿ).
-  Exhausting retries delivers the *last* response as a normal result (still whatever
-  non-2xx it was), not a synthesized transport error - so it flows through `86_llm.lua`'s
-  existing non-200 handling (`error_message`, unchanged since T4) with no new Lua logic
-  needed. Only 429/529 trigger a retry; a real transport error (DNS, timeout, connection
-  refused) is returned on the first attempt, matching `HTTPRequest`'s existing behavior.
-- **Test seams:** `llmURL` and `llmRetryBackoff` are package `var`s, not `const`s,
-  specifically so `session/llm_test.go` can redirect the destination at an
-  `httptest.Server` and skip real sleeps during retries - a small, contained seam rather
-  than a new interface/DI layer, sized to what the tests actually needed.
-- **Swap:** `rune.llm.chat` (T4) moved from `rune.http.post` onto `rune._llm.request`;
-  its public signature and reply shape (`content`/`text`/`tool_uses`/`stop_reason`/`usage`)
-  are unchanged, so T5/T6/T7 needed zero code changes.
-- **Ripple this swap caused (expected, not a bug):** T5/T6/T7's entire test suites
-  (`lua/agent_test.go`, `lua/agent_tools_test.go`, and `lua/agent_ui_test.go` via the
-  shared helpers the latter two files define/consume) simulate LLM turns by injecting
-  canned responses directly against `MockHost`'s HTTP capture - swapping the transport
-  primitive touched every one of them. Purely mechanical, no behavioral change:
-  `host.HTTPCalls` → `host.LLMCalls`, `engine.OnHTTPResult` → `engine.OnLLMResult`
-  (`HTTPResponse` itself is unchanged, since it's reused for delivery - see above).
-  `agent_ui_test.go` needed no edits at all, since it only goes through
-  `agent_tools_test.go`'s shared helpers (`startAgentAndWake`, `deliverToolUse`,
-  `deliverEndTurn`) rather than touching `HTTPCalls`/`OnHTTPResult` directly - exactly the
-  payoff of centralizing those helpers during T6.
-- **Streaming: deliberately deferred, per the plan's own "start non-streaming" option.**
-  T5's turn loop (`on_reply`) and T7's pane/bar both already consume one whole reply per
-  hop, not partial deltas - wiring real token-level streaming through would mean reworking
-  both, not just the transport. `rune._llm.request`'s id-based delivery is already the
-  right shape to grow incremental `AsyncResult`s behind later without another transport
-  swap, same as the plan noted; this task ships the one-final-result half only.
-- **Tests:** `lua/llm_test.go` (MockHost, same coverage as T4 minus the request
-  URL/header/method assertions - those aren't Lua's concern anymore, see below) + new
-  `session/llm_test.go` (real `Session` against `httptest.Server`, mirroring
-  `session/http_test.go`'s pattern): round trip proving method/`x-api-key`/
-  `anthropic-version`/`Content-Type`/body actually reach the wire and the reply flows back
-  through `rune.llm.chat`'s callback; missing-key delivers an error with the server never
-  contacted; a 429-then-200 sequence succeeds after retrying (asserts the server saw
-  exactly the expected hit count); a persistent 429 exhausts every attempt and delivers
-  the final 429 body verbatim rather than a transport error.
-- **Done when:** key never appears in Lua ✓; usage still flows through to T7's tracking
-  unchanged ✓ (reply shape untouched); 429/529 retried with backoff, verified by test, not
-  just reviewed ✓. Live-streaming reasoning is the one open half - see "Streaming" above;
-  the id-based delivery it needs is already in place.
-
-#### T9 `[Lua + small Go]` — governance ✓
-- **Created:** `lua/core/91_agent_policy.lua`. Touched `lua/core/00_init.lua` (new
-  `"quarantined"` hook), `lua/core/20_hooks.lua` (documented the 2 new events), and
-  `lua/core/88_agent_tools.lua` (`send_command`/`speak`/`create_trigger` rewired onto the
-  new governance choke point).
-- **Turned out to need zero new Go, despite the task's own `[Lua + small Go]` label:**
-  `os.time()` (an ordinary gopher-lua stdlib global, already used by `60_log.lua`'s
-  `os.date`) covers the rate limiter's clock, and the quarantine signal is just a new hook
-  fired from `rune.guarded_call` - itself already pure Lua in `00_init.lua`, not the
-  `lua/core/15_registry.lua` the plan guessed (quarantine tracking/disabling lives in
-  `guarded_call`, not the registry factory). Recorded here the same way T3/T8 recorded
-  their own deviations from the original plan.
-- **Why not wrap `rune.send`/`rune.send_raw` directly:** those are shared with ordinary
-  human input - a human typing "quit" at the prompt must never be blocked by the agent's
-  own denylist, and a human's typing speed must never be capped by the agent's rate limit.
-  Governance can only live at the *agent-attribution boundary*: the specific call sites
-  that originate from the agent's own tools/reflexes. `rune.agent_policy.send(cmd)` is that
-  boundary - `send_command`, `speak`, and the function `create_trigger` now installs (see
-  below) call it instead of `rune.send` directly; nothing else does, and a plain human
-  session using `rune.send` itself is completely unaffected.
-- **Rate limit:** `rune.agent_policy.send` enforces `max_commands_per_second` (default 3)
-  via a **fixed 1-second window** keyed off `os.time()` - not a true sliding window (a
-  burst can straddle a boundary), but good-citizen throttling doesn't need leaky-bucket
-  precision, and it made the tests trivial (monkeypatch the Lua global `os.time` for the
-  duration of one test, restored implicitly since each test gets a fresh VM - no new Go
-  seam needed, unlike T8's `llmURL`/`llmRetryBackoff`). On by default, unlike budget - a
-  safety net, not an opt-in. "Covers channel output too" (the plan's own phrasing) falls
-  out for free: `speak` funnels through the exact same `send()` as `send_command`, no
-  separate accounting. The echo+`agent_policy` hook notification is deduped to once per
-  window even under a sustained flood (`rate_limit_notified_this_window`) - the same
-  "report once" instinct as `10_regex.lua`'s `entry.reported` - while `send()`'s own return
-  value still reports every individual denial to its immediate caller.
-  - **Known caveat, documented rather than closed:** `rune.send` still expands `;`-chains
-    and `#N` repeats *after* this choke point, so one governed call can still put more than
-    one line on the wire. This was already true of `create_trigger`'s `command` field before
-    T9 (its schema always allowed `;`-separated commands) - not a regression, just not fully
-    closed by the limiter. It counts governed calls, not wire lines.
-- **Irreversible-command gate:** a denylist of Go-regexp patterns (`rune.regex`, same
-  engine/cache triggers and aliases already use) checked against the full outgoing command
-  text; defaults to a bare `^quit$`. `rune.agent_policy.deny(pattern)` extends it (raises on
-  an invalid pattern, same convention as `rune.trigger.regex`). **Deny-only, not
-  deny-or-confirm:** an interactive confirm needs a UI affordance neither run mode has yet
-  (live mode has no such prompt; headless mode doesn't exist until T10/T11) - denying is the
-  strictly safer half of "denylist/confirm" and fully satisfies "contained". Checked only at
-  send time, never at `create_trigger` creation time - a single robust
-  enforcement point beats statically analyzing trigger definitions whose `%N` capture
-  substitution could produce a denylisted command dynamically in a way creation-time
-  checking could never catch anyway.
-- **Oscillation:** the last `oscillation_window` (default 4) commands
-  `rune.agent_policy.send` actually sent, if they are all the *same command* sent while
-  `rune.perception.snapshot()` stayed byte-identical (compared via `rune.json.encode`, the
-  same encode-and-compare technique `87_agent.lua`'s `build_observation` already uses) every
-  time, means nothing is changing in response to repeating it - notifies, wakes the LLM
-  (`rune.agent.wake("oscillation")`), and clears the tracking ring so it takes a fresh
-  `oscillation_window` repeats to fire again (otherwise every subsequent repeat of a still-stuck
-  command would re-notify/re-wake). **Detects same-command (period-1) repetition
-  specifically, not arbitrary-period cycles** ("A, B, A, B, ...") - the dominant real failure
-  mode (one stuck reflex, or the model repeating one tool call) and far simpler to detect and
-  test than general cycle detection; recorded as a deliberate scope call, not an oversight.
-- **Budget:** accumulates `reply.usage` (via the existing `agent_reply` hook, same event
-  `96_agent_ui.lua` already watches) into a running `$` total and calls `rune.agent.stop()`
-  once `config.budget_usd` is hit. Off by default (`nil`), exactly like `96_agent_ui.lua`'s
-  own `pricing` slot, and for the same reason already documented there: there is no safe
-  universal default for "how much may this bot spend," and fabricating one from guessed
-  per-model pricing would be worse than not enforcing at all. **Tracks its own
-  tokens/pricing independently of `96_agent_ui.lua`'s display accumulator** - a deliberate,
-  considered duplication (not an oversight): governance must keep working even if
-  observability were ever stripped out, and vice versa. A deployer wanting both the bar's
-  display *and* a real cap sets `rune.agent_ui.pricing` and
-  `rune.agent_policy.configure{pricing=...}` separately; they are intentionally not linked,
-  at the cost of needing to be set twice.
-  - **Known imprecision, documented rather than fixed:** the check runs on every
-    `agent_reply` hop (including intermediate `tool_use` hops), but `on_reply`
-    (`87_agent.lua`) does not re-check `active` between firing that hook and continuing a
-    `tool_use` turn - so calling `rune.agent.stop()` from inside the hook can still let one
-    more in-flight hop go out before the *next* `on_reply` invocation's existing `not active`
-    guard drops it. A firm backstop, not a laser-precise cutoff; fixing it would mean
-    touching `87_agent.lua`'s already-shipped turn loop for a one-hop overshoot, which isn't
-    worth it.
-- **Quarantine → re-plan (the payoff loop):** `rune.guarded_call` (`00_init.lua`) now fires
-  a new `"quarantined"` hook `(label, data)` the instant it disables an entry after 3
-  consecutive failures (guarded by `if rune.hooks then`, since this file loads before
-  `20_hooks.lua` defines `rune.hooks` - dead code in practice, since `guarded_call` is only
-  ever invoked during real dispatch, long after every core file has loaded, but consistent
-  with the codebase's existing defensive style, e.g. `15_registry.lua`'s
-  `not rune.group or ...`). `91_agent_policy.lua` listens and wakes the LLM **only when the
-  quarantined entry's `group` starts with `"agent-"`** - the exact convention
-  `create_trigger` already enforces structurally (T6) - so a human's own
-  quarantined trigger can never wake somebody else's bot.
-  - **Tool quarantine deliberately does NOT wake the LLM** (scope is triggers/aliases only,
-    via the group-prefix check): a tool's failure already reaches the model for free,
-    synchronously, as an `is_error` `tool_result` within the very turn that caused it. Only a
-    *reflex* - which runs entirely outside any turn, with no LLM anywhere nearby - has no
-    other way to be noticed at all, which is exactly why the plan called this out as needing
-    a new signal in the first place.
-  - **This forced `create_trigger`'s installed action to change from a string to a
-    function** (`88_agent_tools.lua`): `50_triggers.lua`'s dispatcher only ever routes
-    *function* actions through `rune.guarded_call` - a string action is sent directly,
-    unprotected, and can never fail or quarantine. `create_trigger` now installs
-    `function(matches) ... rune.agent_policy.send(...) ... end` (substituting captures via
-    the same `rune.substitute_captures` the trigger engine itself would have used, so `%1`/`%2`
-    behavior is byte-for-byte unchanged) instead of the raw command string. Its failure
-    contract is deliberately asymmetric: a `"denied"` result from `send()` is re-raised
-    (counts toward *this trigger's* quarantine, feeding the re-plan wake above), but a
-    `"rate_limited"` result is swallowed silently - throttling a fast-but-otherwise-fine
-    reflex during a legitimate burst must degrade to "dropped this one" rather than escalate
-    into "quarantined and disabled," which would be a much harsher outcome than rate
-    limiting is meant to cause. `send_command`/`speak` raise on either reason, since reaching
-    3 consecutive rate-limited *tool* calls would require the model itself to blindly retry
-    3 times despite being told each time - a scenario closer to oscillation than bad luck.
-- **Tests:** `lua/agent_policy_test.go` (14 tests) - denylist blocks the default `quit` and
-  a custom `deny()` pattern (and rejects an invalid one), rate limiting throttles a burst and
-  resumes after the window rolls over (`os.time` monkeypatched, no real sleeps) and honors
-  `configure()`, oscillation wakes an idle agent after 4 identical sends with unchanged
-  perception and resets afterward (proven by 2 more repeats *not* re-waking), the budget cap
-  stops the agent once crossed and stays inert without pricing configured, a quarantined
-  `agent-*` trigger wakes the agent while a quarantined human trigger does not, and
-  `status()`/`/policy` reflect live config. `lua/agent_tools_test.go` gained
-  `TestAgentToolsSendCommandRespectsDenylist`, proving the tool-level integration (not just
-  `rune.agent_policy.send` in isolation) actually routes through the new layer. All
-  pre-existing T5/T6/T7 tests pass unchanged - the rewiring preserves every previously-tested
-  happy path exactly (nothing in those suites sends fast enough or sends anything
-  denylisted).
-- **Done when:** a runaway/looping agent is contained (rate limit + denylist + oscillation,
-  all independently tested) ✓ and a failing reflex re-engages cognition (quarantine → re-plan,
-  tested end-to-end through the real `create_trigger` → quarantine → wake path, not a
-  synthetic shortcut) ✓.
-- **2026-07-23 fix - agent commands invisible against the game transcript:** live local
-  runs showed T7's reasoning pane and the main game window scrolling independently with
-  no shared anchor, so it was effectively impossible to tell which server line an agent
-  command was actually reacting to - the only record of what got sent lived in the
-  separate `agent` pane's `[tool] name(input) -> result` line, never in the main
-  transcript alongside the game's own response. `rune.agent_policy.send` now echoes every
-  agent-attributed command into the main window (`rune.echo(rune.style.gray("[agent] ")
-  .. cmd)`) right before `rune.send(cmd)` - the one choke point already shared by
-  `send_command`, `speak`, and `create_trigger`'s reflex action, so this covers all three
-  for free. `rune.send`/`rune.send_raw` themselves still echo nothing, human-typed or
-  not - this is additive at the governance boundary, not a change to shared plumbing.
-
-#### T9b `[Go+Lua]` — OpenAI-compatible provider (llama.cpp, local/self-hosted) ✓
-- **Why:** run the agent against a local `llama.cpp` (`llama-server`) instance - or any
-  other server speaking the same OpenAI chat/completions wire format (Ollama, vLLM, LM
-  Studio, ...) - instead of OpenCode Zen. Motivated by wanting to develop/test without a
-  hosted key or network dependency, not a vendor preference.
-- **Design constraint that shaped this:** `rune.llm.chat`'s public req/reply shape (T4) is
-  Anthropic-Messages-flavored, and everything above `86_llm.lua` - `87_agent.lua`,
-  `88_agent_tools.lua`, `91_agent_policy.lua` - only ever touches that canonical shape,
-  never raw JSON. `llama-server` speaks OpenAI's `/v1/chat/completions` shape, not
-  Anthropic's, so the work is entirely a translation layer at the existing provider
-  boundary (`86_llm.lua` for JSON shape, `session/lua_llm.go` for URL/auth) - **zero
-  changes** to the agent core, tools, or governance layer.
-- **Provider selection: `RUNE_LLM_PROVIDER`**, read independently on both sides of the
-  boundary rather than one side telling the other - the same pattern as
-  `OPENCODE_API_KEY` already being Go-only and invisible to Lua:
-  - `session/lua_llm.go` reads it to pick the URL/auth-header/key-requirement (`zen`,
-    default, vs. `openai`).
-  - `lua/core/86_llm.lua` reads it (via `rune.env` - added to `api_env.go`'s allowlist,
-    since unlike an API key this name isn't a secret) to pick which JSON shape to
-    build/parse.
-  - An unrecognized value is a configuration error delivered through the normal
-    `_deliver(id, nil, err)` path (not a raise) rather than silently behaving like `zen` -
-    a typo'd provider name would otherwise produce a confusing "OPENCODE_API_KEY is not
-    set" for someone who never meant to talk to Zen at all.
-- **`RUNE_LLM_URL`** overrides the endpoint for either provider; **required** (fails fast
-  with a clear error, gateway never contacted) when `RUNE_LLM_PROVIDER=openai` - a local
-  server's address/port is deployment-specific, and guessing a default (e.g.
-  `localhost:8080`) would silently point at the wrong thing more often than the right one,
-  the same reasoning T4/T7 already used to decline defaulting `req.model` or a per-model $
-  price. `RUNE_LLM_API_KEY` is optional for `openai` - `llama-server` needs no key by
-  default, so it's only attached as `Authorization: Bearer <key>` when configured (a bare
-  `Authorization: Bearer ` on every request would be worse than omitting the header
-  entirely). Neither var is Lua-visible; both are read directly in `session/lua_llm.go`,
-  same as `OPENCODE_API_KEY`.
-- **Wire-format translation (`86_llm.lua`), both directions:**
-  - Request: `system` becomes a leading `{role="system"}` message (OpenAI has no top-level
-    `system` field); `{name, description, input_schema}` tools become `{type="function",
-    function={name, description, parameters}}`; a canonical assistant message's content
-    array becomes OpenAI's separate `content`/`tool_calls` fields; a canonical user
-    message carrying `tool_result` blocks expands into **one OpenAI `role="tool"` message
-    per block** (OpenAI has no multi-block content the way Anthropic does, so one incoming
-    message can become several outgoing ones).
-  - **`is_error` fidelity gap, closed rather than left silent:** Anthropic's `tool_result`
-    block has an `is_error` flag; OpenAI's `role="tool"` message has no equivalent field.
-    Dropping it would leave a local model blind to its own tool failures, so a
-    true `is_error` is folded into the text itself as an `"Error: "` prefix instead of
-    being discarded.
-  - Response: `choices[1].message` is synthesized back into the same Anthropic-shaped
-    `content` array (`text`/`tool_use` blocks) the Zen path produces natively, so
-    `split_content` and the tool-result round trip (`87_agent.lua` echoes `reply.content`
-    back verbatim on the next hop, which the request-side translation above then
-    re-translates) behave identically regardless of which wire was actually spoken.
-    `function.arguments` arrives as a JSON **string** in OpenAI's shape (unlike
-    Anthropic's already-decoded `tool_use.input`) - decoded here so `tool_uses[].input` is
-    always a table either way. `usage.prompt_tokens`/`completion_tokens` map onto the
-    existing `input_tokens`/`output_tokens` fields T7's tracking already reads.
-  - `finish_reason` → `stop_reason`: only `"tool_calls"` → `"tool_use"` is translated (the
-    one value `87_agent.lua`'s `on_reply` actually branches on) plus `"length"` →
-    `"max_tokens"` (a direct, unambiguous correspondence); anything else (e.g. plain
-    `"stop"`) passes through unchanged rather than being forced into an Anthropic term the
-    backend never actually said - still visible in T7's turn-end log either way.
-- **`req.model` against a local server:** typically ignored server-side (`llama-server`
-  serves whatever's loaded) - any non-empty placeholder satisfies the existing "model
-  required" validation; no code change needed.
-- **Tests:** `session/llm_test.go` gained coverage for the Go-side URL/auth split - a
-  configured `RUNE_LLM_API_KEY` is sent as a standard Bearer token, no key configured
-  sends no `Authorization` header at all (not an empty `"Bearer "`), a missing
-  `RUNE_LLM_URL` under `openai` delivers an error without ever contacting a server, and an
-  unrecognized provider name delivers an error naming it. The test seam changed from
-  mutating a package var (`llmURL`) to `t.Setenv(RUNE_LLM_URL, ...)` - the same override a
-  real deployment uses, just aimed at an `httptest.Server`; `withLLMTestServer` also now
-  pins `RUNE_LLM_PROVIDER=zen` explicitly so a real value of that var in a developer's own
-  shell (increasingly plausible now that this exists) can't leak into a test expecting the
-  zen-default path. `lua/llm_test.go` gained the JSON-shape coverage: request body shape
-  (system-as-message, tools-as-function-defs), a text-only response, a tool_calls response
-  (proving `arguments` is decoded from a JSON string into a table), and a tool-result
-  continuation built the same way `87_agent.lua` would build one - proving the
-  assistant-content round trip and the `is_error` → `"Error: "` prefix both survive the
-  translation.
-- **Done when:** `RUNE_LLM_PROVIDER=openai` + `RUNE_LLM_URL` pointed at a local
-  `llama-server` runs the full agent loop - tool calls included - with zero changes to
-  `87_agent.lua`/`88_agent_tools.lua`/`91_agent_policy.lua` ✓ (proven by construction: none
-  of those files were touched); a missing/bad config fails fast with a clear error instead
-  of a confusing downstream failure or a silent wrong-endpoint guess ✓.
-
-### Phase 3 — headless + memory
-
-#### T10 `[Go+cmd]` — HeadlessUI + `--headless` ✓
-- **Created:** `ui/headless/headless.go`, a `ui.UI` implementing exactly the contract in
-  `ui/interface.go`. Content methods log a plain line to an `io.Writer` (`os.Stdout` in
-  production): `Print`/`Echo` write as-is (headless has one transcript, not a separate
-  scrollback vs. echo distinction); `SetPrompt` tags with `[prompt] ` and drops a clear
-  (empty text) rather than logging a bare tag; `WritePane(name, text)` tags with
-  `[pane:<name>] ` - this is how the agent stays observable with no reasoning pane to
-  look at (`96_agent_ui.lua`'s `agent` pane just becomes `[pane:agent] ...` lines in the
-  same stream). Everything visual-only - `UpdateBars`/`UpdateBinds`/`UpdateLayout`,
-  `ShowPicker`, `CreatePane`/`TogglePane`/`SetPaneVisible`/`ClearPane`, the pane-scroll
-  primitives, `InputSetCursor` - is a no-op; `OpenEditor` returns `("", false)` (no
-  terminal to suspend for `$EDITOR`). `Input()`/`Outbound()` return channels that start
-  and stay empty until T11 exists to drive them.
-- **`Run()`/`Quit()` contract:** `New(ctx, w)` takes the context at construction (the
-  interface's `Run()` takes no arguments, so this is the only way in) and `Run()` blocks
-  on `select { <-ctx.Done(); <-h.done }` - either the caller's context or an explicit
-  `Quit()` unblocks it, whichever comes first; both converge on the same `sync.Once`
-  close so either order, or both, is safe. This mirrors exactly what `cmd/rune/main.go`
-  already had: `signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)`'s `ctx` was
-  already being passed into `Session.Run`, just never into the UI (`BubbleTeaUI.Run()`
-  blocks on Bubble Tea's own program loop instead, which has its own independent
-  SIGINT/SIGTERM handling) - headless needed that same `ctx` threaded one level further.
-- **Wired:** `cmd/rune/main.go` gained a `-headless` flag; when set, `headless.New(ctx,
-  os.Stdout)` replaces `tui.NewBubbleTeaUI()` and `Session` construction is otherwise
-  identical - confirming the `ui.UI` seam needed zero `Session`/engine changes, per plan.
-- **Deviation from the plan's "stdout/JSON/file" phrasing:** shipped stdout-only, plain
-  (untagged-except-prompt/pane) lines - no JSON mode, no file mode. `io.Writer` is the
-  seam a JSON or file writer would plug into later without touching this package; adding
-  one before anything needed it would be exactly the speculative-generality this
-  codebase's PLAN.md entries elsewhere argue against (e.g. T7's "$" cost estimate, T9's
-  budget default).
-- **Tests:** `ui/headless/headless_test.go` (Go unit, 7 tests) - `Print`/`Echo` log
-  verbatim, `SetPrompt` tags and drops empty, `WritePane` tags with its name, every
-  visual-only method is a confirmed no-op (including `OpenEditor`), `Run` blocks until
-  context cancel and separately until `Quit` (both proven with a timeout race, not just
-  inspection), `Quit` is idempotent and safe post-`Run`, `Input`/`Outbound` start empty.
-  `test/e2e/headless_test.go` (imperative Go, reusing `harness_test.go`'s `fakeMUD`) -
-  a real `Session` + real `network.TCPClient` + `headless.UI` against a scripted MUD:
-  boots via `Config.ConnectTarget` (headless has no keyboard to type `/connect` at),
-  server output shows up in the captured writer, then cancelling the *same* `ctx` handed
-  to both `headless.New` and `Session.Run` - standing in for a real SIGTERM - unwinds
-  the whole session within the test's timeout. Manually smoke-tested too: a built binary
-  run with `--headless`, no connect target, logged its boot banner to stdout and exited
-  cleanly within ~1s of a real `SIGTERM`.
-- **Done when:** `rune --headless <target>` runs the agent with no terminal and exits
-  cleanly on signal. ✓
-
-#### T11 `[Go/Lua]` — control surface for headless — **cut 2026-07-23**
-- **Cut, not deferred.** The point of headless mode is a bot that runs *without* input;
-  a pause/resume/step channel is a supervision affordance for a human who is, by
-  definition, not there. Everything it was meant to guarantee is already covered:
-  containment by T9's governance (rate limit, denylist, oscillation, budget cap), the
-  kill switch by SIGINT/SIGTERM → ctx cancel → clean shutdown (T10, tested), and
-  "what is it doing" by the session log, which T12 makes complete and durable.
-  Recorded here rather than deleted so the reasoning survives if it ever comes back.
-- **Original scope, for reference:** config-driven autonomy; an out-of-band local
-  control (unix socket or signals) for pause/resume/step/status/reload; optionally
-  in-game supervision via allowlisted `tell`s.
-
-#### T12 `[Go+Lua]` — logging as the bot's memory ✓
-- **Why:** two gaps surfaced once T10 made unattended runs real. (1) A headless run's
-  transcript lived only on stdout - lost entirely unless the deployer redirected it.
-  (2) The agent's only history was `rune.perception.transcript()`'s rolling 200 lines
-  (T3); anything older was simply gone, so it could not recall a quest hint, a name, or
-  what happened last time it tried something.
-- **Created `lua/core/92_agent_log.lua` - layered on top of upstream's `60_log.lua`, not
-  inside it.** That file is upstream's and this is a fork, so logging policy lives in a
-  file of our own and upstream pulls can never conflict over it. Its own header
-  documents exactly this seam ("register your own hooks against `rune._log.write` for a
-  different policy"), and everything here goes through that primitive or `rune.log`'s
-  public API. `60_log.lua` is untouched.
-- **Timestamps (`rune.log.timestamps(true)`):** wraps `rune._log.write` itself, which is
-  what makes this work without editing upstream - both `60_log.lua`'s own output/echo
-  hooks and every `rune.log.write` caller already funnel through that one primitive, so
-  wrapping it stamps *every* line, game output and agent reasoning alike. Off by default,
-  so a plain human `/log` stays byte-identical to upstream. Applies from the moment it is
-  enabled, never retroactively (a test pinned this: `rune.log.start`'s own "--- Log
-  started ---" stamp is written before enabling and correctly stays bare).
-- **Agent chrome:** `60_log.lua` deliberately drops `rune.echo` output as "client chrome"
-  - right for `/help` spam, wrong for a bot, whose echoed commands *are* the transcript.
-  The gap was never the LLM's own turns (`96_agent_ui.lua` has logged those since T7): it
-  was **reflex sends**, which fire from a trigger with no LLM hop and therefore produce no
-  `agent_tool_call` at all, and **policy notices** (denied/rate-limited/oscillation/
-  budget), which only ever reached the screen. Both are now captured by pure-observer
-  hooks, matching `96_agent_ui.lua`'s pattern. `91_agent_policy.lua` fires one new hook,
-  **`agent_send(cmd)`**, from its existing choke point - after governance allowed the
-  command, so a denied one is never logged as sent (tested).
-- **Read-back:** new `Host.LogRead(maxLines)` / `Host.LogSearch(pattern, maxResults)`
-  (`session/lua_log.go`), surfaced as `rune._log.read`/`rune._log.search` and wrapped as
-  `rune.log.read(n)` / `rune.log.search(pattern, n)`. Reads open a second read-only handle:
-  `LogWrite` is unbuffered, so an open log's file already holds every line written so far
-  and no flush coordination is needed (tested explicitly - a read sees a write from moments
-  earlier). Both are **bounded** (default 50, hard cap 500) because they scan
-  synchronously on the session goroutine under the 5s watchdog, and because the result is
-  usually on its way into a prompt. A capped `LogSearch` keeps the **most recent** matches,
-  not the first ones - searching a live log is a question about recent history. The tail is
-  a fixed ring indexed by a running count, O(lines) rather than the O(lines x cap) a
-  per-line slice shift would cost on a long-running bot's log.
-- **Agent tools:** `search_log(pattern, max_results?)` and `read_log(lines?)`
-  (`88_agent_tools.lua`). **Still inside the fairness principle (§4) by construction:** the
-  log holds only what already reached the screen plus the bot's own reasoning, so reading
-  it back is memory, never new perception - no rule needed, the property falls out of what
-  the file contains.
-- **Headless auto-start:** `rune.headless` (new `Engine.SetHeadless`, static boot config
-  set before core scripts load - deliberately *not* part of `ClientState`, which is mutable
-  state Go re-pushes as the connection/terminal changes) lets `92_agent_log.lua` start a
-  timestamped log unprompted when there is no terminal. A terminal session is left alone:
-  writing a file nobody asked for is exactly the unwanted side effect T3's
-  `perception.enable()` and T7's pane placement both already avoid.
-- **`/loglines`:** `/loglines [n]` and `/loglines search <pattern>` give a human the same
-  view the agent's tools get.
-- **Tests:** `session/lua_log_test.go` gained 8 file-backed tests (trailing lines oldest
-  first, a cap above the file length, ring wrapping over 500 lines, search keeping the
-  newest matches, no-hits-is-not-an-error, both calls requiring an open log, an invalid
-  pattern, and reading back writes to a still-open log). `lua/agent_log_test.go` (12 tests)
-  covers the Lua policy: timestamps applied/absent/toggled, `agent_send` and `agent_policy`
-  reaching the log, a denied command *not* logged as sent, chrome silent with no log open,
-  read/search from Lua, the nil+message convention with no log, clamping vs. raising, and
-  headless auto-start vs. a terminal session starting nothing. `lua/agent_tools_test.go`
-  gained 3 driving the real turn cycle. Smoke-tested end to end: a real `--headless` boot
-  auto-opened a timestamped log, captured two sends plus a denylist notice, and read and
-  searched them back.
-- **Done when:** an unattended run is durable and self-describing without the deployer
-  doing anything ✓, and the agent can recall context beyond its rolling window ✓.
+#### T13 `[Lua]` — memory stream (retrieval + reflection) ✓
+- **Why:** the agent had no durable memory of *what it learned*, only of what it saw.
+  `rune.perception.transcript()` is a 200-line rolling window (`84_perception.lua`);
+  past that, T12's `search_log`/`read_log` could find a line again only if the model
+  thought to ask and guessed a regex. The one thing that persisted across turns was
+  `agent_goal` — the model's own last reply text, replayed verbatim. That single slot was
+  carrying the entire cross-turn memory load, badly: it is why the observation heading
+  has to disclaim "your own words … not confirmed fact", and why `accddb2` had to stop
+  fabricated narrative being fed back as the goal. Facts live in the stream now; the goal
+  is a goal again.
+- **Prior art:** Park et al., *Generative Agents* (arXiv:2304.03442). Adopted
+  selectively — the departures below are as load-bearing as what was kept.
+- **Created `lua/core/89_memory.lua`** (`rune.memory`), inert until
+  `rune.memory.enable()`, which `rune.agent.start` calls and `rune.agent.stop` unwinds —
+  the same lifecycle as `84_perception.lua`, for the same reason: a core file loads in
+  every session, and subscribing to GMCP or writing the durable store are side effects a
+  human who never started a bot did not ask for. `disable()` stops recording but
+  deliberately does **not** forget, so a restarted agent still knows what it learned
+  (tested).
+- **Record:** `{ id, t, kind, text, importance, tags, refs }`, persisted in `rune.store`
+  under `agent_memory` as `{ next_id, pending, records }`. Not a bare array: ids must
+  survive eviction because a reflection's `refs` point at them, and the reflection
+  counter must survive a reconnect or a long-running bot reflects on a clock that resets
+  every restart. `kind` carries the event type (`room`/`enemy`/`level`/`close_call`/
+  `tell`/`note`/`reflection`) rather than a flat observation-vs-reflection split — it is
+  what importance is derived from, so collapsing it would have meant storing the score
+  with no way to explain it.
+- **Four departures from the paper, each because a MUD is not a sandbox town:**
+  - *Creation is salience-gated, not per-observation.* Automatic records come only from
+    GMCP deltas — first sight of a room or a mob, a level, a close call, an inbound tell
+    — plus what the model writes with `remember`. A ROM combat round emits lines faster
+    than any of them could be worth storing. Each automatic source is deduped: rooms and
+    mobs against session-local sets seeded from the stream (so eviction can't cause
+    rediscovery), and close calls re-arm only after recovering past 50% hp, so one bad
+    fight leaves one memory rather than one per tick. Tells are kept and the broadcast
+    channels are not — gossip is the MUD's background noise.
+  - *Importance is a static table, not an LLM call.* The paper rates every memory's
+    poignancy 1-10 with its own model call; here that would be one extra request per
+    memory, on a hot path, that can fail mid-turn. Scoring by `kind` is free and
+    deterministic; the model may still set its own on a `remember`, where it is already
+    paying for the turn.
+  - *Recency decays per minute, not per hour.* The paper's `0.995^h` ran over **sandbox**
+    hours, where a simulated day passed in minutes of real time. Applied to real hours the
+    same constant barely decays at all (0.89 after a full day). Per minute puts the
+    half-life near two hours — the scale a play session actually runs on.
+  - *Relevance is tag + keyword overlap, behind a swappable seam.* No embedding provider
+    exists in this stack (Zen's catalog is chat models). Tags carry most of the weight on
+    purpose: "what do I know about room 3054" is an exact-match question and a join
+    answers it better than a similarity search. `rune.memory.set_relevance(fn)` replaces
+    the whole factor when embeddings show up, with no caller changes — the boundary that
+    let a second LLM provider land inside `86_llm.lua` untouched by anything above it. A
+    relevance function that throws is caught and scores zero rather than killing the turn
+    (tested).
+- **Retrieval:** `rune.memory.recall{limit, text, tags, weights}` scores every record —
+  `w.recency·recency + w.importance·importance + w.relevance·relevance`, each factor
+  min-max normalized as the paper specifies (a constant vector maps to all-1, which
+  leaves ranking untouched instead of dividing by zero). Tags default to
+  `context_tags()`, built from the current room/area/enemy in `perception.snapshot()`.
+- **Two weight sets, which the implementation forced.** With the paper's all-1.0
+  weights, a *perfect* relevance hit is worth exactly as much as being the single most
+  important memory — so a high-importance non-match ties with the record that literally
+  contains the search term, and the newer-wins tiebreak then puts the wrong one first.
+  Caught in a smoke test where `/memory search smithy` ranked an unrelated reflection
+  above "the smithy buys weapons". Equal weights are right for the *automatic* retrieval
+  feeding each turn ("what should be on your mind"); an explicit question is a different
+  query ("what do you know about X"), so the `recall` tool and `/memory search` pass
+  `rune.memory.query_weights` (recency 0.5, importance 0.5, relevance 2.0) instead.
+  Pinned by a regression test.
+- **Reflection — the point of the exercise.** Fires from `agent_turn_end` once
+  importance accumulated since the last one crosses 50 (the paper's 150 assumed an agent
+  recording every observation; ours records far fewer, denser ones, so 150 would mean
+  reflecting roughly never). Feeds the last 40 records to the model, parses one
+  conclusion per line, and stores each as a `kind="reflection"` record with `refs` back
+  to its sources. This is what turns three separate "killed by the cityguard"
+  observations into "cityguards are fatal at this level".
+  - Runs **outside** the turn loop with its own single-flight flag: `87_agent.lua`'s
+    `thinking` guard does not cover this call, and two concurrent requests is exactly
+    what that guard exists to prevent.
+  - The counter resets when the request goes **out**, not when it returns — otherwise a
+    reflection that errors leaves the threshold tripped and retries on every subsequent
+    turn end. Both properties tested.
+  - Eviction never drops a reflection to make room for an observation: a reflection is
+    the compressed form of the observations it cites, so that would be backwards. Falls
+    back to the oldest record of any kind if the stream somehow holds only reflections —
+    a cap that cannot be enforced is not a cap.
+- **The stream cap is the watchdog guarantee.** `MAX_RECORDS = 400`, and recall scores
+  every record, so all work is O(cap) regardless of how long the bot has been running —
+  nothing here scales with session length. Measured rather than assumed: a full
+  400-record stream with tags and a text query recalls in **~5.4ms**, three orders of
+  magnitude under the 5s deadline. If it ever needs to be much larger, scoring moves to
+  Go as a primitive the way T12's `LogSearch` did, rather than growing the Lua loop.
+- **Tools:** `remember(text, importance?, tags?)` and `recall(query?, limit?)`, described
+  to the model as memory rather than search — `recall` returns what it *learned*, where
+  T12's `search_log` returns raw lines it saw. Registered through a new
+  `rune.agent_tools.register` export from `88_agent_tools.lua` so they get the same
+  name/source/quarantine machinery as `send_command`; the registry itself stays private,
+  so nothing can enable/disable entries behind `/tools`' back.
+- **Prompt:** `build_observation()` gained a `## What you've learned (your memory - these
+  did happen)` section, capped at 6 records and omitted entirely when the stream is empty
+  (no empty heading in every prompt). Worded to contrast with the goal line directly
+  above it, which is explicitly the model's own unverified words — these are not.
+- **Accounting:** reflection is a second LLM call outside the turn loop, so it never
+  reaches `agent_reply`. It fires `agent_reflection(insights, reply)`, which both
+  `91_agent_policy.lua` (budget) and `96_agent_ui.lua` (token display) now pick up
+  alongside `agent_reply` via a shared `count_usage`. A budget that ignored them would be
+  one the bot could exceed just by remembering a lot. `96_agent_ui.lua` renders insights
+  as `[reflect]` in magenta, distinct from ordinary inline reasoning — a conclusion just
+  committed to memory is a different kind of event from a plan for the next command.
+- **`/memory`** — `[n]`, `search <text>`, `reflect`, `forget`: the same view the agent's
+  own tools get, plus the reflection counter, mirroring `/policy` and `/loglines`.
+- **Deliberately not doing:** the paper's recursive planning tree (daily chunks → hourly
+  → 5-15 minute actions). It presumes a world you control and a clock that matters; a MUD
+  is interrupt-driven and an aggro mob invalidates the plan every thirty seconds. §1
+  already settled this domain's answer — the LLM sets intent, the scripting layer
+  executes tactics. Per-observation creation and LLM-scored importance are not coming
+  back either; only embedding relevance left a seam.
+- **Tests:** `lua/memory_test.go`, 31 Lua-against-MockHost tests — store round-trip,
+  importance defaults/clamping/validation, eviction holding the cap while keeping
+  reflections, each retrieval factor isolated (recency with everything else equal,
+  importance at equal age, the tag join, query text), the query-weights regression, limit
+  clamping, `set_relevance` swapping and restoring, a throwing relevance function, all
+  four automatic capture sources including their dedupe, enable idempotence and disable
+  leaving no hooks, memory surviving an agent restart, `forget_all`, reflection firing on
+  threshold and storing parsed insights with refs, the counter resetting on error,
+  single-flight, refusal while stopped, token accounting reaching both governance and the
+  bar, both tools registered and driven through the real turn cycle, and the observation
+  section appearing and being omitted.
+- **Done when:** the agent can act on something it learned well outside the 200-line
+  window without reaching for `search_log` ✓; reflections are stored and surfaced ✓;
+  retrieval cost is bounded by the cap rather than by uptime ✓ (measured). **Still
+  unproven:** whether reflection produces *useful* conclusions on a real bot against
+  botmud — the threshold (50), sample size (40), and the reflection prompt itself are all
+  first guesses, and tuning them needs a live run, not another test.
 
 ## 6. Open decisions
 
-- **API key in Phase 1:** recommended — `rune.env("OPENCODE_API_KEY")` (T2) so the key
-  stays out of git. Alternative: an `init.lua` constant for a throwaway spike.
-- **`run_lua(code)` codegen tool:** deferred. Ship the structured `create_trigger`
-  vocabulary (T6) first; add codegen later as a **gated** power tool (config/confirm,
-  restricted env). Rune's watchdog + pcall + quarantine already sandbox runaway/throwing
-  code, but arbitrary codegen can still clobber `rune.*`.
-- **Provider: OpenCode Zen, not Anthropic directly** (decided after T1 landed - see
-  T2/T4). One key buys access to a rotating catalog of models, including
-  free/promotional ones; the point is cheap experimentation, not a specific vendor.
-  `rune.llm.chat`'s public signature (T4) stays provider-shaped input/output
-  (system/messages/tools/max_tokens in, a normalized reply out) so swapping the model,
-  or the provider again later, doesn't ripple into T5/T6. **Bore out as intended:** T9b
-  added a second, OpenAI-chat-completions-shaped provider (`llama.cpp` et al.) behind
-  `RUNE_LLM_PROVIDER`, entirely inside `86_llm.lua`/`session/lua_llm.go` - T5/T6/T9
-  needed zero changes, confirming this boundary was drawn in the right place.
-- **Model + wire-format specifics:** fully confirmed as of T4b, against real 200s, not
-  just a bad-key probe. `x-api-key` (not `Authorization: Bearer`) is the auth header,
-  `2023-06-01` is an accepted `anthropic-version`, `/v1/models` lists what's available -
-  and, the part T4's original probe couldn't reach (no valid key on hand, so it never
-  saw a real success): **Zen fronts two differently-shaped endpoints, not one.**
-  `/v1/messages` (Anthropic-Messages-API shape) is Claude-only; every other model in the
-  catalog - deepseek, glm, hy3, mimo, the actual free/promotional models this provider
-  exists for - needs `/v1/chat/completions` (OpenAI chat/completions shape) instead.
-  Sending the wrong model to `/v1/messages` doesn't 404, it fails opaquely, which is why
-  this shipped and ran for a while before it was caught. See T4b for the fix.
+- **`run_lua(code)` codegen tool:** still deferred, and now less likely. The structured
+  reflex vocabulary it was meant to follow (`create_trigger` et al.) was itself dropped
+  on 2026-07-25 — real runs showed a two-layer agent, part direct and part
+  self-installed triggers, confused both the model and the human watching it. If codegen
+  ever lands it is a **gated** power tool (config/confirm, restricted env): the watchdog
+  + pcall + quarantine sandbox runaway and throwing code, but not code that clobbers
+  `rune.*` on purpose.
+- **Provider: OpenCode Zen, not Anthropic directly.** One key buys a rotating catalog of
+  models, including free/promotional ones; the point is cheap experimentation, not a
+  specific vendor. `rune.llm.chat`'s public signature stays provider-shaped
+  (system/messages/tools/max_tokens in, a normalized reply out) so swapping model or
+  provider doesn't ripple outward. **Bore out as intended:** a second,
+  OpenAI-chat-completions-shaped provider (`llama.cpp` et al.) landed behind
+  `RUNE_LLM_PROVIDER` entirely inside `86_llm.lua`/`session/lua_llm.go`, with zero
+  changes to the agent core, tools, or governance.
+- **Zen wire format — confirmed against real 200s, keep this handy.** `x-api-key` (not
+  `Authorization: Bearer`) is the auth header, `2023-06-01` is an accepted
+  `anthropic-version`, `/v1/models` lists the catalog, and **Zen fronts two
+  differently-shaped endpoints, not one**: `/v1/messages` (Anthropic Messages shape) is
+  Claude-only, while every other model — deepseek, glm, hy3, mimo, the free/promotional
+  ones this provider exists for — needs `/v1/chat/completions` instead. Sending the
+  wrong model to `/v1/messages` does not 404; it fails opaquely, which is why the bug
+  shipped and ran for a while before being root-caused.
 
 ## 7. Suggested commit/PR breakdown
 
-One PR per task (T1…T11), each with its own tests, in dependency order. T1 and T3 first
-and in parallel (neither depends on botmud#20). botmud#20 (server GMCP) unblocks a *real*
-end-to-end run but not the client critical path — T3 develops against GMCP fixtures
-meanwhile.
+One PR per task, each with its own tests, in dependency order.

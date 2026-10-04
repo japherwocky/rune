@@ -47,16 +47,38 @@ rune.hooks.on("agent_turn_start", function()
     log_line("turn start")
 end, { name = "agent-ui-turn-start" })
 
-rune.hooks.on("agent_reply", function(reply)
-    if reply.usage then
+local function count_usage(reply)
+    if reply and reply.usage then
         total_input_tokens = total_input_tokens + (reply.usage.input_tokens or 0)
         total_output_tokens = total_output_tokens + (reply.usage.output_tokens or 0)
     end
+end
+
+rune.hooks.on("agent_reply", function(reply)
+    count_usage(reply)
     if reply.text and reply.text ~= "" then
         rune.echo(rune.style.dim("[agent] ") .. reply.text)
         log_line("reply: " .. reply.text)
     end
 end, { name = "agent-ui-reply" })
+
+-- Reflection (89_memory.lua) runs its own LLM call outside the turn
+-- loop, so it never fires agent_reply - both the token count and the
+-- insights themselves have to be picked up here separately. Shown
+-- distinctly from ordinary reasoning: a conclusion the bot just
+-- committed to memory is a different kind of event from a plan for the
+-- next command, and reads wrong unlabeled in the same inline stream.
+rune.hooks.on("agent_reflection", function(insights, reply)
+    count_usage(reply)
+    if #insights == 0 then
+        return
+    end
+    last_action = "reflected"
+    for _, insight in ipairs(insights) do
+        rune.echo(rune.style.magenta("[reflect] ") .. insight)
+        log_line("reflection: " .. insight)
+    end
+end, { name = "agent-ui-reflection" })
 
 -- search_log/read_log can return up to 500 lines (92_agent_log.lua) -
 -- worth keeping in full in the durable log, but dumping all of it into
