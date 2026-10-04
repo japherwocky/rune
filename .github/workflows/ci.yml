@@ -48,28 +48,6 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  coverage:
-    name: coverage-upload
-    needs: test
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - uses: actions/checkout@v7
-      - name: Download coverage report
-        uses: actions/download-artifact@v8
-        with:
-          name: coverage
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v7
-        with:
-          use_oidc: true
-          files: coverage.out
-          disable_search: true
-          fail_ci_if_error: true
-
   vulncheck:
     name: vulncheck
     runs-on: ubuntu-latest
