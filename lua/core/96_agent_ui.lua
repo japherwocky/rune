@@ -168,7 +168,7 @@ end)
 -- read-only "as a deliberate call" - see PLAN.md T7 - this is that
 -- deliberate call, made later). Model resolution for "start":
 -- explicit arg > RUNE_LLM_MODEL (.env, see 83_env.lua) > usage error.
-local USAGE_AGENT = "[Usage] /agent [start [model] | stop]"
+local USAGE_AGENT = "[Usage] /agent [start [model] | stop | goal [text]]"
 
 -- model/provider tag shared by the three places below that report
 -- what's running: "started", "already running", and plain status.
@@ -196,6 +196,32 @@ rune.command.add("agent", function(args)
         end
         rune.agent.start({ model = model })
         rune.echo(rune.style.green("[Agent]") .. " started" .. model_provider_tag(model))
+        return
+    end
+
+    -- "goal" sets the operator's mission (rune.agent.set_mission), which
+    -- is not the same thing as the plan the model writes for itself at
+    -- the end of each turn. Without a mission the only steering the bot
+    -- has is its own last sentence, which is how a weak model talks
+    -- itself into narrating instead of playing.
+    if sub == "goal" then
+        if rest == "" then
+            local current = rune.agent.mission()
+            if current then
+                rune.echo(rune.style.green("[Agent]") .. " mission: " .. current)
+            else
+                rune.echo(rune.style.gray("[Agent]") .. " no mission set" ..
+                    " - " .. rune.style.gray("/agent goal <text>"))
+            end
+            return
+        end
+        if rest == "clear" then
+            rune.agent.set_mission(nil)
+            rune.echo(rune.style.green("[Agent]") .. " mission cleared")
+            return
+        end
+        rune.agent.set_mission(rest)
+        rune.echo(rune.style.green("[Agent]") .. " mission set: " .. rest)
         return
     end
 
