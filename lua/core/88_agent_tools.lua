@@ -110,6 +110,27 @@ end)
 -- something a human player at the same terminal wouldn't have seen
 -- (PLAN.md §4).
 
+-- The agent's own narration goes into the same log it reads back, which
+-- makes read_log self-referential: 96_agent_ui.lua logs every tool call
+-- and its result under "[Agent] ", so a later read_log returns its own
+-- earlier output, nested and escaped, one level deeper each time. Strip
+-- those lines. The agent's sent commands ("[agent] look") and the
+-- governance notices ("[agent-policy] ...") are kept - they are a real
+-- record of what it did and what was refused, which is exactly what it
+-- should be able to look back on.
+local function strip_own_narration(lines)
+    local out = {}
+    for _, line in ipairs(lines) do
+        -- Skip an optional "[HH:MM:SS] " stamp (rune.log.timestamps,
+        -- always on headless) before testing the tag.
+        local body = line:gsub("^%[%d%d:%d%d:%d%d%]%s*", "")
+        if not body:find("^%[Agent%]") then
+            table.insert(out, line)
+        end
+    end
+    return out
+end
+
 register("search_log",
     "Search this session's log for lines matching a regular expression - your " ..
     "own memory of everything seen and done so far, reaching much further back " ..
@@ -130,13 +151,15 @@ register("search_log",
     if not lines then
         error("search_log: " .. tostring(err))
     end
-    return lines
+    return strip_own_narration(lines)
 end)
 
 register("read_log",
-    "Read the most recent lines of this session's log - game output, your own " ..
-    "commands, and your own reasoning, interleaved in the order they happened. " ..
-    "Use it to look further back than the recent output you were given.", {
+    "Read lines of this session's log from further back than the recent game " ..
+    "output you were already given. The recent output in your observation " ..
+    "already covers the last couple of hundred lines, so only reach for this " ..
+    "when you need something older than that - otherwise just read the output " ..
+    "you have and act.", {
     type = "object",
     properties = {
         lines = { type = "number", description = "How many trailing lines to return. Default 50, max 500." },
@@ -147,7 +170,7 @@ register("read_log",
     if not lines then
         error("read_log: " .. tostring(err))
     end
-    return lines
+    return strip_own_narration(lines)
 end)
 
 -- /tools - list registered agent tools and their quarantine status

@@ -33,15 +33,39 @@ local DEFAULT_MAX_TOKENS = 1024
 local LOW_HP_RATIO = 0.3
 local GOAL_KEY = "agent_goal"
 
-local DEFAULT_SYSTEM = "You are an autonomous agent playing a MUD through the " ..
-    "Rune client. Each turn you're given your current goal, some status " ..
-    "data (may be empty depending on the game), and the recent game text - " ..
-    "exactly what a human player would see, never more. Only that text and " ..
-    "a tool's result are real; act by calling tools. Nothing you write " ..
-    "yourself happens or reaches anyone else - never write a room name on " ..
-    "its own line, a \"Command:\" label, dialogue for another character, or " ..
-    "anything else that looks like game output. If you're not calling a " ..
-    "tool, write one short sentence of plan and stop there."
+-- The prohibitions in the last paragraph came first, and on their own
+-- they were not enough: a model given only rules about what not to write
+-- still narrated its way through the world instead of playing it. What
+-- was missing was the domain - that a MUD answers commands with room
+-- descriptions, that an exits line is a list of commands, that acting at
+-- all means calling send_command. Teach that first, then forbid. A
+-- prompt that is all prohibition says what to avoid without ever saying
+-- what the job is.
+local DEFAULT_SYSTEM = table.concat({
+    "You are playing a text MUD (a multiplayer text adventure) through the " ..
+        "Rune client. You are a character inside the game world, and the only " ..
+        "way to do anything at all is to call the send_command tool with a " ..
+        "command the game understands.",
+
+    "How the game talks to you: when you arrive somewhere, or send `look`, it " ..
+        "sends a description of the room you are standing in, usually followed " ..
+        "by a line like `[Exits: north east down]`. Those exits are the " ..
+        "directions you can move, and each one is itself a command. Game " ..
+        "commands are short: `look`, `north`, `get sword`, `kill rat`, " ..
+        "`inventory`, `say hello`.",
+
+    "Each turn you are given your mission, what you have learned, whatever " ..
+        "status data the game provides, and the recent game text. The game " ..
+        "text is the ground truth for where you are and what is happening - " ..
+        "read it before you act, and expect the room description to be in " ..
+        "there rather than in a tidy field.",
+
+    "Only the game text and tool results are real. Nothing you write yourself " ..
+        "happens, and nothing you write reaches anyone: do not write room " ..
+        "descriptions, a \"Command:\" label, dialogue for other characters, or " ..
+        "anything else shaped like game output. If you are not calling a tool, " ..
+        "write one short sentence of plan and stop there.",
+}, "\n\n")
 
 -- name -> {name, description, input_schema, fn}
 local tools = {}
@@ -128,6 +152,11 @@ end
 -- bound, and an unbounded recall would give that back.
 local MEMORY_RECALL = 6
 
+-- Operator-set and fixed for the run, unlike goal() below, which is only
+-- ever whatever the model last said. Declared up here because
+-- build_observation reads it; set by rune.agent.start/set_mission.
+local mission
+
 local function memory_section()
     local recs = rune.memory.recall({ limit = MEMORY_RECALL })
     if #recs == 0 then
@@ -137,21 +166,56 @@ local function memory_section()
         table.concat(rune.memory.format(recs), "\n")
 end
 
+local function is_blank(t)
+    return type(t) ~= "table" or next(t) == nil
+end
+
 local function build_observation()
     local snap = rune.perception.snapshot()
     local transcript = rune.perception.transcript()
-    local sections = {
-        "## Your goal (your own words from the end of your last turn - " ..
-            "not confirmed fact)\n" .. (goal() or "(none yet - decide what to do)"),
-    }
+    local sections = {}
+
+    -- The mission is listed first and outranks the plan: it is the one
+    -- part of the observation the model did not write and cannot drift.
+    if mission and mission ~= "" then
+        table.insert(sections,
+            "## Your mission (set by your operator - this does not change)\n" .. mission)
+    end
+
+    table.insert(sections,
+        "## Your plan (your own words from the end of your last turn - " ..
+            "not confirmed fact)\n" .. (goal() or "(none yet - decide what to do)"))
+
     local memories = memory_section()
     if memories then
         table.insert(sections, memories)
     end
-    table.insert(sections, "## Vitals\n" .. (rune.json.encode(snap.vitals) or "{}"))
-    table.insert(sections, "## Status\n" .. (rune.json.encode(snap.status) or "{}"))
-    table.insert(sections, "## Room\n" .. (rune.json.encode(snap.room) or "{}"))
-    table.insert(sections, "## Recent output\n" .. table.concat(transcript, "\n"))
+
+    -- Vitals/Status/Room come from GMCP, and plenty of MUDs send none of
+    -- it at all. An empty "## Room\n{}" is actively worse than no section:
+    -- it answers "where am I" with "nowhere", under the exact heading the
+    -- model needs, while the real room description sits unlabelled in the
+    -- game text below. Omit what the game did not send, and when it sent
+    -- nothing, say where to look instead.
+    local structured = false
+    for _, part in ipairs({
+        { "Vitals", snap.vitals },
+        { "Status", snap.status },
+        { "Room", snap.room },
+    }) do
+        if not is_blank(part[2]) then
+            structured = true
+            table.insert(sections, "## " .. part[1] .. "\n" .. (rune.json.encode(part[2]) or "{}"))
+        end
+    end
+    if not structured then
+        table.insert(sections,
+            "## Status data\nThis game sends no structured data, so the game " ..
+            "text below is your only source for where you are, what is here, " ..
+            "and which exits exist. Read it as a room description, not a log.")
+    end
+
+    table.insert(sections, "## Recent game output\n" .. table.concat(transcript, "\n"))
     return table.concat(sections, "\n\n")
 end
 
@@ -167,6 +231,14 @@ local model, system, max_tokens
 -- calls start_turn again on a coalesced wake.
 local start_turn, on_reply, finish_turn
 
+-- A turn ends when the model stops asking for tools. A model that never
+-- stops (observed: 25 tool calls in one turn without a single end_turn)
+-- holds the turn open forever, and because agent_turn_end never fires,
+-- everything hanging off the turn boundary - T9's budget accounting and
+-- oscillation check, the goal update - never runs either. Cap the hops
+-- so a runaway turn still closes and still gets governed.
+local MAX_TOOL_HOPS = 8
+
 local function request(messages, cb)
     local defs = tool_defs()
     rune.llm.chat({
@@ -178,7 +250,8 @@ local function request(messages, cb)
     }, cb)
 end
 
-on_reply = function(messages, reply, err)
+on_reply = function(messages, reply, err, hop)
+    hop = hop or 1
     if not active then
         -- Stopped mid-turn: the HTTP request already went out and
         -- can't be recalled, but its result must not act on a stopped
@@ -200,6 +273,19 @@ on_reply = function(messages, reply, err)
     rune.hooks.call("agent_reply", reply)
 
     if reply.stop_reason == "tool_use" and #reply.tool_uses > 0 then
+        if hop >= MAX_TOOL_HOPS then
+            -- Close the turn here rather than continuing. The tool calls
+            -- in this reply are deliberately not dispatched: the model
+            -- has had its hops, and running them would be one more
+            -- action with nothing left to interpret the result.
+            local notice = "tool-hop cap reached (" .. MAX_TOOL_HOPS ..
+                ") - ending the turn"
+            rune.echo(rune.style.gray("[agent]") .. " " .. notice)
+            rune.hooks.call("agent_policy", "hop_cap", notice)
+            rune.hooks.call("agent_turn_end", reply)
+            finish_turn()
+            return
+        end
         table.insert(messages, { role = "assistant", content = reply.content })
 
         local results = {}
@@ -216,7 +302,7 @@ on_reply = function(messages, reply, err)
         table.insert(messages, { role = "user", content = results })
 
         request(messages, function(reply2, err2)
-            on_reply(messages, reply2, err2)
+            on_reply(messages, reply2, err2, hop + 1)
         end)
         return
     end
@@ -234,7 +320,7 @@ start_turn = function()
     rune.hooks.call("agent_turn_start")
     local messages = { { role = "user", content = build_observation() } }
     request(messages, function(reply, err)
-        on_reply(messages, reply, err)
+        on_reply(messages, reply, err, 1)
     end)
 end
 
@@ -281,6 +367,12 @@ function rune.agent.start(opts)
     model = opts.model
     system = opts.system or DEFAULT_SYSTEM
     max_tokens = opts.max_tokens or DEFAULT_MAX_TOKENS
+    if opts.goal ~= nil then
+        if type(opts.goal) ~= "string" then
+            error("rune.agent.start: opts.goal must be a string", 2)
+        end
+        mission = opts.goal
+    end
 
     rune.perception.enable()
     rune.memory.enable()
@@ -355,7 +447,25 @@ function rune.agent.status()
         active = active,
         thinking = thinking,
         wake_pending = wake_pending,
+        mission = mission,
         goal = goal(),
         model = model,
     }
+end
+
+-- rune.agent.set_mission(text) - set or clear the operator's mission
+-- mid-run. Separate from the plan the model writes for itself each turn
+-- (set_goal above): the mission is the part of the observation the agent
+-- cannot author, so it is the only durable steering there is. Takes
+-- effect on the next turn's observation. Pass nil or "" to clear.
+function rune.agent.set_mission(text)
+    if text ~= nil and type(text) ~= "string" then
+        error("rune.agent.set_mission: text must be a string or nil", 2)
+    end
+    mission = (text ~= "" and text) or nil
+end
+
+-- rune.agent.mission() -> the current mission, or nil.
+function rune.agent.mission()
+    return mission
 end
