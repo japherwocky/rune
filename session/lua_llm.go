@@ -2,6 +2,8 @@ package session
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
@@ -9,6 +11,7 @@ import (
 	"time"
 
 	"github.com/mmcdole/rune/lua"
+	"github.com/mmcdole/rune/version"
 )
 
 const (
@@ -93,6 +96,8 @@ var llmRetryBackoff = func(attempt int) time.Duration {
 // consistent with LLMRequest's doc comment in lua/host.go ("Go only
 // ever moves the already-encoded body as bytes").
 type llmProvider struct {
+	name        string
+	sessionID   string
 	url         string
 	apiKeyEnv   string
 	keyRequired bool
@@ -107,6 +112,25 @@ type llmProvider struct {
 // recoverable configuration error, delivered through the same
 // _deliver(id, nil, err) path as any other LLM failure - not a raise,
 // per the Go-primitive error convention (PLAN.md §2).
+// llmSessionID returns this Session's conversation id for Zen, minting
+// it on first use. Zen asks third-party callers to carry a session id
+// alongside a real User-Agent; one id for the whole Session is the
+// honest shape, since that is the conversation. Random rather than
+// derived from anything local - it is an opaque correlation handle, and
+// nothing about the user should be inferable from it. A failed read
+// from crypto/rand degrades to an empty header rather than failing the
+// request: identification is Zen's bookkeeping, not ours to enforce.
+func (s *Session) llmSessionID() string {
+	if s.llmSession == "" {
+		var buf [16]byte
+		if _, err := rand.Read(buf[:]); err != nil {
+			return ""
+		}
+		s.llmSession = hex.EncodeToString(buf[:])
+	}
+	return s.llmSession
+}
+
 func resolveLLMProvider(s *Session, model string) (llmProvider, error) {
 	name, ok := s.Env(llmProviderEnv)
 	if !ok || name == "" {
@@ -124,6 +148,8 @@ func resolveLLMProvider(s *Session, model string) (llmProvider, error) {
 			}
 		}
 		return llmProvider{
+			name:        "zen",
+			sessionID:   s.llmSessionID(),
 			url:         url,
 			apiKeyEnv:   llmZenAPIKeyEnv,
 			keyRequired: true,
@@ -137,6 +163,7 @@ func resolveLLMProvider(s *Session, model string) (llmProvider, error) {
 			return llmProvider{}, fmt.Errorf("%s is required when %s=openai", llmURLEnv, llmProviderEnv)
 		}
 		return llmProvider{
+			name:        "openai",
 			url:         url,
 			apiKeyEnv:   llmOpenAIAPIKeyEnv,
 			keyRequired: false,
@@ -247,6 +274,17 @@ func doLLMRequest(ctx context.Context, provider llmProvider, key string, req lua
 		return nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	// Identify the client. Go's default "Go-http-client/1.1" reads as
+	// anonymous HTTP-library traffic, which Zen rejects outright; its
+	// docs ask third-party callers to say who they are. Harmless
+	// against a local runner, so it is set unconditionally.
+	httpReq.Header.Set("User-Agent", "rune/"+version.Number)
+	if provider.name == "zen" {
+		// One id for the life of the Session, not per request: it keys a
+		// conversation on Zen's side, and a fresh id per turn would
+		// present a long-running agent as a stream of strangers.
+		httpReq.Header.Set("x-opencode-session", provider.sessionID)
+	}
 	provider.setAuth(httpReq, key)
 
 	client := &http.Client{Timeout: llmDefaultTimeout}

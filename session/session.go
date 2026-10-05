@@ -59,6 +59,7 @@ type Session struct {
 	engine        *lua.Engine
 	luaGeneration uint64
 	sessionStore  map[string]string // Reload-surviving state; see lua_session.go
+	llmSession    string            // Zen conversation id; see lua_llm.go
 
 	// Event sources and background-work lifetime
 	// internalEvents carries typed outcomes from Session-owned asynchronous
